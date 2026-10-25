@@ -1,0 +1,62 @@
+{
+  "kernel_commit": "02ca1a919564a9b176a79cce09c40977f833e9ac",
+  "sources": [
+    {
+      "path": "research/sources/bengal.dtsi",
+      "url": "https://raw.githubusercontent.com/MiCode/Xiaomi_Kernel_OpenSource/02ca1a919564a9b176a79cce09c40977f833e9ac/arch/arm64/boot/dts/vendor/qcom/bengal.dtsi",
+      "sha256": "bf12f1997594b1b554ba2a0601a26d8878800aa9d64c7b2074c93b67bad99ea0"
+    },
+    {
+      "path": "research/sources/bengal-gpu.dtsi",
+      "url": "https://raw.githubusercontent.com/MiCode/Xiaomi_Kernel_OpenSource/02ca1a919564a9b176a79cce09c40977f833e9ac/arch/arm64/boot/dts/vendor/qcom/bengal-gpu.dtsi",
+      "sha256": "70eea7e811348cbe88fdf2d2cfcb06e910fb97e29b3d73a5d08a6f0d45334dcd"
+    },
+    {
+      "path": "research/sources/bengal-qupv3.dtsi",
+      "url": "https://raw.githubusercontent.com/MiCode/Xiaomi_Kernel_OpenSource/02ca1a919564a9b176a79cce09c40977f833e9ac/arch/arm64/boot/dts/vendor/qcom/bengal-qupv3.dtsi",
+      "sha256": "f262e673ea385441feb40e21a63c2eab47eb13a8c097135f9c401b48b5dd5f02"
+    },
+    {
+      "path": "research/sources/bengal-sde-display.dtsi",
+      "url": "https://raw.githubusercontent.com/MiCode/Xiaomi_Kernel_OpenSource/02ca1a919564a9b176a79cce09c40977f833e9ac/arch/arm64/boot/dts/vendor/qcom/bengal-sde-display.dtsi",
+      "sha256": "6cb7c8b3906adfbe7dd9a3302e42e5cea4106dcc24225a9ae6917529cf700296"
+    },
+    {
+      "path": "research/sources/bengal-sde.dtsi",
+      "url": "https://raw.githubusercontent.com/MiCode/Xiaomi_Kernel_OpenSource/02ca1a919564a9b176a79cce09c40977f833e9ac/arch/arm64/boot/dts/vendor/qcom/bengal-sde.dtsi",
+      "sha256": "9fa838e42558f883a1e432a11315841700e4589d9fa1d9f5a59695945509f7b7"
+    },
+    {
+      "path": "research/sources/bengal-qrd.dtsi",
+      "url": "https://raw.githubusercontent.com/MiCode/Xiaomi_Kernel_OpenSource/02ca1a919564a9b176a79cce09c40977f833e9ac/arch/arm64/boot/dts/vendor/qcom/bengal-qrd.dtsi",
+      "sha256": "bd436ebd78d52b0fda1946e68b47df889ec84eed980ce42bb5155f9a92fbc02b"
+    },
+    {
+      "path": "research/sources/bengal-idp.dtsi",
+      "url": "https://raw.githubusercontent.com/MiCode/Xiaomi_Kernel_OpenSource/02ca1a919564a9b176a79cce09c40977f833e9ac/arch/arm64/boot/dts/vendor/qcom/bengal-idp.dtsi",
+      "sha256": "8590e19575871a2700a06e9d364d5698697eccffc16334e7a2faba6b97acc5a6"
+    },
+    {
+      "path": "research/sources/bengal.dts",
+      "url": "https://raw.githubusercontent.com/MiCode/Xiaomi_Kernel_OpenSource/02ca1a919564a9b176a79cce09c40977f833e9ac/arch/arm64/boot/dts/vendor/qcom/bengal.dts",
+      "sha256": "ab49c278a7732f21ba34abf484db44ec095cf2fd0f8d05fee08a900bba27c976"
+    },
+    {
+      "path": "research/sources/bengal-qrd.dts",
+      "url": "https://raw.githubusercontent.com/MiCode/Xiaomi_Kernel_OpenSource/02ca1a919564a9b176a79cce09c40977f833e9ac/arch/arm64/boot/dts/vendor/qcom/bengal-qrd.dts",
+      "sha256": "e3c35aeff7f4183c11b786fb530e81d1f9bd36b65dcf2a27cd3a309187590158"
+    },
+    {
+      "path": "research/sources/citrus-BoardConfig.mk",
+      "url": "https://raw.githubusercontent.com/geoanto555/android_device_poco-xiaomi_citrus/android-10/BoardConfig.mk",
+      "sha256": "e950ca90e453888c0823196d7cb2716b2bc95689c699817a12203d458c500b77",
+      "note": "branch URL; content hash recorded"
+    },
+    {
+      "path": "research/sources/aosp-mkbootimg.py",
+      "url": "https://android.googlesource.com/platform/system/tools/mkbootimg/+/refs/heads/main/mkbootimg.py?format=TEXT",
+      "sha256": "37d84b3d162e0bc62e36c1f4e1c63c85ea0caa9f29be023eb2f8efe006ad948c",
+      "note": "Base64 decoded upstream Python source, fetched 2026-10-25"
+    }
+  ]
+}

@@ -1,0 +1,226 @@
+{
+  "status": "observed Android hardware; not a boot configuration",
+  "device": "citrus",
+  "model": "M2010J19CG",
+  "variant": "4GB/64GB Indonesia",
+  "boot_image": {
+    "header_version": 2,
+    "page_size": 4096
+  },
+  "memory_banks": [
+    {
+      "base": "0x40000000",
+      "size": "0x3dd00000"
+    },
+    {
+      "base": "0xc0000000",
+      "size": "0x80000000"
+    },
+    {
+      "base": "0x80000000",
+      "size": "0x40000000"
+    }
+  ],
+  "reserved_memory": {
+    "/reserved-memory/hyp_region@45700000": [
+      {
+        "base": "0x45700000",
+        "size": "0x600000"
+      }
+    ],
+    "/reserved-memory/xbl_aop_region@45e00000": [
+      {
+        "base": "0x45e00000",
+        "size": "0x140000"
+      }
+    ],
+    "/reserved-memory/sec_apps_region@45fff000": [
+      {
+        "base": "0x45fff000",
+        "size": "0x1000"
+      }
+    ],
+    "/reserved-memory/smem_region@46000000": [
+      {
+        "base": "0x46000000",
+        "size": "0x200000"
+      }
+    ],
+    "/reserved-memory/removed_region@60000000": [
+      {
+        "base": "0x60000000",
+        "size": "0x3900000"
+      }
+    ],
+    "/reserved-memory/modem_region@4ab00000": [
+      {
+        "base": "0x4ab00000",
+        "size": "0x6900000"
+      }
+    ],
+    "/reserved-memory/pil_video_region@51400000": [
+      {
+        "base": "0x51400000",
+        "size": "0x500000"
+      }
+    ],
+    "/reserved-memory/wlan_msa_region@51900000": [
+      {
+        "base": "0x51900000",
+        "size": "0x100000"
+      }
+    ],
+    "/reserved-memory/cdsp_regions@51a00000": [
+      {
+        "base": "0x51a00000",
+        "size": "0xa00000"
+      }
+    ],
+    "/reserved-memory/pil_adsp_region@53800000": [
+      {
+        "base": "0x53800000",
+        "size": "0x2200000"
+      }
+    ],
+    "/reserved-memory/ipa_fw_region@55A00000": [
+      {
+        "base": "0x55a00000",
+        "size": "0x10000"
+      }
+    ],
+    "/reserved-memory/ipa_gsi_region@55A10000": [
+      {
+        "base": "0x55a10000",
+        "size": "0x5000"
+      }
+    ],
+    "/reserved-memory/gpu_region@55A15000": [
+      {
+        "base": "0x55a15000",
+        "size": "0x2000"
+      }
+    ],
+    "/reserved-memory/ramoops@64000000": [
+      {
+        "base": "0x64000000",
+        "size": "0x400000"
+      }
+    ],
+    "/reserved-memory/cont_splash_region@5c000000": [
+      {
+        "base": "0x5c000000",
+        "size": "0xf00000"
+      }
+    ],
+    "/reserved-memory/dfps_data_region@5cf00000": [
+      {
+        "base": "0x5cf00000",
+        "size": "0x100000"
+      }
+    ]
+  },
+  "psci_method": "smc",
+  "gic": {
+    "distributor": "0x0f200000",
+    "redistributors": "0x0f300000",
+    "redistributor_region_size": "0x100000"
+  },
+  "display": {
+    "width": 1080,
+    "height": 2340,
+    "refresh_hz": 60,
+    "selected_panel": "qcom,mdss_dsi_ft8719_truly_v2_video",
+    "splash_reservation": "0x5c000000",
+    "splash_reservation_size": "0xf00000",
+    "framebuffer_stride": 4320,
+    "framebuffer_format": "MDP SRC_FORMAT 0x237ff",
+    "bootloader_framebuffer_base": "0x5c000000"
+  },
+  "touch": {
+    "driver": "fts_ts",
+    "controller_id": "0x8719",
+    "bus": "SPI",
+    "serial_engine": "0x4a88000",
+    "chip_select": 0,
+    "mode": 1,
+    "max_hz": 6000000,
+    "reset_tlmm_gpio": 103,
+    "irq_tlmm_gpio": 93,
+    "max_contacts": 10,
+    "x_max": 1080,
+    "y_max": 2340
+  },
+  "gpu": {
+    "model": "Adreno610v1",
+    "chip_id": "0x06010000",
+    "register_base": "0x05900000"
+  },
+  "ufs": {
+    "register_base": "0x04804000"
+  },
+  "unresolved": [
+    "Temporary fastboot boot command rejected by ABL; alternate boot route needed",
+    "CPU feature register granule support",
+    "Wi-Fi silicon and firmware details",
+    "usable XNU RAM span after all carve-outs and dynamic reservations"
+  ],
+  "boot_route_test": {
+    "date": "2026-10-25",
+    "fastboot_version": "37.0.1",
+    "transfer": "success",
+    "boot": "rejected before execution",
+    "error": "unknown command",
+    "recovery": "fastboot reboot; Android ADB returned",
+    "partitions_written": false
+  },
+  "diagnostic_readout": {
+    "source": "user transcription of physical diagnostic display",
+    "MIDR": "0x51af8014",
+    "MPIDR": "0x80000000",
+    "MMFR0": "0x11122",
+    "MMFR1": "0x0",
+    "PFR0": "0x1002222",
+    "ISAR0": "0x11120",
+    "CNTFRQ": "0x124f800",
+    "DTB": "0x45217000",
+    "FB_BASE": "0x5c000000",
+    "FB_STRIDE": "0x10e0",
+    "FB_FORMAT": "0x237ff",
+    "RAM_TRANSCRIBED": [
+      {
+        "base": "0x40000000",
+        "size": "0x30000000"
+      },
+      {
+        "base": "0xc0000000",
+        "size": "0x08000000"
+      },
+      {
+        "base": "0x80000000",
+        "size": "0x40000000"
+      }
+    ],
+    "ram_note": "First two sizes differ from Android live FDT; retain as transcription, verify from a photograph or binary FDT before choosing kernel RAM.",
+    "automatic_reset": "did not return to fastboot within 100 seconds"
+  },
+  "gold_diagnostic": {
+    "source": "updated physical display transcription from user",
+    "MIDR": "0x51af8002",
+    "MPIDR": "0x80000100",
+    "MMFR0": "0x01011122",
+    "TGran16": 1,
+    "CurrentEL": 1,
+    "handoff": "confirmed to MPIDR affinity 0x100",
+    "automatic_reset": "not confirmed; manual fastboot return followed",
+    "boot_restoration": "fastboot flash boot original backup succeeded; phone left in fastboot"
+  },
+  "xnu_test_1": {
+    "image": "out/citrus-diagnostic/citrus-xnu-boot.img",
+    "source_archive_artifact": 12263212928,
+    "source_buildtree_artifact": 12262938798,
+    "kernel": "out/citrus-kernel/kernel.development.citrus",
+    "user_report": "XNU kernel text or panic visible",
+    "precise_stop": "awaiting final visible lines",
+    "root_filesystem_present": false
+  }
+}

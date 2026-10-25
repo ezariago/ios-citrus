@@ -1,10 +1,10 @@
 # Citrus XNU port — active handoff
 
-Updated 2026-10-26 06:30 (Asia/Jakarta). Read this checkpoint first.
+Updated 2026-10-26 06:52 (Asia/Jakarta). Read this checkpoint first.
 
-## CURRENT STATE — iOS UI IS UP: the phone boots to the iOS LOCK SCREEN, and the
-## kernel console is streamed LIVE over USB. The old "~150 s whole-kernel freeze"
-## is NOT reproduced on the current build and was very likely self-inflicted.
+## CURRENT STATE — the kernel console is streamed LIVE over USB (new, works), and
+## one boot of four reaches and keeps the iOS LOCK SCREEN. The remaining blocker is
+## an INTERMITTENT stall (Apple logo / console stops) that is not yet explained.
 
 ### 2026-10-26 06:30 Asia/Jakarta — what changed today
 
@@ -139,14 +139,23 @@ Note usb6 predates the timebase fix; the next build (usb7) has a true 5 s
 
 ### Next work, in order
 
-1. **Run the A/B test on the watchdog**: boot the same build twice, once with
-   `sweetwdt=150` and once with `sweetwdt=0`, and see whether the "freeze"
-   reproduces only with the watchdog. If so, delete that hypothesis from the
-   handoff, keep `sweetwdt=0`, and stop chasing a UFS wedge.
-2. **Watch stability with the 5 s heartbeat** (build usb7 = current tree): the
-   `SWEET LIVE T=..s beat=.. ufsio=.. free=.. op=..` line must keep advancing
-   for 10+ minutes with the lock screen up. `op=` names the in-flight UFS
-   command (`sweet_ufs_op_string()` in sweet_ufs.c).
+1. **Characterise the intermittent stall** (this is the blocker; the watchdog
+   theory is dead, see above). Ideas, cheapest first:
+   a. Re-boot the *same* image several times and count how often it stalls. If it
+      is ~1-in-4, look for a race rather than a fixed blocker.
+   b. Boot `out/citrus-diagnostic/citrus-xnu-boot-usb6.img` again (the build that
+      reached the lock screen) and compare its console with a stalled boot's.
+   c. Use `sweetsample=SpringBoard,backboardd,launchd` (prints thread PCs every
+      90 s from a kernel thread) on a stalled boot — the sample dump names the
+      blocking stack. Note the sampler's output never appeared in the logs so far
+      because the console is already silent by then; `sweetirqwr=1` +
+      `tools/pull-sweetlog.sh` from recovery is the fallback.
+   d. Consider the VM angle: free pages fell to ~24k (96 MB) by T=147 s at
+      ~340 pages/s with cpus=1. A stalled boot's last heartbeat vs a good boot's
+      is the cheapest discriminator.
+2. **Watch stability with the opt-in heartbeat** (`sweetusbbeat=1`, real 5 s
+   period now) once the stall is understood, not before: it may itself perturb
+   timing.
 3. **Lock screen → home screen**: it is stable but not unlockable; touch
    (FT8719 over SPI) is still unported, and the lock screen may be waiting for a
    passcode/press. Consider whether `sweetfb_stayon=1` + a synthetic HID event

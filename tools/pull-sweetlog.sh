@@ -28,11 +28,12 @@ open(f'{out}/{name}-heartbeat.bin', 'wb').write(hb)
 
 fields = ['boot_id', 'seq', 'uptime_s', 'console_bytes', 'console_seq', 'ufs_ios',
           'flush_runs', 'free_pages', 'wire_pages',
+          'svc_runs', 'panel_runs', 'intr_pc', 'ufs_users',
           'prev_boot_id', 'prev_phase', 'prev_uptime_s', 'prev_console_bytes',
           'prev_console_seq', 'prev_ufs_ios', 'prev_flush_runs']
 if hb[:8] == b'SWEETHB1':
     version, phase = struct.unpack_from('<II', hb, 8)
-    values = struct.unpack_from('<16Q', hb, 16)
+    values = struct.unpack_from('<20Q', hb, 16)
     lines = [f'magic {hb[:8]!r} version {version} phase {phase}']
     lines += [f'{k:20} {v}' for k, v in zip(fields, values)]
     text = '\n'.join(lines)

@@ -55,7 +55,9 @@ def main():
     OUT.mkdir(parents=True, exist_ok=True)
     targets = [('osfmk', 'sweet_early.o'), ('osfmk', 'start.o'),
                ('osfmk', 'arm_vm_init.o'), ('iokit', 'SweetBattery.cpo'),
-               ('osfmk', 'serial_console.o'), ('iokit', 'SweetFramebuffer.cpo')]
+               ('osfmk', 'serial_console.o'), ('iokit', 'SweetFramebuffer.cpo'),
+               ('osfmk', 'exception.o'), ('osfmk', 'rtclock.o'), ('osfmk', 'video_console.o'), ('bsd', 'sweet_sample.o'),
+               ('bsd', 'sweet_ufs.o')]
     for component, target in targets:
         compile_object(component, target)
     link = ART / 'xnu-kernel/kernel.development.sweet.link'

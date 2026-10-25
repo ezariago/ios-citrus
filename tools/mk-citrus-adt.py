@@ -19,15 +19,21 @@ if pathlib.Path(mkadt.D22AP_ADT).exists():
     mkadt.d22ap_product = lambda: _d22ap_product(mkadt.D22AP_ADT)
 
 mkadt.PHYS_BASE = 0x80000000
-mkadt.MEM_SIZE = 0x40000000
 mkadt.FB_H = 2340
 mkadt.SWEET_ECID = 0x4349545255530001
-tree = mkadt.build(native=True)
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('output', type=pathlib.Path)
 parser.add_argument('--ufs', action='store_true', help='Include UFS node; use ufsrw=0 for read-only probe')
 parser.add_argument('--display', action='store_true', help='Include native-sized iOS display service')
+parser.add_argument('--ram-mib', type=int, default=1024,
+                    help='Kernel-managed RAM from 0x80000000 (1024 default; 1792 verified '
+                         'free below the 0xf3c00000 reservation)')
 args = parser.parse_args()
+# 0x80000000..0xf3c00000 is System RAM with no reservation; stay below it.
+if not 256 <= args.ram_mib <= 1792 or args.ram_mib % 16:
+    parser.error('--ram-mib must be a multiple of 16 between 256 and 1792')
+mkadt.MEM_SIZE = args.ram_mib << 20
+tree = mkadt.build(native=True)
 tree.children = [node for node in tree.children if args.ufs or node.name != 'sweet-ufs']
 for node in tree.children:
     if node.name == 'cpus':
@@ -54,4 +60,5 @@ for node in tree.children:
 destination = args.output
 destination.parent.mkdir(parents=True, exist_ok=True)
 destination.write_bytes(adt.serialize(tree))
-print(f'Wrote {destination}: one Gold core, 1 GiB at 0x80000000, UFS={args.ufs}, display={args.display}, WLAN=False')
+print(f'Wrote {destination}: one Gold core, {args.ram_mib} MiB at 0x80000000, '
+      f'UFS={args.ufs}, display={args.display}, WLAN=False')

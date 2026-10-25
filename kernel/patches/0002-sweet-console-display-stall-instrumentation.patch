@@ -1,0 +1,920 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -31,6 +31,7 @@
+ #include <kern/locks.h>
+ #include <kern/clock.h>
+ #include <kern/sched_prim.h>
++#include <kern/timer_call.h>
+ #include <machine/machine_routines.h>
+ #include <arm/caches_internal.h>
+ #include <vm/pmap.h>
+@@ -50,10 +51,19 @@
+ extern int hz;
+ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
++extern void sweet_progress(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
++/* vm/vm_page.h, not included here */
++extern unsigned int vm_page_free_count;
++extern unsigned int vm_page_wire_count;
+ 
++/* Counters carried in the flight-recorder block. */
++static uint64_t _Atomic sweet_ufs_ios;
++static uint64_t _Atomic sweet_flush_runs;
++static uint64_t _Atomic sweet_console_seq;
++
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+ #define REG_IE          0x24
+@@ -116,6 +126,17 @@
+ 
+ static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
+ static LCK_MTX_DECLARE(sweet_ufs_lock, &sweet_ufs_grp);
++/*
++ * How many threads are inside the UFS driver (including waiting for the
++ * mutex). The interrupt-context stall sampler may only touch the controller
++ * when this is zero: with one CPU and interrupts off, that guarantees the
++ * bounce buffer and the request slot are idle.
++ */
++static uint64_t _Atomic sweet_ufs_users;
++#define SWEET_UFS_LOCK()   do { os_atomic_inc(&sweet_ufs_users, relaxed); \
++	lck_mtx_lock(&sweet_ufs_lock); } while (0)
++#define SWEET_UFS_UNLOCK() do { lck_mtx_unlock(&sweet_ufs_lock); \
++	os_atomic_dec(&sweet_ufs_users, relaxed); } while (0)
+ 
+ static inline uint32_t
+ ufs_rd(uint32_t off)
+@@ -448,7 +469,7 @@
+ 	if (!su.ready) {
+ 		return EAGAIN;
+ 	}
+-	lck_mtx_lock(&sweet_ufs_lock);
++	SWEET_UFS_LOCK();
+ 	uint8_t saved = su.lun;
+ 	error = ufs_lookup_part(want, &slot);
+ 	uint64_t bytes = error ? 0 : part_cache[slot].nblocks * UFS_BLOCK;
+@@ -468,7 +489,7 @@
+ 		}
+ 	}
+ 	su.lun = saved;
+-	lck_mtx_unlock(&sweet_ufs_lock);
++	SWEET_UFS_UNLOCK();
+ 	return error;
+ }
+ 
+@@ -532,6 +553,8 @@
+ 
+ 	bool rd = buf_flags(bp) & B_READ;
+ 
++	os_atomic_inc(&sweet_ufs_ios, relaxed);
++
+ 	buf_setresid(bp, count);
+ 	if (!rd && !su.writable) {
+ 		error = EROFS;
+@@ -549,7 +572,7 @@
+ 		goto done;
+ 	}
+ 
+-	lck_mtx_lock(&sweet_ufs_lock);
++	SWEET_UFS_LOCK();
+ 	for (uint32_t done = 0; done < count;) {
+ 		uint64_t pos = off + done;
+ 		uint64_t lba = pos / UFS_BLOCK;
+@@ -578,7 +601,7 @@
+ 		done += want;
+ 		buf_setresid(bp, count - done);
+ 	}
+-	lck_mtx_unlock(&sweet_ufs_lock);
++	SWEET_UFS_UNLOCK();
+ 	buf_unmap(bp);
+ 
+ done:
+@@ -622,9 +645,9 @@
+ 		if (!su.writable) {
+ 			return 0;
+ 		}
+-		lck_mtx_lock(&sweet_ufs_lock);
++		SWEET_UFS_LOCK();
+ 		int error = ufs_sync_cache();
+-		lck_mtx_unlock(&sweet_ufs_lock);
++		SWEET_UFS_UNLOCK();
+ 		return error;
+ 	}
+ 	case DKIOCGETMAXBLOCKCOUNTREAD:
+@@ -715,7 +738,7 @@
+ 
+ 		uint32_t h = 0, e = 0, bh = 0;
+ 		bool ok;
+-		lck_mtx_lock(&sweet_ufs_lock);
++		SWEET_UFS_LOCK();
+ 		ok = ufs_read_blocks(1, 1) == 0 && memcmp(b, "EFI PART", 8) == 0;
+ 		if (ok) {
+ 			memcpy(&h, b + 16, 4);
+@@ -726,7 +749,7 @@
+ 				memcpy(&bh, b + 16, 4);
+ 			}
+ 		}
+-		lck_mtx_unlock(&sweet_ufs_lock);
++		SWEET_UFS_UNLOCK();
+ 		if (!ok || h != gpt_hcrc || e != gpt_ecrc || (gpt_bhcrc && bh != gpt_bhcrc)) {
+ 			uint64_t ns;
+ 			absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
+@@ -774,7 +797,7 @@
+ 	su.lun = 0;
+ 	su.secsize = DEV_BSIZE;
+ 
+-	lck_mtx_lock(&sweet_ufs_lock);
++	SWEET_UFS_LOCK();
+ 	error = ufs_take_over_host();
+ 	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
+@@ -785,7 +808,7 @@
+ 	if (!error) {
+ 		error = ufs_find_partition(want);
+ 	}
+-	lck_mtx_unlock(&sweet_ufs_lock);
++	SWEET_UFS_UNLOCK();
+ 	if (error) {
+ 		return error;
+ 	}
+@@ -850,6 +873,9 @@
+ 
+ static char sweet_log_ring[SWEET_LOG_SIZE];
+ static uint64_t _Atomic sweet_log_total;
++/* Bytes printed by threads other than the interrupt stall probe. */
++static uint64_t _Atomic sweet_other_bytes;
++static int sweet_in_probe;
+ static int sweet_log_chan;
+ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
+ 
+@@ -863,6 +889,9 @@
+ 		return;
+ 	}
+ 	uint64_t at = os_atomic_add_orig(&sweet_log_total, (uint64_t)size, relaxed);
++	if (!sweet_in_probe) {
++		os_atomic_add(&sweet_other_bytes, (uint64_t)size, relaxed);
++	}
+ 	for (int i = 0; i < size; i++) {
+ 		sweet_log_ring[(at + (uint64_t)i) % SWEET_LOG_SIZE] = c[i];
+ 	}
+@@ -898,13 +927,326 @@
+ 	return os_atomic_load(&sweet_log_total, relaxed);
+ }
+ 
++/* What the flush thread last persisted; printed by the stall watchdog. */
++static uint64_t _Atomic sweet_log_flushed;
++
++uint64_t sweet_log_flushed_bytes(void);
++
++uint64_t
++sweet_log_flushed_bytes(void)
++{
++	return os_atomic_load(&sweet_log_flushed, relaxed);
++}
++
++uint64_t sweet_ufs_ios_count(void);
++
++uint64_t
++sweet_ufs_ios_count(void)
++{
++	return os_atomic_load(&sweet_ufs_ios, relaxed);
++}
++
+ struct sweet_log_header {
+ 	char magic[8];
+ 	uint32_t version, size;
+ 	uint64_t total, seq;
++};
++
++/*
++ * Flight recorder: one device block just before the console-log area (still
++ * far past the end of the 16 GiB HFS image, so nothing else uses it). A
++ * kernel thread rewrites it every few seconds with counters that show which
++ * subsystem is still running, so a later reset cannot hide a stall behind a
++ * blocked console. It also carries a persistent boot id plus a snapshot of
++ * the previous boot's last heartbeat, so a watchdog panic + hardware reset
++ * loop is visible after the fact. tools/pull-sweetlog.sh fetches it too.
++ */
++#define SWEET_HB_SECS   5
++#define SWEET_HB_VERSION 1u
++#define SWEET_HB_RUNNING 0u
++#define SWEET_HB_DUMPING 1u
++
++struct sweet_heartbeat {
++	char magic[8];
++	uint32_t version;
++	uint32_t phase;         /* 0 running, 1 watchdog dump/panic in progress */
++	uint64_t boot_id;       /* persistent, incremented by each boot */
++	uint64_t seq;           /* heartbeat write number */
++	uint64_t uptime_s;      /* mach_absolute_time since boot */
++	uint64_t console_bytes; /* characters handed to the console */
++	uint64_t console_seq;   /* last console-log flush sequence persisted */
++	uint64_t ufs_ios;       /* block I/O requests serviced */
++	uint64_t flush_runs;    /* console flush thread wakeups */
++	uint64_t free_pages;    /* VM free page count */
++	uint64_t wire_pages;    /* VM wired page count */
++	/* how far the previous boot got before the phone reset */
++	uint64_t prev_boot_id, prev_phase, prev_uptime_s, prev_console_bytes,
++	    prev_console_seq, prev_ufs_ios, prev_flush_runs;
+ };
+ 
++static int sweet_hb_chan;
++static uint64_t sweet_hb_base;
++static struct sweet_heartbeat sweet_hb_prev;   /* this boot's own last write */
+ static void
++sweet_hb_write(uint32_t phase, bool try_only)
++{
++	static uint64_t seq;
++	void *bounce = (void *)(su.dma + DMA_BOUNCE);
++
++	struct sweet_heartbeat hb = {
++		.magic = { 'S', 'W', 'E', 'E', 'T', 'H', 'B', '1' },
++		.version = SWEET_HB_VERSION,
++		.phase = phase,
++		.boot_id = sweet_hb_prev.boot_id,
++		.seq = ++seq,
++		.console_bytes = os_atomic_load(&sweet_log_total, relaxed),
++		.console_seq = os_atomic_load(&sweet_console_seq, relaxed),
++		.ufs_ios = os_atomic_load(&sweet_ufs_ios, relaxed),
++		.flush_runs = os_atomic_load(&sweet_flush_runs, relaxed),
++		.free_pages = vm_page_free_count,
++		.wire_pages = vm_page_wire_count,
++	};
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	hb.uptime_s = ns / 1000000000ULL;
++	hb.prev_boot_id = sweet_hb_prev.prev_boot_id;
++	hb.prev_phase = sweet_hb_prev.prev_phase;
++	hb.prev_uptime_s = sweet_hb_prev.prev_uptime_s;
++	hb.prev_console_bytes = sweet_hb_prev.prev_console_bytes;
++	hb.prev_console_seq = sweet_hb_prev.prev_console_seq;
++	hb.prev_ufs_ios = sweet_hb_prev.prev_ufs_ios;
++	hb.prev_flush_runs = sweet_hb_prev.prev_flush_runs;
++
++	/* A stalled UFS must not stop the watchdog from panicking: try only. */
++	if (try_only) {
++		os_atomic_inc(&sweet_ufs_users, relaxed);
++		if (!lck_mtx_try_lock(&sweet_ufs_lock)) {
++			os_atomic_dec(&sweet_ufs_users, relaxed);
++			return;
++		}
++	} else {
++		SWEET_UFS_LOCK();
++	}
++	bzero(bounce, UFS_BLOCK);
++	memcpy(bounce, &hb, sizeof(hb));
++	int error = ufs_write_blocks(sweet_hb_base, 1);
++	if (!error) {
++		error = ufs_sync_cache();
++	}
++	SWEET_UFS_UNLOCK();
++	if (!error) {
++		sweet_hb_prev = hb;     /* what the next boot will see */
++	}
++}
++
++/* Called from the stall watchdog just before it panics. */
++void
++sweet_hb_mark(uint32_t phase)
++{
++	if (sweet_hb_base != 0) {
++		sweet_hb_write(phase, true);
++	}
++}
++
++/*
++ * Interrupt-context stall probe. When every thread stops making progress the
++ * scheduler cannot run any watchdog, so this runs from a timer_call (which
++ * always keeps a decrementer deadline armed) and reads the pc that
++ * rtclock_intr recorded for the interrupted thread. It reports twice:
++ *  - to the panel, by printing to the kernel console and pointing the MDP back
++ *    at the console frame, which needs no scheduler, locks or disk;
++ *  - to a ring of blocks below the heartbeat block, when no thread is inside
++ *    the UFS driver.
++ */
++#define SWEET_STALL_SLOTS       16
++#define SWEET_STALL_AFTER_NS    10000000000ull   /* 10 s without progress */
++#define SWEET_STALL_EVERY_NS     5000000000ull   /* probe period */
++#define SWEET_STALL_VERSION      1u
++
++struct sweet_stall {
++	char magic[8];
++	uint32_t version;
++	uint32_t slot;
++	uint64_t seq;
++	uint64_t uptime_s;
++	uint64_t stall_s;
++	uint64_t pc;            /* interrupted pc: kernel VA if in the kernel */
++	uint64_t last_pc;       /* pc of the previous sample */
++	char name[16];          /* process name of the interrupted thread */
++	uint64_t console_bytes;
++	uint64_t ufs_ios;
++	uint64_t free_pages;
++	uint64_t ufs_users;
++};
++
++/* Set by rtclock_intr (osfmk/arm/rtclock.c) before it runs the timer queue. */
++uintptr_t sweet_intr_pc;
++
++static void sweet_stall_probe(void);
++extern void sweet_fb_show_console(void);
++extern void sweet_console_force(const char *s, int len);
++
++static int sweet_panel_mode;
++int sweet_console_hold;
++
++/*
++ * Called from rtclock_intr (osfmk/arm/rtclock.c) on every timer interrupt, in
++ * interrupt context, with the interrupted pc. rtclock also keeps a 1 Hz tick
++ * armed (see there) because timer_call callbacks never run on this port:
++ * ml_timer_evaluate() is empty, so only thread-wakeup deadlines are serviced.
++ */
++void
++sweet_stall_service(uintptr_t pc)
++{
++	uint64_t step, ns;
++	static int shown;
++	static uint64_t next_service;
++	uint64_t now;
++
++	sweet_intr_pc = pc;
++	nanoseconds_to_absolutetime(SWEET_STALL_EVERY_NS, &step);
++	now = mach_absolute_time();
++	if (now < next_service) {
++		return;
++	}
++	next_service = now + step;
++
++	if (sweet_panel_mode) {
++		/* Prove from the first firing that this path reaches the panel. */
++		char line[96];
++		absolutetime_to_nanoseconds(now, &ns);
++		int n = snprintf(line, sizeof(line), "SWEET PANEL t=%llus ufs=%llu c=%llu\n",
++		    ns / 1000000000ull, os_atomic_load(&sweet_ufs_users, relaxed),
++		    os_atomic_load(&sweet_other_bytes, relaxed));
++		sweet_in_probe = 1;
++		printf("%s", line);
++		sweet_console_force(line, n);
++		sweet_in_probe = 0;
++		sweet_fb_show_console();
++		sweet_console_hold = 1;   /* keep the console frame on the panel */
++		shown = 1;
++		(void)shown;
++	}
++	sweet_stall_probe();
++}
++
++static void
++sweet_stall_probe(void)
++{
++	static uint64_t idle_since, last_sample, samples;
++	static uint64_t last_out, last_ios, prev_pc;
++	uint64_t now = mach_absolute_time();
++	uint64_t step, idle_ns;
++
++	if (sweet_hb_base == 0) {
++		return;
++	}
++	uint64_t out = os_atomic_load(&sweet_other_bytes, relaxed);
++	uint64_t ios = os_atomic_load(&sweet_ufs_ios, relaxed);
++	if (out != last_out || ios != last_ios) {
++		last_out = out;
++		last_ios = ios;
++		idle_since = 0;
++		return;
++	}
++	if (idle_since == 0) {
++		idle_since = now;
++		return;
++	}
++	absolutetime_to_nanoseconds(now - idle_since, &idle_ns);
++	if (idle_ns < SWEET_STALL_AFTER_NS) {
++		return;
++	}
++	nanoseconds_to_absolutetime(SWEET_STALL_EVERY_NS, &step);
++	if (now - last_sample < step) {
++		return;
++	}
++	last_sample = now;
++
++	uintptr_t pc = sweet_intr_pc;
++	uint64_t users = os_atomic_load(&sweet_ufs_users, relaxed);
++	struct sweet_stall st = {
++		.magic = { 'S', 'W', 'E', 'E', 'T', 'S', 'T', 'L' },
++		.version = SWEET_STALL_VERSION,
++		.slot = (uint32_t)(samples % SWEET_STALL_SLOTS),
++		.seq = ++samples,
++		.stall_s = idle_ns / 1000000000ull,
++		.pc = pc,
++		.last_pc = prev_pc,
++		.console_bytes = out,
++		.ufs_ios = ios,
++		.free_pages = vm_page_free_count,
++		.ufs_users = users,
++	};
++	prev_pc = pc;
++	uint64_t ns;
++	absolutetime_to_nanoseconds(now, &ns);
++	st.uptime_s = ns / 1000000000ull;
++	proc_selfname(st.name, sizeof(st.name));
++
++	/*
++	 * Panel first: this must work even when the compositor, the disk and the
++	 * scheduler are gone. printf draws into the console shadow; the hook
++	 * points the display at it with register writes only.
++	 */
++	char line[160];
++	int n = snprintf(line, sizeof(line),
++	    "SWEET STALL %llus stall=%llus ufs=%llu pc=0x%llx last=0x%llx %s\n",
++	    st.uptime_s, st.stall_s, users, (uint64_t)pc, (uint64_t)prev_pc, st.name);
++	sweet_in_probe = 1;
++	printf("%s", line);
++	sweet_console_force(line, n);
++	sweet_in_probe = 0;
++	sweet_fb_show_console();
++
++	/* Then persist it, if no thread is inside the driver right now. */
++	if (users == 0) {
++		void *bounce = (void *)(su.dma + DMA_BOUNCE);
++		bzero(bounce, UFS_BLOCK);
++		memcpy(bounce, &st, sizeof(st));
++		if (ufs_write_blocks(sweet_hb_base - 1 - (st.slot % SWEET_STALL_SLOTS), 1) == 0) {
++			(void)ufs_sync_cache();
++		}
++	}
++}
++
++static void
++sweet_hb_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	void *bounce = (void *)(su.dma + DMA_BOUNCE);
++	struct sweet_heartbeat old;
++	int error;
++
++	sweet_hb_base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS - 1;
++	bzero(&old, sizeof(old));
++	SWEET_UFS_LOCK();
++	error = ufs_read_blocks(sweet_hb_base, 1);
++	if (!error) {
++		memcpy(&old, bounce, sizeof(old));
++	}
++	SWEET_UFS_UNLOCK();
++
++	if (error == 0 && memcmp(old.magic, "SWEETHB1", 8) == 0 && old.version == SWEET_HB_VERSION) {
++		sweet_hb_prev.boot_id = old.boot_id + 1;
++		sweet_hb_prev.prev_boot_id = old.boot_id;
++		sweet_hb_prev.prev_phase = old.phase;
++		sweet_hb_prev.prev_uptime_s = old.uptime_s;
++		sweet_hb_prev.prev_console_bytes = old.console_bytes;
++		sweet_hb_prev.prev_console_seq = old.console_seq;
++		sweet_hb_prev.prev_ufs_ios = old.ufs_ios;
++		sweet_hb_prev.prev_flush_runs = old.flush_runs;
++	} else {
++		sweet_hb_prev.boot_id = 1;
++	}
++	sweet_hb_write(SWEET_HB_RUNNING, false);
++	PE_parse_boot_argn("sweetpanel", &sweet_panel_mode, sizeof(sweet_panel_mode));
++	for (;;) {
++		(void)tsleep(&sweet_hb_chan, PZERO, "sweethb", hz * SWEET_HB_SECS);
++		sweet_hb_write(SWEET_HB_RUNNING, false);
++	}
++}
++
++static void
+ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
+@@ -915,6 +1257,8 @@
+ 	    SWEET_LOG_BLOCKS * UFS_BLOCK >> 10, base);
+ 	for (;;) {
+ 		(void)tsleep(&sweet_log_chan, PZERO, "sweetlog", hz * (int)sweet_log_secs);
++		sweet_progress();       /* watchdog: the thread ran even if idle */
++		os_atomic_inc(&sweet_flush_runs, relaxed);
+ 		uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
+ 		if (total == flushed) {
+ 			continue;
+@@ -922,7 +1266,7 @@
+ 		uint64_t pos = total - flushed >= SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : flushed;
+ 		int error = 0;
+ 
+-		lck_mtx_lock(&sweet_ufs_lock);
++		SWEET_UFS_LOCK();
+ 		while (pos < total && !error) {
+ 			uint32_t off = (uint32_t)(pos % SWEET_LOG_SIZE);
+ 			uint32_t blk = off / UFS_BLOCK;
+@@ -945,12 +1289,14 @@
+ 		if (!error) {
+ 			error = ufs_sync_cache();
+ 		}
+-		lck_mtx_unlock(&sweet_ufs_lock);
++		SWEET_UFS_UNLOCK();
+ 		if (error) {
+ 			printf("SWEET LOG: write failed (%d), stopping\n", error);
+ 			return;
+ 		}
+ 		flushed = total;
++		os_atomic_store(&sweet_log_flushed, total, relaxed);
++		os_atomic_store(&sweet_console_seq, seq, relaxed);
+ 	}
+ }
+ 
+@@ -971,6 +1317,9 @@
+ 	if (kernel_thread_start(sweet_log_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	if (kernel_thread_start(sweet_hb_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ }
+ 
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -45,7 +45,28 @@
+ }
+ 
+ extern void sweet_sample_task(const char *name, int pid, task_t task);  /* osfmk/kern/exception.c */
++extern int sweet_sample_compact;                /* osfmk/kern/exception.c */
++extern uint64_t sweet_log_position(void);       /* bsd/dev/sweet_ufs.c */
++extern uint64_t sweet_log_flushed_bytes(void);  /* bsd/dev/sweet_ufs.c */
++extern uint64_t sweet_ufs_ios_count(void);      /* bsd/dev/sweet_ufs.c */
++extern void sweet_hb_mark(uint32_t phase);      /* bsd/dev/sweet_ufs.c */
+ 
++/*
++ * Watchdog progress counter. The console-log flush thread bumps it every
++ * ufslogsecs even when there is nothing to write, so a frozen counter means
++ * the kernel can no longer schedule that thread (or it is stuck in I/O).
++ * sweetwdt=<seconds> (0 = off) then prints a compact stack dump of the
++ * sampled processes and panics, so the dump stays on the panel to photograph.
++ */
++static uint64_t sweet_progress_counter;
++
++void
++sweet_progress(void)
++{
++	__atomic_add_fetch(&sweet_progress_counter, 1, __ATOMIC_RELAXED);
++}
++
++
+ static int
+ sweet_sample_proc(proc_t p, __unused void *arg)
+ {
+@@ -78,6 +99,48 @@
+ 	}
+ }
+ 
++static void
++sweet_wdt_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static int chan;
++	int secs = 0;
++	if (!PE_parse_boot_argn("sweetwdt", &secs, sizeof(secs)) || secs < 15) {
++		return;
++	}
++	/*
++	 * Console bytes are the real progress signal: the flush thread keeps
++	 * waking even when a console lock or the display path has wedged every
++	 * writer, so its own wakeups cannot be used here.
++	 */
++	uint64_t last_out = sweet_log_position();
++	uint64_t last_ios = sweet_ufs_ios_count();
++	int idle = 0;
++	for (;;) {
++		(void)tsleep(&chan, PZERO, "sweetwdt", 5 * hz);
++		uint64_t out = sweet_log_position();
++		uint64_t ios = sweet_ufs_ios_count();
++		if (out != last_out || ios != last_ios) {
++			last_out = out;
++			last_ios = ios;
++			idle = 0;
++			continue;
++		}
++		idle += 5;
++		if (idle < secs) {
++			continue;
++		}
++		/* Record the stall even if the console or a panic cannot print. */
++		sweet_hb_mark(1);
++		printf("SWEET WDT: no console output or block I/O for %d s\n", idle);
++		printf("SWEET WDT: console generated %llu bytes, flushed %llu\n",
++		    sweet_log_position(), sweet_log_flushed_bytes());
++		sweet_sample_compact = 1;
++		printf("SMP --- stall dump\n");
++		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
++		panic("SWEET WDT: stall, no progress for %d s", idle);
++	}
++}
++
+ void
+ sweet_sample_start(void)
+ {
+@@ -85,4 +148,7 @@
+ 	if (kernel_thread_start(sweet_sample_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	if (kernel_thread_start(sweet_wdt_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ }
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -995,6 +995,8 @@
+  * pointer backtrace of every thread of a task, from the saved user state.
+  */
+ void sweet_sample_task(const char *name, int pid, task_t task);
++/* Set by the stall watchdog: fewer threads/frames so a panic dump fits a screen. */
++int sweet_sample_compact;
+ 
+ void
+ sweet_sample_task(const char *name, int pid, task_t task)
+@@ -1002,6 +1004,8 @@
+ 	vm_map_t map = get_task_map(task);
+ 	uint64_t slide = 0;
+ 	int tn = 0;
++	int max_threads = sweet_sample_compact ? 4 : 1000;
++	int max_frames = sweet_sample_compact ? 6 : 16;
+ 	thread_t thread;
+ 	vm_shared_region_t sr = vm_shared_region_get(task);
+ 
+@@ -1021,10 +1025,13 @@
+ 		if (ss == NULL || !is_saved_state64(ss)) {
+ 			continue;
+ 		}
++		if (tn >= max_threads) {
++			break;
++		}
+ 		fp = get_saved_state_fp(ss);
+ 		n = snprintf(line, sizeof(line), "SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx bt", name, tn++,
+ 		    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss));
+-		for (int i = 0; i < 16 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
++		for (int i = 0; i < max_frames && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
+ 			uint64_t frame[2];
+ 			if (vm_map_read_user(map, fp, frame, sizeof(frame)) != KERN_SUCCESS) {
+ 				break;
+--- a/osfmk/arm/rtclock.c
++++ b/osfmk/arm/rtclock.c
+@@ -367,6 +367,28 @@
+ 
+ 	/* call the generic etimer */
+ 	timer_intr(user_mode, pc);
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * A 1 Hz floor on timer interrupts, applied after timer_intr() has
++	 * re-synced the real deadline: timer_call callbacks never expire on this
++	 * port (ml_timer_evaluate is empty), so without it the decrementer stops
++	 * once every thread is asleep and no watchdog can observe a stall. Only
++	 * ever pulls the deadline in.
++	 */
++	{
++		uint64_t now = mach_absolute_time();
++		uint64_t sec = (uint64_t)rtclock_sec_divisor;
++		if (cdp->rtcPop == 0 || cdp->rtcPop - now > sec) {
++			cdp->rtcPop = now + sec;
++			ml_set_decrementer((uint32_t)sec);
++		}
++	}
++	extern void sweet_stall_service(uintptr_t pc);
++	if (!user_mode) {
++		sweet_stall_service(pc);
++	}
++#endif
+ }
+ 
+ static int
+--- a/osfmk/console/video_console.c
++++ b/osfmk/console/video_console.c
+@@ -3431,4 +3431,23 @@
+ 	gc_ops.show_cursor = sweet_cursor;
+ 	VCPUTC_LOCK_UNLOCK();
+ }
++
++/*
++ * Draw straight into the console frame even though the window server paused the
++ * console (gc_enabled = FALSE, disableConsoleOutput = 1). The interrupt stall
++ * probe uses this so its report reaches the panel without the scheduler.
++ */
++void
++sweet_console_force(const char *s, int len)
++{
++	if (!gc_initialized || len <= 0) {
++		return;
++	}
++	VCPUTC_LOCK_LOCK();
++	gc_enabled = TRUE;
++	for (int i = 0; i < len; i++) {
++		gc_putchar(s[i]);
++	}
++	VCPUTC_LOCK_UNLOCK();
++}
+ #endif
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -318,7 +318,7 @@
+ 		return;
+ 	}
+ 	if (sweet_log_filter < 0) {
+-		sweet_log_filter = PE_parse_boot_argn("sweetlog", sweet_log_words, sizeof(sweet_log_words)) &&
++		sweet_log_filter = PE_parse_boot_argn("sweetlogmask", sweet_log_words, sizeof(sweet_log_words)) &&
+ 		    sweet_log_words[0] != '\0';
+ 	}
+ 	if (sweet_log_filter > 0 && !panic_active()) {
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -68,6 +68,7 @@
+ }
+ class AppleCLCD;
+ static AppleCLCD *sweet_cons_fb;
++extern "C" int sweet_console_hold;
+ static void sweet_cons_show(void);
+ class OSDictionary;
+ static void sweet_bl_log(const char *who, OSDictionary *d);
+@@ -410,6 +411,19 @@
+ 		    frames - fb->fIntfFrames, fb->fIntf1[(0x800 + 0x0b0) / 4], fb->fIntf1[0x800 / 4]);
+ 		fb->fIntfFrames = frames;
+ 	}
++	/*
++	 * Stall-probe hold (boot-arg sweetpanel=1): keep the panel on the kernel
++	 * console frame so interrupt-context text stays readable, while clients
++	 * still get their vsync notifications.
++	 */
++	if (sweet_console_hold) {
++		if (fb->fVig0 != NULL && fb->fScanPhys != fb->fConsPhys) {
++			fb->scanFrom(fb->fConsPhys, fb->fRowBytes);
++		}
++		IOLockUnlock(fb->fLock);
++		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		return;
++	}
+ 	if (fb->fPowerOff) {
+ 		/*
+ 		 * topaz: fade in cached memory and flip whole frames to the MDP.
+@@ -756,6 +770,17 @@
+ 	if (fb != NULL && fb->fVig0 != NULL && fb->fScanPhys != fb->fConsPhys) {
+ 		fb->scanFrom(fb->fConsPhys, fb->fRowBytes);
+ 	}
++}
++
++/*
++ * Called from the timer-interrupt stall probe: put the panel back on the
++ * kernel console frame so text printed from interrupt context is visible even
++ * when the compositor's vsync thread is gone. Register writes only.
++ */
++extern "C" void
++sweet_fb_show_console(void)
++{
++	sweet_cons_show();
+ }
+ 
+ void
+@@ -846,6 +871,20 @@
+ 		if ((pa & 0xf) == 0 && pa + (uint64_t)fHeight * s->bytesPerRow < (1ull << 32)) {
+ 			uintptr_t va = s->kernelAddress();
+ 			if (va != 0) {
++				static uint32_t pix_logs;
++				if (pix_logs < 8) {
++					pix_logs++;
++					const uint32_t *q = (const uint32_t *)(va + s->offset);
++					uint32_t total = s->width * s->height, nz = 0, tested = 0;
++					for (uint32_t k = 0; k < total; k += 97) {
++						nz += q[k] != 0;
++						tested++;
++					}
++					const uint32_t *mid = q + (s->height / 2) * (s->bytesPerRow / 4) + s->width / 2;
++					IOLog("SWEET FB: present %ux%u bpr %u off %u nz %u/%u mid %08x top %08x bottom %08x\n",
++					    s->width, s->height, s->bytesPerRow, s->offset, nz, tested, mid[0],
++					    q[0], q[(s->height - 1) * (s->bytesPerRow / 4)]);
++				}
+ 				/*
+ 				 * Copy into our back buffer and flip: CoreAnimation may start the
+ 				 * next frame in this surface at once, so scanning it directly let
+@@ -877,6 +916,21 @@
+ 	return ok;
+ }
+ 
++static uint32_t
++sweet_surface_rgb_nz(SweetSurface *s)
++{
++	uintptr_t va = s->kernelAddress();
++	if (va == 0) {
++		return 0;
++	}
++	const uint32_t *q = (const uint32_t *)va;
++	uint32_t tot = s->width * s->height, nz = 0;
++	for (uint32_t k = 0; k < tot; k += 97) {
++		nz += (q[k] & 0x00ffffffu) != 0;
++	}
++	return nz;
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+@@ -892,6 +946,105 @@
+ 		(void)mask;
+ 		return;
+ 	}
++	/*
++	 * TEST: the swap record can reference an empty 1125x2436 surface while the
++	 * composed frame sits in a 1080x2340 surface. If the referenced surface is
++	 * empty, present the best non-empty same-size surface instead.
++	 */
++	{
++		static uint32_t fb_logs;
++		SweetSurface *s0 = sweet_surface_copy(get32(rec, 0x54));
++		uint32_t nz0 = s0 != NULL ? sweet_surface_rgb_nz(s0) : 0;
++		OSSafeReleaseNULL(s0);
++		if (nz0 == 0) {
++			uint32_t best = 0, best_nz = 0;
++			for (uint32_t id = 2; id <= 8; id++) {
++				SweetSurface *ss = sweet_surface_copy(id);
++				if (ss == NULL) {
++					continue;
++				}
++				if (ss->width == fWidth && ss->height == fHeight) {
++					uint32_t nz = sweet_surface_rgb_nz(ss);
++					if (nz > best_nz) {
++						best_nz = nz;
++						best = id;
++					}
++				}
++				ss->release();
++			}
++			if (best != 0) {
++				SweetSurface *bs = sweet_surface_copy(best);
++				if (bs != NULL) {
++					uintptr_t va = bs->kernelAddress();
++					if (va != 0) {
++						if (fb_logs < 8) {
++							fb_logs++;
++							IOLog("SWEET FB: fallback frame surface %u nz %u (record %u)\n",
++							    best, best_nz, get32(rec, 0x54));
++						}
++						fConsShown = false;
++						fConsolePaused = true;
++						flipFrom((const uint8_t *)va, bs->bytesPerRow);
++					}
++					bs->release();
++				}
++				return;
++			}
++		}
++	}
++	/* A swap with no enabled layer carries no frame: keep what is on screen. */
++	{
++		static uint32_t surf_logs;
++		if (surf_logs < 6) {
++			surf_logs++;
++			for (uint32_t id = 1; id <= 8; id++) {
++				SweetSurface *ss = sweet_surface_copy(id);
++				if (ss == NULL) {
++					continue;
++				}
++				uintptr_t sv = ss->kernelAddress();
++				uint32_t tot = ss->width * ss->height, nz = 0, tested = 0;
++				uint32_t px0 = 0, px1 = 0;
++				if (sv != 0) {
++					const uint32_t *q = (const uint32_t *)sv;
++					px0 = q[0];
++					px1 = q[tot / 2];
++					for (uint32_t k = 0; k < tot; k += 97) {
++						nz += (q[k] & 0x00ffffffu) != 0;
++						tested++;
++					}
++				}
++				IOLog("SWEET FB: surface %u %ux%u bpr %u rgb-nz %u/%u px %08x %08x\n", id,
++				    ss->width, ss->height, ss->bytesPerRow, nz, tested, px0, px1);
++				ss->release();
++			}
++			uint32_t pnz = 0, pt = 0;
++			for (int32_t y = 0; y < (int32_t)fHeight; y += 7) {
++				const uint32_t *row = (const uint32_t *)(fPixels + (uint64_t)y * fRowBytes);
++				for (int32_t x = 0; x < (int32_t)fWidth; x += 7) {
++					pnz += row[x] != 0;
++					pt++;
++				}
++			}
++			IOLog("SWEET FB: panel nz %u/%u\n", pnz, pt);
++		}
++		static uint32_t present_logs;
++		uint32_t enabled = 0;
++		for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
++			if ((mask & (1u << i)) && get32(rec, 0x54 + 4 * i) != 0) {
++				enabled++;
++			}
++		}
++		if (present_logs < 12) {
++			present_logs++;
++			IOLog("SWEET FB: present %u mask 0x%x ids %u %u %u %u layers %u\n",
++			    get32(rec, 0x50), mask, get32(rec, 0x54), get32(rec, 0x58),
++			    get32(rec, 0x5c), get32(rec, 0x60), enabled);
++		}
++		if (enabled == 0) {
++			return;
++		}
++	}
+ 	fConsShown = false;
+ 	if (directPresent(rec)) {
+ 		if (!fConsolePaused) {

@@ -100,9 +100,12 @@ int try_xnu(void)
     const struct payload *p = (const struct payload *)start;
     if (!matches(p->magic, "SWEETXNU") || p->version != 1 || !p->count || p->count > 64 ||
         p->count > (length - sizeof(*p)) / sizeof(struct segment)) return -3;
-    /* First Citrus profile is intentionally limited to the verified low 1GiB
-     * bank. Nothing from Topaz's nonexistent high DDR bank is accepted. */
-    if (p->phys_base != 0x80000000 || p->memory_size != 0x40000000 ||
+    /* Citrus profiles are limited to the verified low DDR bank that starts at
+     * 0x80000000: 1 GiB (original) or 1.75 GiB, which ends at 0xf0000000 just
+     * below the first firmware reservation at 0xf3c00000. Nothing from Topaz's
+     * nonexistent high DDR bank is accepted. */
+    if (p->phys_base != 0x80000000 ||
+        (p->memory_size != 0x40000000 && p->memory_size != 0x70000000) ||
         p->virt_base > p->entry || p->virt_base > p->kernel_end ||
         p->kernel_end - p->virt_base > p->memory_size ||
         !inside(p->adt_offset, p->adt_size, 0, length) || !p->adt_size ||

@@ -26,11 +26,14 @@ log = raw[17 * 4096:]
 open(f'{out}/{name}-sweetlog.bin', 'wb').write(log)
 open(f'{out}/{name}-heartbeat.bin', 'wb').write(hb)
 
+# Field order must match struct sweet_heartbeat in bsd/dev/sweet_ufs.c exactly:
+# the prev_* block sits where it does in the struct, and the interrupt-side
+# fields come last. Getting this wrong mislabels every value.
 fields = ['boot_id', 'seq', 'uptime_s', 'console_bytes', 'console_seq', 'ufs_ios',
           'flush_runs', 'free_pages', 'wire_pages',
-          'svc_runs', 'panel_runs', 'intr_pc', 'ufs_users',
           'prev_boot_id', 'prev_phase', 'prev_uptime_s', 'prev_console_bytes',
-          'prev_console_seq', 'prev_ufs_ios', 'prev_flush_runs']
+          'prev_console_seq', 'prev_ufs_ios', 'prev_flush_runs',
+          'svc_runs', 'panel_runs', 'intr_pc', 'ufs_users']
 if hb[:8] == b'SWEETHB1':
     version, phase = struct.unpack_from('<II', hb, 8)
     values = struct.unpack_from('<20Q', hb, 16)

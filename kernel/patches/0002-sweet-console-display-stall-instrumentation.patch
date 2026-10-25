@@ -8,7 +8,7 @@
  #include <machine/machine_routines.h>
  #include <arm/caches_internal.h>
  #include <vm/pmap.h>
-@@ -50,10 +51,22 @@
+@@ -50,10 +51,27 @@
  extern int hz;
  static void sweet_log_start(void);
  extern void sweet_sample_start(void);
@@ -16,6 +16,11 @@
  extern void sweet_keys_init(void);
  extern void sweet_touch_init(void);
  extern void sweet_usb_probe(void);
++static void sweet_ufs_op_begin(uint8_t cdb0, uint32_t len, bool write);
++static void sweet_ufs_op_end(void);
++static bool sweet_panel_on(void);
++static bool sweet_irq_ufs_writes(void);
++static void sweet_irq_writes_resolve(void);
 +/* vm/vm_page.h, not included here */
 +extern unsigned int vm_page_free_count;
 +extern unsigned int vm_page_wire_count;
@@ -31,7 +36,7 @@
  #define REG_CAP         0x00
  #define REG_IS          0x20
  #define REG_IE          0x24
-@@ -116,6 +129,17 @@
+@@ -116,6 +134,17 @@
  
  static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
  static LCK_MTX_DECLARE(sweet_ufs_lock, &sweet_ufs_grp);
@@ -49,7 +54,34 @@
  
  static inline uint32_t
  ufs_rd(uint32_t off)
-@@ -448,7 +472,7 @@
+@@ -153,6 +182,7 @@
+ 	uint64_t ucd_pa = su.dma_pa + DMA_UCD, bounce_pa = su.dma_pa + DMA_BOUNCE;
+ 
+ 	assert(len <= BOUNCE_SIZE);
++	sweet_ufs_op_begin(cdb[0], len, write);
+ 	bzero(utrd, sizeof(*utrd));
+ 	bzero(ucd, sizeof(*ucd));
+ 
+@@ -221,6 +251,7 @@
+ 		if (now > deadline) {
+ 			ufs_wr(REG_UTRLCLR, ~1u);
+ 			printf("SWEET UFS: command 0x%02x timed out\n", cdb[0]);
++			sweet_ufs_op_end();
+ 			return ETIMEDOUT;
+ 		}
+ 		if (sleepable && now >= spin_until) {
+@@ -251,8 +282,10 @@
+ 	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
+ 		printf("SWEET UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
+ 		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
++		sweet_ufs_op_end();
+ 		return EIO;
+ 	}
++	sweet_ufs_op_end();
+ 	return 0;
+ }
+ 
+@@ -448,7 +481,7 @@
  	if (!su.ready) {
  		return EAGAIN;
  	}
@@ -58,7 +90,7 @@
  	uint8_t saved = su.lun;
  	error = ufs_lookup_part(want, &slot);
  	uint64_t bytes = error ? 0 : part_cache[slot].nblocks * UFS_BLOCK;
-@@ -468,7 +492,7 @@
+@@ -468,7 +501,7 @@
  		}
  	}
  	su.lun = saved;
@@ -67,7 +99,7 @@
  	return error;
  }
  
-@@ -532,6 +556,8 @@
+@@ -532,6 +565,8 @@
  
  	bool rd = buf_flags(bp) & B_READ;
  
@@ -76,7 +108,7 @@
  	buf_setresid(bp, count);
  	if (!rd && !su.writable) {
  		error = EROFS;
-@@ -549,7 +575,7 @@
+@@ -549,7 +584,7 @@
  		goto done;
  	}
  
@@ -85,7 +117,7 @@
  	for (uint32_t done = 0; done < count;) {
  		uint64_t pos = off + done;
  		uint64_t lba = pos / UFS_BLOCK;
-@@ -578,7 +604,7 @@
+@@ -578,7 +613,7 @@
  		done += want;
  		buf_setresid(bp, count - done);
  	}
@@ -94,7 +126,7 @@
  	buf_unmap(bp);
  
  done:
-@@ -622,9 +648,9 @@
+@@ -622,9 +657,9 @@
  		if (!su.writable) {
  			return 0;
  		}
@@ -106,7 +138,7 @@
  		return error;
  	}
  	case DKIOCGETMAXBLOCKCOUNTREAD:
-@@ -715,7 +741,7 @@
+@@ -715,7 +750,7 @@
  
  		uint32_t h = 0, e = 0, bh = 0;
  		bool ok;
@@ -115,7 +147,7 @@
  		ok = ufs_read_blocks(1, 1) == 0 && memcmp(b, "EFI PART", 8) == 0;
  		if (ok) {
  			memcpy(&h, b + 16, 4);
-@@ -726,7 +752,7 @@
+@@ -726,7 +761,7 @@
  				memcpy(&bh, b + 16, 4);
  			}
  		}
@@ -124,7 +156,7 @@
  		if (!ok || h != gpt_hcrc || e != gpt_ecrc || (gpt_bhcrc && bh != gpt_bhcrc)) {
  			uint64_t ns;
  			absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
-@@ -774,7 +800,7 @@
+@@ -774,7 +809,7 @@
  	su.lun = 0;
  	su.secsize = DEV_BSIZE;
  
@@ -133,7 +165,7 @@
  	error = ufs_take_over_host();
  	if (!error) {
  		static const uint8_t tur[6] = { 0x00 };
-@@ -785,7 +811,7 @@
+@@ -785,7 +820,7 @@
  	if (!error) {
  		error = ufs_find_partition(want);
  	}
@@ -142,7 +174,37 @@
  	if (error) {
  		return error;
  	}
-@@ -850,6 +876,9 @@
+@@ -808,6 +843,7 @@
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
++	sweet_irq_writes_resolve();    /* resolve once, from thread context */
+ 	sweet_sample_start();
+ 	thread_t gpt_thread;
+ 	if (kernel_thread_start(sweet_gpt_watch, NULL, &gpt_thread) == KERN_SUCCESS) {
+@@ -819,14 +855,18 @@
+ 	 * topaz; sweettouch=0 / sweetkeys=0 disable them. USB still pokes SM7150
+ 	 * MMIO (DWC3 at 0xa600000), so it only runs with sweethw=1.
+ 	 */
+-	int hw = 0;
++	int hw = 0, usb = 0;
+ 	(void)PE_parse_boot_argn("sweethw", &hw, sizeof(hw));
++	(void)PE_parse_boot_argn("sweetusb", &usb, sizeof(usb));
+ 	sweet_touch_init();
+ 	sweet_keys_init();
+-	if (hw == 1) {
++	if (usb > 0) {
++		/* Citrus DWC3 at 0x04e00000: sweetusb is the switch now, not sweethw. */
+ 		sweet_usb_probe();
++	} else if (hw == 1) {
++		sweet_usb_probe();
+ 	} else {
+-		printf("SWEET UFS: USB skipped (topaz, sweethw=0)\n");
++		printf("SWEET UFS: USB skipped (sweetusb=0 sweethw=0)\n");
+ 	}
+ 	return 0;
+ }
+@@ -850,6 +890,9 @@
  
  static char sweet_log_ring[SWEET_LOG_SIZE];
  static uint64_t _Atomic sweet_log_total;
@@ -152,7 +214,7 @@
  static int sweet_log_chan;
  static uint32_t sweet_log_secs = SWEET_LOG_SECS;
  
-@@ -863,6 +892,9 @@
+@@ -863,6 +906,9 @@
  		return;
  	}
  	uint64_t at = os_atomic_add_orig(&sweet_log_total, (uint64_t)size, relaxed);
@@ -162,7 +224,7 @@
  	for (int i = 0; i < size; i++) {
  		sweet_log_ring[(at + (uint64_t)i) % SWEET_LOG_SIZE] = c[i];
  	}
-@@ -896,15 +928,544 @@
+@@ -896,15 +942,702 @@
  sweet_log_position(void)
  {
  	return os_atomic_load(&sweet_log_total, relaxed);
@@ -177,14 +239,60 @@
 +sweet_log_flushed_bytes(void)
 +{
 +	return os_atomic_load(&sweet_log_flushed, relaxed);
- }
- 
++}
++
 +uint64_t sweet_ufs_ios_count(void);
 +
 +uint64_t
 +sweet_ufs_ios_count(void)
 +{
 +	return os_atomic_load(&sweet_ufs_ios, relaxed);
++}
++
++/*
++ * The UFS command that is in flight right now. A healthy thread can read this
++ * and print it without taking any lock, which is how the live USB console
++ * reports which command is stuck when progress stops.
++ */
++static struct {
++	uint64_t seq, start;
++	uint32_t len, tag;
++	uint8_t  cdb0, write, active;
++} sweet_cur_op;
++
++static void
++sweet_ufs_op_begin(uint8_t cdb0, uint32_t len, bool write)
++{
++	sweet_cur_op.seq++;
++	sweet_cur_op.start = mach_absolute_time();
++	sweet_cur_op.cdb0 = cdb0;
++	sweet_cur_op.len = len;
++	sweet_cur_op.write = write ? 1 : 0;
++	sweet_cur_op.active = 1;
+ }
+ 
++static void
++sweet_ufs_op_end(void)
++{
++	sweet_cur_op.active = 0;
++}
++
++/* "op=0x28 w len=131072 age=3400ms n=1234" (empty when the driver is idle). */
++int sweet_ufs_op_string(char *buf, int max);
++
++int
++sweet_ufs_op_string(char *buf, int max)
++{
++	if (!sweet_cur_op.active) {
++		return snprintf(buf, max, "idle");
++	}
++	uint64_t ns = 0;
++	if (mach_absolute_time() > sweet_cur_op.start) {
++		absolutetime_to_nanoseconds(mach_absolute_time() - sweet_cur_op.start, &ns);
++	}
++	return snprintf(buf, max, "op=0x%02x%s len=%u age=%llums n=%llu",
++	    sweet_cur_op.cdb0, sweet_cur_op.write ? "w" : "r", sweet_cur_op.len,
++	    ns / 1000000ull, sweet_cur_op.seq);
 +}
 +
  struct sweet_log_header {
@@ -324,14 +432,76 @@
 +	uint64_t ufs_ios;
 +	uint64_t free_pages;
 +	uint64_t ufs_users;
- };
++};
 +
 +static void sweet_stall_probe(void);
++static void sweet_panel_bar(int filled);
 +extern void sweet_fb_show_console(void);
 +extern void sweet_console_force(const char *s, int len);
 +
-+static int sweet_panel_mode;
++static int sweet_panel_mode = -1;
 +int sweet_console_hold;
++
++/* Parsed on first use: the recorder thread used to set this only at ~36 s, so
++ * every earlier probe run drew nothing and the panel test proved nothing. */
++static bool
++sweet_panel_on(void)
++{
++	/*
++	 * Only ever resolved in thread context (sweet_ufs_init / the recorder
++	 * thread). PE_parse_boot_argn must not be called from a timer
++	 * interrupt early in boot: doing that killed every boot within a few
++	 * seconds before the first log flush. Unknown means "do nothing".
++	 */
++	return sweet_panel_mode > 0;
++}
++
++/* Pixel drawing is level 2: level 1 only counts probe runs so a boot can be
++ * observed without touching the framebuffer at all. */
++static bool
++sweet_panel_draw(void)
++{
++	return sweet_panel_on() && sweet_panel_mode >= 2;
++}
++
++/*
++ * Writing the flight recorder from a timer interrupt is only safe when no
++ * driver command is outstanding: ufs_scsi() owns exactly one UTRL slot, one
++ * UCD and one bounce buffer, and it takes no lock the interrupt path could
++ * respect. If a real I/O is in flight when the probe rings the doorbell, the
++ * probe overwrites that command's UTRD, so the waiting thread sees the probe's
++ * completion (or none) and the slot state is garbage. That is a prime suspect
++ * for the ~36 s freeze. Boot with sweetirqwr=0 to disable the interrupt-side
++ * writes while keeping the lock-free panel output and the thread heartbeat.
++ */
++static int sweet_irq_writes = -1;
++static bool
++sweet_irq_ufs_writes(void)
++{
++	if (sweet_irq_writes < 0) {
++		int v = 1;
++		/* Thread context only: see sweet_panel_on(). */
++		PE_parse_boot_argn("sweetirqwr", &v, sizeof(v));
++		sweet_irq_writes = v;
++	}
++	return sweet_irq_writes != 0;
++}
++
++/* Called once from sweet_ufs_init, in thread context. */
++static void
++sweet_irq_writes_resolve(void)
++{
++	if (sweet_irq_writes < 0) {
++		int v = 1;
++		PE_parse_boot_argn("sweetirqwr", &v, sizeof(v));
++		sweet_irq_writes = v;
++	}
++	if (sweet_panel_mode < 0) {
++		int v = 0;
++		PE_parse_boot_argn("sweetpanel", &v, sizeof(v));
++		sweet_panel_mode = v;
++	}
++}
 +
 +/*
 + * Lock-free panel text. The console cannot be used from a stalled timer
@@ -379,7 +549,7 @@
 +	{ 0x0e, 0x11, 0x11, 0x0e, 0x11, 0x11, 0x0e },
 +	{ 0x0e, 0x11, 0x11, 0x0f, 0x01, 0x02, 0x0c },
 +	{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
-+};
+ };
 +extern int sweet_console_shadow_info(uintptr_t *va, uint32_t *rowbytes, uint32_t *height);
 +extern void sweet_fb_show_console(void);
 +extern int sweet_fb_console_frame(uintptr_t *va, uint32_t *stride, uint32_t *height, uint64_t *pa);
@@ -418,7 +588,7 @@
 +	uintptr_t va = 0;
 +	uint32_t stride = 0, height = 0;
 +	uint64_t pa = 0;
- 
++
 +	if (!sweet_fb_console_frame(&va, &stride, &height, &pa) || va == 0) {
 +		if (!sweet_console_shadow_info(&va, &stride, &height) || va == 0) {
 +			return;
@@ -497,6 +667,47 @@
 +}
 +
 +/*
++ * A 32-cell progress bar along the bottom of the console frame. Each timer
++ * probe advances it, so the screen alone says whether interrupts are still
++ * arriving after the system stops making progress: if the bar keeps moving
++ * past the freeze, the kernel is alive and only the I/O threads are wedged.
++ */
++static void
++sweet_panel_bar(int filled)
++{
++	uintptr_t va = 0;
++	uint32_t stride = 0, height = 0;
++	uint64_t pa = 0;
++
++	if (!sweet_fb_console_frame(&va, &stride, &height, &pa) || va == 0 ||
++	    height < 8 || stride < 128) {
++		return;
++	}
++	int width = (int)(stride / 4);
++	int cell = width / 32;
++	if (cell < 2) {
++		cell = 2;
++	}
++	int y0 = (int)height - 6;
++	for (int y = y0; y < (int)height; y++) {
++		uint32_t *p = (uint32_t *)(va + (uint64_t)y * stride);
++		for (int x = 0; x < width; x++) {
++			p[x] = 0xff101010u;
++		}
++	}
++	for (int i = 0; i < 32 && i < filled; i++) {
++		for (int y = y0; y < (int)height; y++) {
++			uint32_t *p = (uint32_t *)(va + (uint64_t)y * stride);
++			for (int x = i * cell; x < (i + 1) * cell - 1 && x < width; x++) {
++				p[x] = 0xff00ff00u;
++			}
++		}
++	}
++	clean_dcache64((addr64_t)va + (uint64_t)y0 * stride,
++	    (unsigned)(((int)height - y0) * stride), TRUE);
++}
++
++/*
 + * Called from rtclock_intr (osfmk/arm/rtclock.c) on every timer interrupt, in
 + * interrupt context, with the interrupted pc. rtclock also keeps a 1 Hz tick
 + * armed (see there) because timer_call callbacks never run on this port:
@@ -507,13 +718,17 @@
 + * no thread is inside the driver (one CPU, interrupts off here), so a UFS wedge
 + * cannot corrupt anything: the block simply stops advancing.
 + */
- static void
++static void
 +sweet_hb_write_from_irq(void)
 +{
 +	static uint64_t seq;
 +	void *bounce = (void *)(su.dma + DMA_BOUNCE);
 +
 +	if (sweet_hb_base == 0 || os_atomic_load(&sweet_ufs_users, relaxed) != 0) {
++		return;
++	}
++	/* Never touch the single UTRL slot from interrupt context unless asked. */
++	if (!sweet_irq_ufs_writes()) {
 +		return;
 +	}
 +	struct sweet_heartbeat hb = {
@@ -551,7 +766,7 @@
 +	/* The thread-side writer must not overwrite this with older counters. */
 +	sweet_hb_prev = hb;
 +}
-+
+ 
 +void
 +sweet_stall_service(uintptr_t pc, int user_mode)
 +{
@@ -572,25 +787,30 @@
 +	next_service = now + step;
 +	os_atomic_inc(&sweet_svc_runs, relaxed);
 +
-+	if (sweet_panel_mode) {
-+		char line[96];
++	if (sweet_panel_on()) {
++		os_atomic_inc(&sweet_panel_runs, relaxed);
++	}
++	if (sweet_panel_draw()) {
++		char line[112];
 +		int n;
 +
 +		absolutetime_to_nanoseconds(now, &ns);
-+		n = snprintf(line, sizeof(line), "SWEET PANEL T=%lluS UFS=%llu C=%llu",
-+		    ns / 1000000000ull, os_atomic_load(&sweet_ufs_users, relaxed),
-+		    os_atomic_load(&sweet_other_bytes, relaxed));
++		n = snprintf(line, sizeof(line), "SWEET PANEL T=%lluS N=%llu UFS=%llu C=%llu PC=%llx",
++		    ns / 1000000000ull, os_atomic_load(&sweet_svc_runs, relaxed),
++		    os_atomic_load(&sweet_ufs_users, relaxed),
++		    os_atomic_load(&sweet_other_bytes, relaxed),
++		    (uint64_t)sweet_intr_pc);
 +		/* No printf, no console locks, no scheduler: raw pixels + MMIO. */
 +		sweet_panel_text(line, n, 0);
++		sweet_panel_bar((int)(os_atomic_load(&sweet_svc_runs, relaxed) % 32));
 +		sweet_fb_show_console();
 +		sweet_console_hold = 1;
-+		os_atomic_inc(&sweet_panel_runs, relaxed);
 +	}
 +	sweet_hb_write_from_irq();
 +	sweet_stall_probe();
 +}
 +
-+static void
+ static void
 +sweet_stall_probe(void)
 +{
 +	static uint64_t idle_since, last_sample, samples;
@@ -657,7 +877,7 @@
 +	sweet_fb_show_console();
 +
 +	/* Then persist it, if no thread is inside the driver right now. */
-+	if (users == 0) {
++	if (users == 0 && sweet_irq_ufs_writes()) {
 +		void *bounce = (void *)(su.dma + DMA_BOUNCE);
 +		bzero(bounce, UFS_BLOCK);
 +		memcpy(bounce, &st, sizeof(st));
@@ -696,7 +916,7 @@
 +		sweet_hb_prev.boot_id = 1;
 +	}
 +	sweet_hb_write(SWEET_HB_RUNNING, false);
-+	PE_parse_boot_argn("sweetpanel", &sweet_panel_mode, sizeof(sweet_panel_mode));
++	(void)sweet_panel_on();
 +	for (;;) {
 +		(void)tsleep(&sweet_hb_chan, PZERO, "sweethb", hz * SWEET_HB_SECS);
 +		sweet_hb_write(SWEET_HB_RUNNING, false);
@@ -707,7 +927,7 @@
  sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
  {
  	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
-@@ -915,6 +1476,8 @@
+@@ -915,6 +1648,8 @@
  	    SWEET_LOG_BLOCKS * UFS_BLOCK >> 10, base);
  	for (;;) {
  		(void)tsleep(&sweet_log_chan, PZERO, "sweetlog", hz * (int)sweet_log_secs);
@@ -716,7 +936,7 @@
  		uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
  		if (total == flushed) {
  			continue;
-@@ -922,7 +1485,7 @@
+@@ -922,7 +1657,7 @@
  		uint64_t pos = total - flushed >= SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : flushed;
  		int error = 0;
  
@@ -725,7 +945,7 @@
  		while (pos < total && !error) {
  			uint32_t off = (uint32_t)(pos % SWEET_LOG_SIZE);
  			uint32_t blk = off / UFS_BLOCK;
-@@ -945,12 +1508,14 @@
+@@ -945,12 +1680,14 @@
  		if (!error) {
  			error = ufs_sync_cache();
  		}
@@ -741,7 +961,7 @@
  	}
  }
  
-@@ -971,6 +1536,9 @@
+@@ -971,6 +1708,9 @@
  	if (kernel_thread_start(sweet_log_thread, NULL, &thread) == KERN_SUCCESS) {
  		thread_deallocate(thread);
  	}
@@ -1162,3 +1382,656 @@
  	fConsShown = false;
  	if (directPresent(rec)) {
  		if (!fConsolePaused) {
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -39,29 +39,51 @@
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+-#define GCC_PA                  0x00100000
+-#define GCC_SIZE                0x00090000
+-#define GCC_USB30_PRIM_GDSCR    0x0f004         /* bit 31: power on */
++/*
++ * Citrus (POCO M3, Qualcomm bengal / SM6115):
++ *   DWC3 wrapper  ssusb@4e00000, core registers at 0x4e00000, size 0xcd00,
++ *                 QSCRATCH at core + 0xf8800 (the same layout dwc3-qcom uses
++ *                 for every SoC from SDM845 on).
++ *   QUSB2 PHY     qusb@1613000 (the SM7150 Topaz PHY at 0x88e2000 is a
++ *                 different block - do not mix the two), regs per
++ *                 phy-qcom-qusb2.c msm8996_regs_layout.
++ *   GCC           bengal offsets from drivers/clk/qcom/gcc-sm6115.c.
++ * The 1 MiB "core_base" window also covers QSCRATCH, so one mapping suffices.
++ */
++/* bengal GCC is at 0x1400000, size 0x1f0000 (DT: /soc/qcom,gcc@1400000).
++ * 0x100000 is NOT GCC on this SoC and reading it hangs the bus. */
++#define GCC_PA                  0x01400000
++#define GCC_SIZE                0x001f0000
++
++#define GCC_USB30_PRIM_GDSCR    0x1a004         /* bit 0 SW_COLLAPSE, bit 31 PWR_ON */
++#define   GDSCR_SW_COLLAPSE     (1u << 0)
++#define   GDSCR_PWR_ON          (1u << 31)
++#define GCC_USB30_PRIM_BCR      0x1a000
++#define GCC_USB_PHY_CFG_AHB2PHY_BCR 0x1d000
++#define GCC_QUSB2PHY_PRIM_BCR   0x1c000
+ #define CBCR_CLK_OFF            (1u << 31)
++#define CBCR_CLK_ON             (1u << 0)
+ 
++#define DWC3_PA                 0x04e00000
++#define DWC3_SIZE               0x0000d000
++#define QSCRATCH_OFF            0x000f8800
++#define QSCRATCH_SIZE           0x00000400
++#define QUSB2_PA                0x01613000      /* qusb@1613000 */
++#define QUSB2_SIZE              0x00000400
++
++/* SM6115 GCC CBCRs: the branch enable/halt register is the CBCR itself. */
+ static const struct {
+ 	const char *name;
+ 	uint32_t    off;
+ } usb_cbcr[] = {
+-	{ "master", 0x0f010 },
+-	{ "sleep", 0x0f014 },
+-	{ "utmi", 0x0f018 },
+-	{ "cfg-noc-axi", 0x0502c },
+-	{ "aggre-axi", 0x8201c },
+-	{ "ahb2phy", 0x6a004 },
+-	{ "clkref", 0x8c010 },
++	{ "usb30-master",   0x1a010 },
++	{ "usb30-sleep",    0x1a014 },
++	{ "usb30-mock-utmi",0x1a018 },
++	{ "cfg-noc-axi",    0x1a084 },
++	{ "ahb2phy-usb",    0x1d008 },
++	{ "usb3-clkref",    0x9f000 },
+ };
+ 
+-#define DWC3_PA                 0x0a600000
+-#define DWC3_SIZE               0x0000d000
+-#define QUSB2_PA                0x088e2000
+-#define QUSB2_SIZE              0x00000400
+-
+ static uint32_t
+ usb_rd(vm_offset_t base, uint32_t off)
+ {
+@@ -70,67 +92,132 @@
+ 	return v;
+ }
+ 
++static int sweet_usb_map_gcc(vm_offset_t *gcc_out);
++static void sweet_usb_bringup_thread(void *arg, wait_result_t wr);
++static int sweet_usb_wait_chan;
++static bool sweet_usb_clk_on(vm_offset_t gcc, uint32_t off);
++static void sweet_usb_clk_set(vm_offset_t gcc, uint32_t off, bool on);
++
++/* QUSB2 PHY registers, phy-qcom-qusb2.c msm8996_regs_layout (what sm6115 uses) */
++#define Q2_PLL_TEST     0x04
++#define Q2_PLL_TUNE     0x08
++#define Q2_PLL_UCTL1    0x0c
++#define Q2_PLL_UCTL2    0x10
++#define Q2_PLL_AUTOPGM  0x1c
++#define Q2_PLL_PWRCTRL  0x18
++#define Q2_PLL_STATUS   0x38
++#define   Q2_PLL_LOCKED (1u << 5)
++#define Q2_TUNE1        0x80
++#define Q2_TUNE2        0x84
++#define Q2_TUNE3        0x88
++#define Q2_TUNE4        0x8c
++#define Q2_TEST2        0x9c
++#define Q2_POWERDOWN    0xb4
++#define   Q2_CLAMP_N_EN (1u << 5)
++#define   Q2_FREEZIO_N  (1u << 1)
++#define   Q2_POWER_DOWN (1u << 0)
++
++/*
++ * Board PHY sequence, verbatim from /soc/qusb@1613000/qcom,qusb-phy-init-seq
++ * (value, register) pairs in the device's own DT.
++ */
++static const uint32_t qusb2_init_seq[][2] = {
++	{ 0xf8, Q2_TUNE1 }, { 0xb3, Q2_TUNE2 }, { 0x81, Q2_TUNE3 },
++	{ 0xc7, Q2_TUNE4 }, { 0x30, Q2_PLL_TUNE }, { 0x79, Q2_PLL_UCTL1 },
++	{ 0x21, Q2_PLL_UCTL2 }, { 0x14, Q2_TEST2 }, { 0x80, Q2_PLL_TEST },
++	{ 0x9f, Q2_PLL_AUTOPGM }, { 0x00, Q2_PLL_PWRCTRL },
++};
++
+ void
+ sweet_usb_probe(void)
+ {
+ 	int enabled = 1;
+-	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+-	bool clocks_on = true;
++	vm_offset_t gcc;
++	uint32_t gdscr;
+ 
+-	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
++	/* sweetusb=0 off, 1 report state, 2 power up + enumerate + live log */
+ 	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
+ 	if (!enabled) {
++		printf("SWEET USB: disabled (sweetusb=0)\n");
+ 		return;
+ 	}
+-	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+-	if (gcc == 0) {
+-		printf("SWEET USB: GCC map failed\n");
++	gcc = 0;
++	if (!sweet_usb_map_gcc(&gcc)) {
+ 		return;
+ 	}
+ 	gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
+-	printf("SWEET USB: GDSC usb30_prim 0x%08x (%s)\n", gdscr, (gdscr & (1u << 31)) ? "on" : "off");
++	printf("SWEET USB: GDSC usb30_prim 0x%08x (%s)\n", gdscr,
++	    (gdscr & GDSCR_PWR_ON) ? "on" : "off");
+ 	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
+-		cbcr[i] = usb_rd(gcc, usb_cbcr[i].off);
+-		printf("SWEET USB: clk %-12s CBCR 0x%08x (%s)\n", usb_cbcr[i].name, cbcr[i],
+-		    (cbcr[i] & CBCR_CLK_OFF) ? "off" : "on");
++		uint32_t v = usb_rd(gcc, usb_cbcr[i].off);
++		printf("SWEET USB: clk %-16s CBCR 0x%08x (%s)\n", usb_cbcr[i].name, v,
++		    (v & CBCR_CLK_OFF) ? "off" : "on");
+ 	}
+-	/* DWC3 registers need the GDSC, the master clock and the config-NoC path. */
+-	clocks_on = (gdscr & (1u << 31)) && !(cbcr[0] & CBCR_CLK_OFF) && !(cbcr[3] & CBCR_CLK_OFF);
+-	if (!clocks_on) {
+-		printf("SWEET USB: controller unpowered or unclocked; DWC3 not read\n");
+-		return;
+-	}
+-	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
+-	if (dwc == 0) {
+-		printf("SWEET USB: DWC3 map failed\n");
+-		return;
+-	}
+-	printf("SWEET USB: DWC3 GSNPSID 0x%08x GCTL 0x%08x GSTS 0x%08x GUSB2PHYCFG 0x%08x\n",
+-	    usb_rd(dwc, 0xc120), usb_rd(dwc, 0xc110), usb_rd(dwc, 0xc118), usb_rd(dwc, 0xc200));
+-	printf("SWEET USB: DWC3 DCFG 0x%08x DCTL 0x%08x DEVTEN 0x%08x DSTS 0x%08x DALEPENA 0x%08x\n",
+-	    usb_rd(dwc, 0xc700), usb_rd(dwc, 0xc704), usb_rd(dwc, 0xc708), usb_rd(dwc, 0xc70c),
+-	    usb_rd(dwc, 0xc720));
+-	printf("SWEET USB: DWC3 GEVNTADR 0x%08x%08x GEVNTSIZ 0x%08x GEVNTCOUNT 0x%08x GHWPARAMS0 0x%08x\n",
+-	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
+-	    usb_rd(dwc, 0xc140));
++	printf("SWEET USB: BCR usb30 0x%08x ahb2phy 0x%08x qusb2phy 0x%08x\n",
++	    usb_rd(gcc, GCC_USB30_PRIM_BCR), usb_rd(gcc, GCC_USB_PHY_CFG_AHB2PHY_BCR),
++	    usb_rd(gcc, GCC_QUSB2PHY_PRIM_BCR));
+ 	if (enabled >= 2) {
+-		sweet_usb_gadget_start(dwc);
++		/* Never inline: a mistake in the bring-up must not take the boot
++		 * (and the console log) down with it. The thread also waits until
++		 * the recorder has flushed at least once. */
++		thread_t thread;
++		if (kernel_thread_start(sweet_usb_bringup_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		}
+ 	}
+-	if (cbcr[5] & CBCR_CLK_OFF) {
+-		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
++}
++
++static void
++sweet_usb_bringup_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	vm_offset_t gcc;
++	uint64_t deadline;
++
++	printf("SWEET USB: bring-up thread starting in 6 s\n");
++	clock_interval_to_deadline(6, NSEC_PER_SEC, &deadline);
++	(void)assert_wait_deadline(&sweet_usb_wait_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++	if (!sweet_usb_map_gcc(&gcc)) {
+ 		return;
+ 	}
+-	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
+-	if (phy == 0) {
+-		return;
++	printf("SWEET USB: bringing up the Citrus DWC3 (bengal)\n");
++	sweet_usb_gadget_start(gcc);
++	printf("SWEET USB: bring-up thread done\n");
++}
++
++static int
++sweet_usb_map_gcc(vm_offset_t *gcc_out)
++{
++	static vm_offset_t gcc;
++	if (gcc == 0) {
++		gcc = ml_io_map(GCC_PA, GCC_SIZE);
++		if (gcc == 0) {
++			printf("SWEET USB: GCC map failed\n");
++		}
+ 	}
+-	/* DT qcom,qusb-phy-reg-offset order (Linux phy-msm-qusb-v2.c): PORT_TUNE1 0x240,
+-	 * PLL_COMMON_STATUS_ONE 0x1a0, PWR_CTRL1 0x210, INTR_CTRL 0x230,
+-	 * PLL_CORE_INPUT_OVERRIDE 0x0a8, TEST1 0x254. */
+-	printf("SWEET USB: QUSB2 PLL_STATUS 0x%08x PWR_CTRL1 0x%08x PORT_TUNE1 0x%08x TEST1 0x%08x\n",
+-	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
++	*gcc_out = gcc;
++	return gcc != 0;
+ }
+ 
++static void
++sweet_usb_clk_set(vm_offset_t gcc, uint32_t off, bool on)
++{
++	uint32_t v = usb_rd(gcc, off);
++	if (on) {
++		*(volatile uint32_t *)(gcc + off) = v | CBCR_CLK_ON;
++	} else {
++		*(volatile uint32_t *)(gcc + off) = v & ~CBCR_CLK_ON;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static bool
++sweet_usb_clk_on(vm_offset_t gcc, uint32_t off)
++{
++	uint32_t v = usb_rd(gcc, off);
++	return !(v & CBCR_CLK_OFF);
++}
++
+ /*
+  * Step 2: USB device mode with only the default control endpoint, enough
+  * for the host to enumerate the phone (boot-arg sweetusb=2). ABL leaves
+@@ -148,6 +235,10 @@
+ #define GEVNTADRHI      0xc404
+ #define GEVNTSIZ        0xc408
+ #define GEVNTCOUNT      0xc40c
++#define GSNPSID         0xc120
++#define GHWPARAMS0      0xc140
++#define GUSB2PHYCFG     0xc200
++#define   GUSB2PHYCFG_SUSPHY   (1u << 6)
+ #define DCFG            0xc700
+ #define DCTL            0xc704
+ #define DEVTEN          0xc708
+@@ -164,7 +255,11 @@
+  * session; Linux dwc3-qcom forces that in software when the charger
+  * reports a cable (dwc3_qcom_vbus_override_enable).
+  */
+-#define QSCRATCH_PA             0x0a6f8800
++#define QSCRATCH_PA             (DWC3_PA + QSCRATCH_OFF)
++#define QSCRATCH_GENERAL_CFG    0x08
++#define   PIPE_UTMI_CLK_SEL     (1u << 0)
++#define   PIPE3_PHYSTATUS_SW    (1u << 3)
++#define   PIPE_UTMI_CLK_DIS     (1u << 8)
+ #define QSCRATCH_HS_PHY_CTRL    0x10
+ #define   UTMI_OTG_VBUS_VALID   (1u << 20)
+ #define   SW_SESSVLD_SEL        (1u << 28)
+@@ -203,7 +298,8 @@
+ #define UD_DATA         0x1100          /* ep0 data stage, 512 bytes */
+ #define UD_NOTIFY       0x1300          /* 16-byte notification */
+ #define UD_RX           0x2000          /* one received frame */
+-#define UD_TX           0x2800          /* one frame to send */
++#define UD_TX           0x2800          /* console stream scratch (6 KiB) */
++#define UD_TX_CONSOLE   0x1800
+ #define UD_FRAME_MAX    0x800
+ #define UD_SIZE         0x4000
+ 
+@@ -332,24 +428,31 @@
+  */
+ static const uint8_t ud_dev_desc[18] = {
+ 	18, 1, 0x00, 0x02, 0x02, 0x00, 0x00, 64,
+-	0x09, 0x12, 0x01, 0x00, 0x00, 0x01, 1, 2, 3, 1,
++	0x09, 0x12, 0x02, 0x00, 0x00, 0x01, 1, 2, 3, 1,
+ };
+-static const uint8_t ud_cfg_desc[80] = {
+-	9, 2, 80, 0, 2, 1, 0, 0x80, 250,                /* config: 2 interfaces, 500 mA */
+-	9, 4, 0, 0, 1, 0x02, 0x06, 0x00, 0,             /* comm interface 0: CDC ECM, 1 endpoint */
+-	5, 0x24, 0x00, 0x10, 0x01,                      /* header, CDC 1.10 */
+-	5, 0x24, 0x06, 0, 1,                            /* union: control 0, data 1 */
+-	13, 0x24, 0x0f, 4, 0, 0, 0, 0, 0xea, 0x05, 0, 0, 0, /* ethernet: MAC string 4, max segment 1514 */
+-	7, 5, 0x82, 0x03, 16, 0, 9,                     /* ep 0x82 interrupt IN, 16 bytes, 2^(9-1) uframes */
+-	9, 4, 1, 0, 0, 0x0a, 0x00, 0x00, 0,             /* data interface 1 alt 0: no endpoints */
+-	9, 4, 1, 1, 2, 0x0a, 0x00, 0x00, 0,             /* data interface 1 alt 1: two bulk endpoints */
+-	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                /* ep 0x81 bulk IN, 512 */
+-	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                /* ep 0x01 bulk OUT, 512 */
+-};
+-/* The host side's MAC (ECM iMACAddress); the phone's own is ..:02 */
+-static const char *const ud_strings[] = {
+-	NULL, "ios-sweet", "Sweet iOS (USB Ethernet)", "0001", "02005E77EE01",
++/*
++ * CDC-ACM: macOS binds AppleUSBCDCACMData and the log appears as a plain
++ * /dev/tty.usbmodem* node. No IP stack, no routing, no ARP - the kernel
++ * writes console bytes straight to the bulk IN endpoint.
++ */
++static const uint8_t ud_cfg_desc[] = {
++	9, 2, 67, 0, 2, 1, 0, 0x80, 250,                   /* config, 2 interfaces */
++	9, 4, 0, 0, 1, 0x02, 0x02, 0x01, 0,                /* if0: CDC ACM control */
++	5, 0x24, 0x00, 0x10, 0x01,                         /* header, CDC 1.10 */
++	5, 0x24, 0x01, 0x00, 0x01,                         /* call mgmt */
++	4, 0x24, 0x02, 0x02,                               /* ACM: line coding + serial state */
++	5, 0x24, 0x06, 0x00, 0x01,                         /* union: control 0, data 1 */
++	7, 5, 0x82, 0x03, 16, 0, 10,                       /* ep 0x82 interrupt IN */
++	9, 4, 1, 0, 2, 0x0a, 0x00, 0x00, 0,                /* if1: CDC data */
++	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                   /* ep 0x81 bulk IN, 512 */
++	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                   /* ep 0x01 bulk OUT, 512 */
+ };
++/* Line coding reported to the host: 115200 8N1. */
++static const uint8_t ud_line_coding[7] = { 0x00, 0xc2, 0x01, 0x00, 0x00, 0x00, 0x08 };
++static const char *const ud_strings[] = {
++	NULL, "ios-sweet", "Sweet iOS (USB console)", "0001",
++};
++/* Kept for the (unused) ECM ifnet path below. */
+ static const uint8_t ud_phone_mac[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x02 };
+ 
+ static uint32_t
+@@ -426,8 +529,22 @@
+ 
+ 	printf("SWEET USB: setup %02x %02x %04x %04x len %u\n", type, req, value, index, length);
+ 	ud.data_in = (type & 0x80) != 0;
+-	if ((type & 0x60) == 0x20) {    /* class request (e.g. SET_ETHERNET_PACKET_FILTER) */
+-		ok = (length == 0);
++	if ((type & 0x60) == 0x20) {    /* CDC class request */
++		switch (req) {
++		case 0x20:              /* SET_LINE_CODING: 7 data bytes out */
++			ok = true;
++			break;
++		case 0x21:              /* GET_LINE_CODING */
++			memcpy(data, ud_line_coding, sizeof(ud_line_coding));
++			n = sizeof(ud_line_coding);
++			break;
++		case 0x22:              /* SET_CONTROL_LINE_STATE */
++			ok = true;
++			break;
++		default:
++			ok = (length == 0);
++			break;
++		}
+ 	} else if ((type & 0x60) != 0) {
+ 		ok = false;
+ 	} else if (req == 6) {          /* GET_DESCRIPTOR */
+@@ -453,9 +570,6 @@
+ 	} else if (req == 11) {         /* SET_INTERFACE */
+ 		if (index == 1) {
+ 			ud.data_alt = (uint8_t)value;
+-			if (value == 1 && ud.configured) {
+-				ud_notify_connected();
+-			}
+ 		}
+ 	} else if (req == 10) {         /* GET_INTERFACE */
+ 		data[0] = index == 1 ? ud.data_alt : 0; n = 1;
+@@ -773,51 +887,200 @@
+  */
+ extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
+ extern uint64_t sweet_log_position(void);
++extern uint32_t vm_page_free_count;   /* vm_resident.c */
++extern uint64_t sweet_ufs_ios_count(void);
++extern int sweet_ufs_op_string(char *buf, int max);
+ 
+ static void
+ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+-	static char chunk[1400];
+-	socket_t so = NULL;
+-	struct sockaddr_in to;
++	static char chunk[UD_TX_CONSOLE];
+ 	uint64_t pos = sweet_log_position();
++	uint64_t sent_datagrams = 0;
+ 
+ 	pos = pos > 65536 ? pos - 65536 : 0;
+-	bzero(&to, sizeof(to));
+-	to.sin_len = sizeof(to);
+-	to.sin_family = AF_INET;
+-	to.sin_port = htons(5140);
+-	to.sin_addr.s_addr = htonl(0xc0a80701);         /* 192.168.7.1 */
++	printf("SWEET USB: console log thread up, streaming to bulk IN 0x81\n");
++	uint64_t busy_since = 0, next_beat = 0, beats = 0, busy_limit = 0;
++	nanoseconds_to_absolutetime(250ull * 1000000ull, &busy_limit);
+ 	for (;;) {
+-		ud_sleep_ms(100);
++		ud_sleep_ms(2);
++		/*
++		 * Live heartbeat: if these lines ever stop while the phone is up,
++		 * the kernel stopped scheduling (or stopped taking timer
++		 * interrupts) - the one failure no in-kernel watchdog can report.
++		 */
++		uint64_t now = mach_absolute_time();
++		if (now >= next_beat) {
++			char op[96];
++			uint64_t ns = 0, free_pages = (uint64_t)vm_page_free_count;
++			/* mach_absolute_time() is in timebase ticks (24 MHz here),
++			 * not nanoseconds: convert, or "5 s" becomes ~208 s. */
++			{
++				uint64_t step = 0;
++				nanoseconds_to_absolutetime(5ull * 1000000000ull, &step);
++				next_beat = now + step;
++			}
++			absolutetime_to_nanoseconds(now, &ns);
++			(void)sweet_ufs_op_string(op, sizeof(op));
++			printf("SWEET LIVE T=%llus beat=%llu ufsio=%llu free=%llu %s\n",
++			    ns / 1000000000ull, ++beats, sweet_ufs_ios_count(), free_pages, op);
++		}
+ 		if (!ud.configured) {
+ 			continue;
+ 		}
+-		if (so == NULL && sock_socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, NULL, &so) != 0) {
+-			so = NULL;
++		if (ud.tx_busy) {
++			/* The host only polls the endpoint while its tty is open,
++			 * and a lost event must not wedge the channel for good. */
++			uint64_t now = mach_absolute_time();
++			if (busy_since == 0) {
++				busy_since = now;
++			} else if (now - busy_since > busy_limit) {
++				printf("SWEET USB: bulk IN stalled, re-arming\n");
++				ud.tx_busy = false;
++				busy_since = 0;
++			}
+ 			continue;
+ 		}
+-		uint32_t n;
+-		while ((n = sweet_log_copy(&pos, chunk, sizeof(chunk))) > 0) {
+-			struct iovec iov = { .iov_base = chunk, .iov_len = n };
+-			struct msghdr msg = {
+-				.msg_name = &to, .msg_namelen = sizeof(to),
+-				.msg_iov = &iov, .msg_iovlen = 1,
+-			};
+-			size_t sent = 0;
+-			if (sock_send(so, &msg, 0, &sent) != 0) {
+-				break;          /* no route/ARP yet: retry later */
++		busy_since = 0;
++		uint32_t n = sweet_log_copy(&pos, chunk, UD_TX_CONSOLE - 1);
++		if (n == 0) {
++			continue;
++		}
++		/* A transfer of exactly 512 bytes needs a terminator; pad instead. */
++		if ((n % 512) == 0) {
++			chunk[n++] = '\n';
++		}
++		memcpy((void *)(ud.dma + UD_TX), chunk, n);
++		ud.tx_busy = true;
++		ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, n, TRBCTL_NORMAL);
++		if ((++sent_datagrams % 500) == 0) {
++			printf("SWEET USB: console %llu chunks, %u bytes last\n",
++			    sent_datagrams, n);
++		}
++	}
++}
++
++/* Poll a GDSC/branch until it reports the expected state. */
++static bool
++sweet_usb_gdsc_on(vm_offset_t gcc)
++{
++	uint32_t v = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++	if (!(v & GDSCR_PWR_ON)) {
++		*(volatile uint32_t *)(gcc + GCC_USB30_PRIM_GDSCR) = v & ~GDSCR_SW_COLLAPSE;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (int i = 0; i < 200; i++) {
++			if (usb_rd(gcc, GCC_USB30_PRIM_GDSCR) & GDSCR_PWR_ON) {
++				break;
+ 			}
++			delay(100);
+ 		}
+ 	}
++	return (usb_rd(gcc, GCC_USB30_PRIM_GDSCR) & GDSCR_PWR_ON) != 0;
+ }
+ 
++/* Turn on the USB30_PRIM power domain, its clocks and the AHB2PHY block. */
++static bool
++sweet_usb_power_on(vm_offset_t gcc)
++{
++	bool ok = true;
++
++	ok = sweet_usb_gdsc_on(gcc);
++	printf("SWEET USB: GDSC on -> 0x%08x (%s)\n", usb_rd(gcc, GCC_USB30_PRIM_GDSCR),
++	    ok ? "on" : "STILL OFF");
++
++	/* The QUSB2 PHY sits behind the USB AHB2PHY block: clock + reset first. */
++	sweet_usb_clk_set(gcc, 0x1d008, true);
++	*(volatile uint32_t *)(gcc + GCC_USB_PHY_CFG_AHB2PHY_BCR) = 0;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(100);
++
++	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
++		sweet_usb_clk_set(gcc, usb_cbcr[i].off, true);
++	}
++	delay(100);
++	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
++		printf("SWEET USB: clk %-16s now 0x%08x (%s)\n", usb_cbcr[i].name,
++		    usb_rd(gcc, usb_cbcr[i].off),
++		    sweet_usb_clk_on(gcc, usb_cbcr[i].off) ? "on" : "OFF");
++	}
++
++	/* Pulse the controller reset now that its clocks are running. */
++	*(volatile uint32_t *)(gcc + GCC_USB30_PRIM_BCR) = 1;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(100);
++	*(volatile uint32_t *)(gcc + GCC_USB30_PRIM_BCR) = 0;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(100);
++	printf("SWEET USB: USB30 reset released, BCR 0x%08x\n",
++	    usb_rd(gcc, GCC_USB30_PRIM_BCR));
++	return ok;
++}
++
++/*
++ * QUSB2 PHY bring-up, following phy-qcom-qusb2.c for the sm6115 table with
++ * the msm8996 register layout: reset, hold disabled, board sequence from the
++ * device tree, enable, single-ended reference clock, wait for PLL lock.
++ */
++static bool
++sweet_usb_qusb2_init(vm_offset_t gcc)
++{
++	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++	if (phy == 0) {
++		printf("SWEET USB: QUSB2 map failed\n");
++		return false;
++	}
++	*(volatile uint32_t *)(gcc + GCC_QUSB2PHY_PRIM_BCR) = 1;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(100);
++	*(volatile uint32_t *)(gcc + GCC_QUSB2PHY_PRIM_BCR) = 0;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(100);
++	printf("SWEET USB: QUSB2 reset released, PLL_TEST 0x%02x PWRDN 0x%02x STATUS 0x%02x\n",
++	    usb_rd(phy, Q2_PLL_TEST), usb_rd(phy, Q2_POWERDOWN), usb_rd(phy, Q2_PLL_STATUS));
++
++	*(volatile uint32_t *)(phy + Q2_POWERDOWN) = usb_rd(phy, Q2_POWERDOWN) |
++	    Q2_CLAMP_N_EN | Q2_FREEZIO_N | Q2_POWER_DOWN;
++	for (unsigned i = 0; i < sizeof(qusb2_init_seq) / sizeof(qusb2_init_seq[0]); i++) {
++		*(volatile uint32_t *)(phy + qusb2_init_seq[i][1]) = qusb2_init_seq[i][0];
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(phy + Q2_POWERDOWN) =
++	    usb_rd(phy, Q2_POWERDOWN) & ~Q2_POWER_DOWN;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(200);
++	/* Single-ended (cmos) reference clock: sm6115_phy_cfg.se_clk_scheme_default */
++	*(volatile uint32_t *)(phy + Q2_PLL_TEST) = 0x80;
++	__asm__ volatile ("dsb sy" ::: "memory");
++
++	uint32_t status = 0;
++	for (int i = 0; i < 100; i++) {
++		status = usb_rd(phy, Q2_PLL_STATUS);
++		if (status & Q2_PLL_LOCKED) {
++			break;
++		}
++		delay(100);
++	}
++	printf("SWEET USB: QUSB2 PLL status 0x%02x (%s) PWRDN 0x%02x TUNE1 0x%02x\n",
++	    status, (status & Q2_PLL_LOCKED) ? "locked" : "NOT LOCKED",
++	    usb_rd(phy, Q2_POWERDOWN), usb_rd(phy, Q2_TUNE1));
++	return (status & Q2_PLL_LOCKED) != 0;
++}
++
+ static void
+-sweet_usb_gadget_start(vm_offset_t dwc)
++sweet_usb_gadget_start(vm_offset_t gcc)
+ {
+ 	thread_t thread;
++	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
+ 
++	if (dwc == 0) {
++		printf("SWEET USB: DWC3 map failed\n");
++		return;
++	}
+ 	ud.dwc = dwc;
++	if (!sweet_usb_power_on(gcc)) {
++		printf("SWEET USB: power-up failed, trying anyway\n");
++	}
++	(void)sweet_usb_qusb2_init(gcc);
+ 	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("SWEET USB: no DMA memory\n");
+@@ -828,8 +1091,37 @@
+ 		return;
+ 	}
+ 	ud.dma_pa = ptoa_64(pn);
+-	ud_if_create();
++	/* CDC-ACM console: no network interface, no sockets, no ARP. The TX
++	 * completion handler still takes ud.lock, so allocate it here (it used
++	 * to come from ud_if_create()). */
++	{
++		static lck_grp_t *grp;
++		grp = lck_grp_alloc_init("sweet_usb", LCK_GRP_ATTR_NULL);
++		ud.lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
++	}
+ 
++	/*
++	 * No SuperSpeed PHY on this port: feed the core its pipe clock from UTMI,
++	 * the way dwc3-qcom does for HS-only designs ("select-utmi-as-pipe-clk").
++	 * Without a pipe clock the endpoint command engine rejects commands.
++	 */
++	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
++	if (qs != 0) {
++		uint32_t g = usb_rd(qs, QSCRATCH_GENERAL_CFG);
++		*(volatile uint32_t *)(qs + QSCRATCH_GENERAL_CFG) =
++		    (g | PIPE_UTMI_CLK_SEL | PIPE3_PHYSTATUS_SW) & ~PIPE_UTMI_CLK_DIS;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		printf("SWEET USB: GENERAL_CFG 0x%08x -> 0x%08x (utmi as pipe clk)\n", g,
++		    usb_rd(qs, QSCRATCH_GENERAL_CFG));
++	}
++	printf("SWEET USB: GSNPSID 0x%08x GHWPARAMS0 0x%08x GCTL 0x%08x DSTS 0x%08x GUSB2PHYCFG 0x%08x\n",
++	    dwc_rd(GSNPSID), dwc_rd(GHWPARAMS0), dwc_rd(GCTL), dwc_rd(DSTS), dwc_rd(GUSB2PHYCFG));
++	/* The device tree asks for the USB2 suspend quirk (snps,dis_u2_susphy_quirk). */
++	{
++		uint32_t cfg = dwc_rd(GUSB2PHYCFG) & ~GUSB2PHYCFG_SUSPHY;
++		dwc_wr(GUSB2PHYCFG, cfg);
++	}
++
+ 	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
+ 	dwc_wr(DCTL, DCTL_CSFTRST);
+ 	int i;
+@@ -854,11 +1146,11 @@
+ 	/* Events: disconnect, USB reset, connect done */
+ 	dwc_wr(DEVTEN, 0x7);
+ 
+-	/* Endpoint 0 OUT/IN: start config, control type, max packet 512 until connect done. */
++	/* Endpoint 0 OUT/IN: control type, max packet 64 for high speed. */
+ 	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0) ||
+-	    ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (0u << 25), 0) ||
++	    ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3), (1u << 8) | (1u << 10) | (0u << 25), 0) ||
+ 	    ud_epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
+-	    ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0) ||
++	    ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0) ||
+ 	    ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
+ 		printf("SWEET USB: endpoint 0 setup failed\n");
+ 		return;
+@@ -866,7 +1158,6 @@
+ 	dwc_wr(DALEPENA, 0x3);
+ 	ud_start_setup();
+ 
+-	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
+ 	if (qs != 0) {
+ 		uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL), ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
+ 		printf("SWEET USB: QSCRATCH HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x GENERAL_CFG 0x%08x\n",
+@@ -888,7 +1179,7 @@
+ 	}
+ 	int livelog = 1;
+ 	PE_parse_boot_argn("sweetusblog", &livelog, sizeof(livelog));
+-	if (livelog && ud.ifp != NULL && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
++	if (livelog && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
+ }

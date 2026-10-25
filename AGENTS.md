@@ -1,139 +1,146 @@
 # Citrus XNU port — active handoff
 
-Updated 2026-10-26 02:05 (Asia/Jakarta). Read this checkpoint first.
+Updated 2026-10-26 06:30 (Asia/Jakarta). Read this checkpoint first.
 
-## CURRENT STATE — the whole kernel freezes ~150 s into every post-keychain boot;
-## NOT the old container-XPC wall, NOT memory pressure, NOT the logger
+## CURRENT STATE — iOS UI IS UP: the phone boots to the iOS LOCK SCREEN, and the
+## kernel console is streamed LIVE over USB. The old "~150 s whole-kernel freeze"
+## is NOT reproduced on the current build and was very likely self-inflicted.
 
-### STOPPED HERE — 2026-10-26 02:05 Asia/Jakarta, user asleep, phone left running a diagnostic
+### 2026-10-26 06:30 Asia/Jakarta — what changed today
 
-**Phone is ON, running `out/citrus-diagnostic/citrus-xnu-boot-panel5.img`**
-(flashed and booted 02:04:23, payload `payload-ufsroot-panel5.bin`). It will
-freeze as usual and sit there. To resume: hold **Power + Volume Down** until
-fastboot, then `fastboot reboot recovery`, wait for `adb devices` = recovery,
-and run `tools/pull-sweetlog.sh NAME` (this now decodes the heartbeat block and
-the stall-sample blocks). **That pull is the next experiment**: the new
-`svc_runs` / `panel_runs` / `intr_pc` / `ufs_users` fields in the heartbeat say
-whether the interrupt probe ever ran and whether a thread was inside the UFS
-driver at the last interrupt write. Do not flash before pulling.
+**Milestone 2 reached.** The phone boots the HFS root, runs launchd and the
+daemons, brings up SpringBoard/backboardd on the MDF, **draws the Apple logo,
+then the iOS lock screen, and the clock/UI keep updating for minutes**. User
+confirmed stable lock screen at 06:26. This is the first time iOS UI (not just
+the boot logo) has been seen on this port.
 
-**Hard finding (measured, three independent channels):** every boot since the
-keychain ownership fix stops dead at **~146–166 s** of kernel uptime.
-1. Console log flush stops at `SWEETLOG total ~133-139 KB, seq 53-61`.
-2. The flight-recorder block (one device block before the log area, rewritten
-   every 5 s by a kernel thread) stops at `uptime_s` 146/151/166; it carries
-   `boot_id` (+1 per boot) and the previous boot's `prev_*` values, so a silent
-   reboot loop would be visible. It is not rebooting.
-3. HFS catalog mtimes read straight off the device over ADB
-   (`tools/hfs-catalog-times.py`) diffed against the flashed image: newest mtime
-   **uptime 143 s**.
+**Live kernel+userspace console over USB works** (`sweetusb=2`). The kernel
+exposes a CDC-ACM function ("Sweet iOS (USB console)"), macOS creates
+`/dev/cu.usbmodem00011` about 40 s into the boot, and the kernel streams its
+console ring to bulk IN. No root, no host IP config, no network stack.
+`tools/usb-log.py` reads it (autodetects the port): the "adb logcat" channel we
+wanted. Verified streaming kernel printf and `|SpringBoard|`/`|backboardd|`
+stderr from `/dev/null` tees.
 
-RAM is **ruled out**: identical stall with **1.75 GiB** (111632 free pages at
-boot, 15840–24933 free at the stall, never exhausted, no swap files created).
+### The old "freeze at ~150 s" is almost certainly our own watchdog panic
 
-**Panel/console findings (important, cost several boots):**
-- The video console stops receiving text very early — the last line ever drawn is
-  `debug_log_init: Error!! gPanicBase is still not initialized` (log line ~51,
-  right before `kdp_core`/serial setup). Everything after that (platform expert,
-  launchd, all daemons) only goes to the ring. The frozen screen therefore shows
-  early-boot text forever; this is expected, not a new bug. Most likely
-  `serial=3` switches console output to serial at that point.
-- `sweet_shadow_va` (video_console) is not a reliable drawing target after the
-  console is paused/retargeted; the driver's own console frame
-  (`AppleCLCD::fCons`, exported as `sweet_fb_console_frame()`) is the buffer that
-  is actually scanned.
-- **Never call `printf` or take the console ticket lock from interrupt context**
-  on this port: an early attempt froze the phone within seconds.
-- The panel is only useful as an output if `sweet_fb_show_console()` (MMIO
-  scanout switch, no locks) is called and `sweet_console_hold=1` stops the vsync
-  thread from flipping away. `sweetpanel=1` does both.
+Every stalled boot carried `sweetwdt=150`, and every stall was reported at
+uptime 146/151/156/166 s. `sweet_wdt_thread` (bsd/dev/sweet_sample.c) prints
+`SWEET WDT: no console output or block I/O for %d s` and then **panics**. The
+current boot uses `sweetwdt=0` and has stayed alive past 6 minutes with UI
+updating. Treat the previous checkpoint's "whole kernel freezes" conclusion as
+**unproven / probably wrong** until an A/B test is run (same build, only
+`sweetwdt` differing). The flight recorder's last uptime and the console flush
+counts are consistent with a panic at idle>=150 s, not with a hardware wedge.
 
-**Timer findings (critical for any watchdog):**
-- `ml_timer_evaluate()` is empty and **`timer_call` callbacks never run** on this
-  port. Thread wakeups work only because `timer_intr()` services thread-wait
-  deadlines (`running_timers_expire`). A sleeping watchdog thread therefore dies
-  with the scheduler and a `timer_call` watchdog never fires at all.
-- **Do not reprogram `cdp->rtcPop`/the decrementer** to force a 1 Hz tick: three
-  builds with that hack froze at **~40 s** (boot 6/7/8, heartbeat stops at
-  uptime 36, log flush #2). It was removed again; the probe now rides whatever
-  timer interrupts occur.
-- Consequence: if the freeze stops all timer deadlines, nothing in software can
-  report anything afterwards. A second CPU or a real console channel is the only
-  robust answer (see below).
+Consequence: the whole "UFS wedge holding sweet_ufs_lock" theory built on
+`ufs_users=1` at the last heartbeat is also unproven — that value was simply the
+last sample before the watchdog panic.
 
-**Instrumentation currently in the kernel** (buildtree + captured in
-`kernel/patches/0002-sweet-console-display-stall-instrumentation.patch`):
-- `bsd/dev/sweet_ufs.c`
-  * flight-recorder block `SWEETHB1` v2 at `partition_end - 1042` blocks:
-    boot_id, seq, uptime, console bytes/seq, UFS I/O count, flush runs,
-    free/wire pages, `svc_runs`, `panel_runs`, `intr_pc`, `ufs_users`, and the
-    previous boot's last values.
-  * `sweet_hb_write_from_irq()`: the timer probe persists the block itself when
-    `sweet_ufs_users == 0` (one CPU + interrupts off ⇒ the controller is idle, so
-    no lock is needed). If the UFS is wedged the block simply stops advancing.
-  * `sweet_stall_service(pc, user_mode)`: called from every timer interrupt,
-    rate-limited to 5 s; counts runs, draws the lock-free panel line, writes the
-    IRQ heartbeat, and after 10 s without console output/block I/O prints/writes
-    `SWEET STALL ... UFS=<n> PC=<pc> LAST=<pc> <proc>`.
-  * `sweet_panel_text()`: raw framebuffer text with a 5x7 font scaled 4x, no
-    locks, dcache-cleaned; first call floods the frame black so it is obvious
-    whether the panel scans that buffer.
-  * stall-sample blocks: up to 16 x 4 KiB before the heartbeat block, appended by
-    the probe when `sweet_ufs_users == 0`.
-- `osfmk/arm/rtclock.c`: calls `sweet_stall_service(pc, user_mode)` after
-  `timer_intr()` (pc only recorded for kernel-mode interrupts).
-- `osfmk/console/video_console.c`: `sweet_console_shadow_info()` (console
-  geometry) and `sweet_console_force()` (kept, but not used from IRQ any more).
-- `iokit/.../SweetFramebuffer.cpp`: `sweet_fb_show_console()`,
-  `sweet_fb_console_frame()` (fCons VA/stride/height/PA) and the
-  `sweet_console_hold` vsync bypass.
-- Boot args: `sweetpanel=1` (panel reporting + console hold), `sweetwdt=<s>`
-  (thread watchdog, only useful while the scheduler runs).
+### USB port status (new, working)
 
-**Tooling added/changed this session:**
-- `tools/pull-sweetlog.sh NAME` — pulls the log, the heartbeat block and the 16
-  stall blocks in one read and decodes them (`NAME-heartbeat.txt`,
-  `NAME-stalls.txt`). Needs recovery + `adb`.
-- `tools/symbolicate-kernel.py ADDR...` — resolves kernel PCs against
-  `out/citrus-kernel/kernel.development.citrus` with `llvm-addr2line`.
-- `tools/hfs-catalog-times.py` — newest catalog timestamps / diff support,
-  `--adb-cache NEW_DIR` reads the device read-only.
-- `tools/rebuild-kernel.py` now also rebuilds `exception.o`, `rtclock.o`,
-  `video_console.o`, `sweet_sample.o`, `sweet_ufs.o`.
+`bsd/dev/sweet_usb.c` is now ported from Topaz/SM7150 to **Citrus = bengal /
+SM6115** and device mode works:
 
-**Boot images built this session (all under out/citrus-diagnostic/):**
-`citrus-xnu-boot-ram1792-wdt.img` (RAM+watchdog), `-hb.img` (flight recorder),
-`-irq.img` (IRQ samples), `-panel.img`, `-phb.img`, `-phb2.img`, `-tick.img`
-(1 Hz hack, harmful), `-panel2/3/4/5.img` (lock-free panel; 5 = current).
-ADT: `out/citrus-kernel/citrus-ufsroot-disp-ram1792.adt` (1792 MiB, display).
-Cmdline = the native-long one plus `sweetwdt=150 sweetpanel=1`.
+- **DWC3** wrapper `ssusb@4e00000`, core regs at `0x04e00000` (size 0xcd00),
+  **QSCRATCH at core + 0xf8800**. Correct.
+- **GCC is at `0x01400000`, size `0x1f0000`** (DT `/soc/qcom,gcc@1400000`).
+  The old Topaz value `0x00100000` is NOT GCC here: reading it wedges the bus
+  and killed four boots silently before the first log flush. This cost most of
+  the debugging time today.
+- USB power domain/clocks are **OFF** after ABL (measured): `usb30_prim` GDSCR
+  `0x00222001` (bit31=0), all `usb30-*`/`cfg-noc`/`ahb2phy` CBCRs have bit31 set.
+  Bring-up that works (`sweet_usb_power_on`): clear GDSCR bit0 and poll bit31;
+  enable `ahb2phy-usb` (0x1d008) and deassert its BCR (0x1d000); enable
+  `usb30-master` 0x1a010, `sleep` 0x1a014, `mock-utmi` 0x1a018, `cfg-noc-axi`
+  0x1a084, `ahb2phy-usb` 0x1d008, `usb3-clkref` 0x9f000; pulse `usb30` BCR
+  (0x1a000). GDSCR comes back `0xf8222000`, all CBCRs on.
+- **QUSB2 PHY is `qusb@1613000`** (NOT 0x088e2000 — that was a wrong note from
+  Topaz). Register layout = `phy-qcom-qusb2.c` `msm8996_regs_layout`
+  (PLL_STATUS 0x38, TUNE1-4 0x80/84/88/8c, TEST2 0x9c, POWERDOWN 0xb4).
+  The board's own init sequence is in the DT property
+  `qcom,qusb-phy-init-seq` (value,offset pairs) and is applied verbatim;
+  reset is GCC `GCC_QUSB2PHY_PRIM_BCR` 0x1c000. PLL locks (status bit5).
+- **HS-only needs the pipe clock from UTMI**: write QSCRATCH `GENERAL_CFG`
+  (0x08) with `PIPE_UTMI_CLK_SEL|PIPE3_PHYSTATUS_SW`, clear `PIPE_UTMI_CLK_DIS`
+  (the equivalent of dwc3-qcom's `select-utmi-as-pipe-clk`). Without it the
+  DWC3 command engine rejects SETEPCONFIG ("ep0 cmd 0x1 timeout").
+- EP0 max packet must be **64** (HS), not 512.  VBUS override is still needed:
+  QSCRATCH `HS_PHY_CTRL` 0x10 |= `UTMI_OTG_VBUS_VALID|SW_SESSVLD_SEL`,
+  `SS_PHY_CTRL` 0x30 |= `LANE0_PWR_PRESENT`.
+- The gadget body (EP0 state machine, bulk endpoints, TRBs) is Topaz code that
+  ported unchanged.
 
-**Next work, in order:**
-1. Reset to recovery and run `tools/pull-sweetlog.sh next`. Read `svc_runs`,
-   `panel_runs`, `ufs_users`, `intr_pc`, and the current uptime.
-   - `svc_runs == 0` ⇒ timer interrupts stop reaching `rtclock_intr` very early
-     (would be surprising, thread sleeps work) — check `intr_pc`.
-   - `svc_runs > 0` and `panel_runs > 0` but the screen still shows old text ⇒
-     purely a scanout/drawing problem; the black flood in panel5 answers whether
-     the panel scans `fCons` at all.
-   - `ufs_users > 0` at the last IRQ write ⇒ a thread is wedged inside the UFS
-     driver holding `sweet_ufs_lock`: instrument `sweet_ufs_strategy` /
-     `ufs_scsi` with entry timestamps, lba/count and a per-call counter, and make
-     the probe able to write through a second UTRL slot.
-   - `ufs_users == 0` and `intr_pc` points into display/surface code ⇒ examine
-     `SweetSurface`/`SweetFramebuffer` (the last console lines before every
-     freeze are SpringBoard creating small snapshot surfaces 4/5/6 and
-     `SWEET SURF: SpringBoard sel 35`).
-2. **Consider a real console channel** (user's suggestion): `sweet_usb.c` already
-   streams the log over USB-ECM (UDP 192.168.7.1:5140) but is hard-wired to the
-   Topaz DWC3 at `0x0a600000`. Citrus's DWC3 is at **`0x04e00000`**
-   (`04e0c100-04e0ccff` in /proc/iomem) with a different PHY/clock tree
-   (QUSB2 at `0x088e2000`), so it needs a real port (controller base, GCC
-   clocks/GDSC, PHY init, endpoint setup). With a live channel this whole class
-   of problem becomes trivial. That is probably the highest-value next
-   infrastructure task.
-3. Then continue the original goals: home/setup rendering, mobileactivationd
-   SIGTRAP, sandbox container-path patches 0149/0936 (not applied), touch/GPU/Wi-Fi.
+**Console channel implementation:** descriptors are CDC-ACM (2 interfaces, bulk
+0x81 IN / 0x01 OUT, int 0x82); `ud_log_thread` reads `sweet_log_copy()` straight
+from the console ring and pushes 6 KiB chunks to the bulk IN endpoint. There is
+**no ifnet/socket/UDP path any more** (the old ECM+UDP code enumerates fine but
+never delivered datagrams; sockets/routes are more fragile than a serial line).
+`ud.lock` must still be allocated by hand — it used to come from
+`ud_if_create()`.
+
+**Timebase trap:** `mach_absolute_time()` is 24 MHz ticks here, not nanoseconds.
+A `now + 5*1000000000ull` "5 s" period is really ~208 s. Always use
+`nanoseconds_to_absolutetime()`. This bug is fixed in the log thread's
+heartbeat but was the reason only one `SWEET LIVE` line ever appeared.
+
+### Boot arguments that matter now
+
+`sweetusb=2` (power up DWC3 + PHY, enumerate, stream the console),
+`sweetusb=1` (probe GCC/clock state only, no writes),
+`sweetwdt=0` (do NOT enable the 150 s stall watchdog while debugging a boot —
+it panics),
+`sweetpanel=1` = probe bookkeeping only, `sweetpanel=2` = also draw on the
+console frame from the timer interrupt (drawing from IRQ is still suspect: every
+build that drew died within seconds of the first draw),
+`sweetirqwr=0` = keep the interrupt-side UFS heartbeat writes off.
+
+**Never call `PE_parse_boot_argn` from interrupt context.** Resolve boot args
+once in thread context (`sweet_irq_writes_resolve()` in `sweet_ufs_init`) and
+have the IRQ path read the resolved value. Doing otherwise killed every boot
+within seconds (panel7 through usbprobe2), which was misread as a new freeze.
+
+### Phone state at STOP (2026-10-26 06:30)
+
+Phone is ON and **alive**, running `out/citrus-diagnostic/citrus-xnu-boot-usb6.img`
+(`sweetusb=2 sweetwdt=0 sweetpanel=1 sweetirqwr=0`, payload
+`payload-ufsroot-usb6.bin`), booted 06:22:16, showing the iOS lock screen.
+Note usb6 predates the timebase fix; the next build (usb7) has a true 5 s
+`SWEET LIVE` heartbeat and should be used to measure long-run stability.
+`/dev/cu.usbmodem00011` is live; `tools/usb-log.py -o FILE` captures it.
+
+### Next work, in order
+
+1. **Run the A/B test on the watchdog**: boot the same build twice, once with
+   `sweetwdt=150` and once with `sweetwdt=0`, and see whether the "freeze"
+   reproduces only with the watchdog. If so, delete that hypothesis from the
+   handoff, keep `sweetwdt=0`, and stop chasing a UFS wedge.
+2. **Watch stability with the 5 s heartbeat** (build usb7 = current tree): the
+   `SWEET LIVE T=..s beat=.. ufsio=.. free=.. op=..` line must keep advancing
+   for 10+ minutes with the lock screen up. `op=` names the in-flight UFS
+   command (`sweet_ufs_op_string()` in sweet_ufs.c).
+3. **Lock screen → home screen**: it is stable but not unlockable; touch
+   (FT8719 over SPI) is still unported, and the lock screen may be waiting for a
+   passcode/press. Consider whether `sweetfb_stayon=1` + a synthetic HID event
+   (SweetHID touch/buttons already open) can dismiss the lock screen for a test.
+4. Then the original list: setup/home rendering, mobileactivationd SIGTRAP,
+   sandbox container-path patches 0149/0936 (still not applied), touch, GPU
+   (Adreno 610), Wi-Fi.
+
+### Rules and traps learned today
+
+- Before calling a boot "frozen", check that `sweetwdt` is 0 — the in-kernel
+  watchdog panics by design.
+- Any new MMIO base must be cross-checked against
+  `device-dumps/20261025-141423-923416/live-tree.json` (authoritative for this
+  SoC: bengal/SM6115). The GCC address was the single most expensive mistake.
+- Flashing: `fastboot flash boot <img>` then `fastboot reboot`; the boot images
+  are ~23.7 MB. To pull the UFS recorder you must still go through
+  `fastboot reboot recovery` + `tools/pull-sweetlog.sh NAME`, but **most
+  debugging no longer needs it** thanks to the USB console.
+- Tests are reset with Power + Volume Down by the user (no automated reset).
+- Use `tools/usb-log.py` (not a raw `cat`) so silence is reported as
+  "kernel stopped printing" rather than being missed.
 
 ### Superseded checkpoint (2026-10-26 00:03 Asia/Jakarta)
 

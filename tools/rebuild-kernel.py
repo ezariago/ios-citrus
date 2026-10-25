@@ -57,7 +57,7 @@ def main():
                ('osfmk', 'arm_vm_init.o'), ('iokit', 'SweetBattery.cpo'),
                ('osfmk', 'serial_console.o'), ('iokit', 'SweetFramebuffer.cpo'),
                ('osfmk', 'exception.o'), ('osfmk', 'rtclock.o'), ('osfmk', 'video_console.o'), ('bsd', 'sweet_sample.o'),
-               ('bsd', 'sweet_ufs.o')]
+               ('bsd', 'sweet_ufs.o'), ('bsd', 'sweet_usb.o')]
     for component, target in targets:
         compile_object(component, target)
     link = ART / 'xnu-kernel/kernel.development.sweet.link'

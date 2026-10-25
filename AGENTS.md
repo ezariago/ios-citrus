@@ -22,20 +22,36 @@ console ring to bulk IN. No root, no host IP config, no network stack.
 wanted. Verified streaming kernel printf and `|SpringBoard|`/`|backboardd|`
 stderr from `/dev/null` tees.
 
-### The old "freeze at ~150 s" is almost certainly our own watchdog panic
+### The stall is INTERMITTENT and still unexplained (watchdog theory disproved)
 
-Every stalled boot carried `sweetwdt=150`, and every stall was reported at
-uptime 146/151/156/166 s. `sweet_wdt_thread` (bsd/dev/sweet_sample.c) prints
-`SWEET WDT: no console output or block I/O for %d s` and then **panics**. The
-current boot uses `sweetwdt=0` and has stayed alive past 6 minutes with UI
-updating. Treat the previous checkpoint's "whole kernel freezes" conclusion as
-**unproven / probably wrong** until an A/B test is run (same build, only
-`sweetwdt` differing). The flight recorder's last uptime and the console flush
-counts are consistent with a panic at idle>=150 s, not with a hardware wedge.
+History, measured today with the live USB console (builds usb6..usb9, all with
+`sweetwdt=0`, i.e. the in-kernel panic watchdog disabled):
 
-Consequence: the whole "UFS wedge holding sweet_ufs_lock" theory built on
-`ufs_users=1` at the last heartbeat is also unproven — that value was simply the
-last sample before the watchdog panic.
+- **usb6** (no periodic heartbeat printed): reached the **iOS lock screen**, UI
+  clock updating, still healthy after 6 minutes (user confirmed). Console output
+  went quiet at ~60 s, and re-opening the tty later still delivered buffered
+  output, so the kernel was alive the whole time.
+- **usb7 / usb8** (5 s `SWEET LIVE` heartbeat printed from the USB log thread):
+  heartbeats advanced every 5 s to T=147..157 s, then the console stopped and the
+  screen stayed on the **Apple logo**.
+- **usb9** (heartbeat off by default, everything else identical to usb8): console
+  quiet at ~70 s, screen **Apple logo**, no data on re-open.
+
+So (a) the old "whole-kernel freeze at ~150 s" is **not** a watchdog panic —
+`sweetwdt=0` boots still stop — and (b) it is **not** deterministic: one boot in
+four reached and kept the lock screen. Do not treat any single boot as canonical.
+
+Both good and stalled logs reach the same SpringBoard lock-screen code path
+(`SBCoverSheetPrimarySlidingViewController` appears in usb6 and usb9), so the
+difference is how far the UI gets and/or whether it keeps presenting, not whether
+SpringBoard starts. usb6 ran 531 `exec`s, usb9 279.
+
+Free-page trend seen in the 5 s heartbeat (usb7/usb8): 111632 at boot ->
+39658 at T=112 s -> 24611 at T=147 s (~340 pages/s). Worth checking whether the
+stalled boots die later in a VM-pressure/compressor path with cpus=1; not proven.
+
+The "UFS wedge holding sweet_ufs_lock" theory remains unproven (it rested on
+`ufs_users=1` in a recorder written by a boot that also had the watchdog on).
 
 ### USB port status (new, working)
 
@@ -79,6 +95,14 @@ never delivered datagrams; sockets/routes are more fragile than a serial line).
 `ud.lock` must still be allocated by hand — it used to come from
 `ud_if_create()`.
 
+**Stability caveat:** the console stream itself sometimes dies (bulk IN transfer
+left pending, e.g. if the host closes the tty). Re-opening `/dev/cu.usbmodem*`
+recovers the buffered console on some boots (usb6) but not on others (usb9); a
+dead channel is therefore NOT proof that the kernel is dead — always ask the user
+what the screen shows. The periodic `SWEET LIVE` heartbeat is now **opt-in**
+(`sweetusbbeat=1`) because it is still unclear whether frequent printf from that
+thread contributed to the stalls.
+
 **Timebase trap:** `mach_absolute_time()` is 24 MHz ticks here, not nanoseconds.
 A `now + 5*1000000000ull` "5 s" period is really ~208 s. Always use
 `nanoseconds_to_absolutetime()`. This bug is fixed in the log thread's
@@ -100,9 +124,13 @@ once in thread context (`sweet_irq_writes_resolve()` in `sweet_ufs_init`) and
 have the IRQ path read the resolved value. Doing otherwise killed every boot
 within seconds (panel7 through usbprobe2), which was misread as a new freeze.
 
-### Phone state at STOP (2026-10-26 06:30)
+### Phone state at STOP (2026-10-26 06:50)
 
-Phone is ON and **alive**, running `out/citrus-diagnostic/citrus-xnu-boot-usb6.img`
+Phone is ON, running `out/citrus-diagnostic/citrus-xnu-boot-usb9.img` (~06:44:53),
+screen static on the Apple logo. Reset with Power + Volume Down for the next test.
+usb6 (below) is the build that reached the lock screen; keep it as the reference.
+
+Earlier, 06:30: phone **alive**, running `out/citrus-diagnostic/citrus-xnu-boot-usb6.img`
 (`sweetusb=2 sweetwdt=0 sweetpanel=1 sweetirqwr=0`, payload
 `payload-ufsroot-usb6.bin`), booted 06:22:16, showing the iOS lock screen.
 Note usb6 predates the timebase fix; the next build (usb7) has a true 5 s

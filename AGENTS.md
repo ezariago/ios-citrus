@@ -76,6 +76,49 @@ Both outcomes are actionable; implement this before more hypothesis testing.
 configured, 1 KiB console chunks. Use these for ordinary boots; re-enable the
 UFS log only when a boot must be inspected after a reset.
 
+### 08:15 update — the failure is NOT one bug: I/O results go wrong in different places
+
+The physical-timer build (`ptimer`, `sweetptimer=1`, PPI 18, 1 Hz) produced a
+completely different failure from the ~150 s stall:
+
+- heartbeat thread **kept writing to uptime 271 s** (seq 48, `svc_runs=54`),
+  `free_pages=107396` (nothing had allocated), `ufs_ios` only 785, console only
+  **12 KB**;
+- the log shows the root mounted, then launchd failing in
+  **`shared_region ... vm_shared_region_start_address() failed`** and
+  `libignition: failed to lookup preboot ... ignition boot failed: 25`;
+- `ufs_users=1` at the last heartbeat.
+
+So on that boot the kernel was alive and healthy, but **userspace could not map
+the dyld shared cache / could not open files**, so no UI ever started. Other
+stalled boots stop later (after ~120 KB of log, SpringBoard's MSD warnings).
+Stalled boots also always leave a thread inside the UFS driver.
+
+**Unifying hypothesis to test next (highest value): the UFS driver returns
+stale/late/incorrect completions, so I/O results are occasionally wrong or
+never arrive.** That explains all observations at once: intermittent, different
+failure points per boot, one-in-eight clean boot, a thread sitting in the
+driver, `shared_region`/`ignition` file errors, and the total stall.
+
+Concrete defects to fix in `bsd/dev/sweet_ufs.c` (all in `ufs_scsi`):
+1. `su.tag` is a byte incremented without atomics and the response UPIU's tag is
+   never validated — a late completion from a timed-out command is accepted as
+   the current one.
+2. On timeout the code only clears the doorbell (`REG_UTRLCLR`) and returns; the
+   device may deliver that response later, so the next command can consume it.
+   Needs a real drain/reset of the host controller (stop the ring, clear, restart,
+   re-arm UTRLBA) or at minimum a tag check plus discarding mismatched completions.
+3. Only the OCS/response bytes are checked; there is no length/residual check, so
+   a short read is invisible (looks like zeros, e.g. an empty shared cache).
+4. `su.cache` (boot-arg `ufscache`) defaults to 0, i.e. every transfer is a
+   clean+invalidate "sync" rather than the minimal operation; verify the
+   direction of invalidate vs clean for reads against `flush_dcache64(..., TRUE)`.
+
+Answer to "why did usb6 work?": nothing about usb6 was special in the build
+(`sweetusb=2`, everything else the same as the boots that follow); it simply won
+the race. Treat it as the reference for what a good boot looks like, not as a
+different configuration.
+
 ### USB port status (new, working)
 
 `bsd/dev/sweet_usb.c` is now ported from Topaz/SM7150 to **Citrus = bengal /

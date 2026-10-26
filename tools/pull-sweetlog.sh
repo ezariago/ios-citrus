@@ -59,19 +59,20 @@ for i in range(16):
         op_age_ms, op_cdb, op_flags = struct.unpack_from('<QII', blk, 104)
     else:
         op_age_ms, op_cdb, op_flags = 0, 0, 0
+    pt = struct.unpack_from('<Q', blk, 120)[0] if version >= 3 else 0
     rows.append((seq, slot, uptime_s, stall_s, pc, last_pc, proc,
                  console_bytes, ufs_ios, free_pages, ufs_users,
-                 op_age_ms, op_cdb, op_flags))
+                 op_age_ms, op_cdb, op_flags, pt))
 if rows:
     lines = ['seq slot uptime stall   pc                 last_pc            proc             console_bytes ufs_ios free_pages users  ufs_op']
     for r in sorted(rows):
         (seq, slot, up, st, pc, lpc, proc, cb, io, fp, users,
-         op_age, op_cdb, op_flags) = r
+         op_age, op_cdb, op_flags, pt) = r
         op = 'idle'
         if op_flags & 2:
             op = f'0x{op_cdb:02x}{"w" if op_flags & 1 else "r"} age={op_age}ms'
         lines.append(f'{seq:3} {slot:4} {up:6} {st:5} 0x{pc:016x} 0x{lpc:016x} {proc:16} '
-                     f'{cb:13} {io:7} {fp:9} {users:5}  {op}')
+                     f'{cb:13} {io:7} {fp:9} {users:5}  {op} ptimer={pt}')
     text = '\n'.join(lines)
     open(f'{out}/{name}-stalls.txt', 'w').write(text + '\n')
     print(text)

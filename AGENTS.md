@@ -869,9 +869,9 @@ be the wrong model; the failure is intermittent I/O, see section 1.)
 
 ## Immediate handoff checklist
 
-1. Read **STOPPED HERE** first: it has the phone state, the attributes-extent fix,
-   the working `sweetlog=1` method, the display findings and the launchd logging
-   experiment.
+1. Read **sections 0–8 at the top** first; they replace every older checkpoint.
+   The most important sentence in the file: the boot failure is intermittent and
+   looks like bad/missing I/O results, so fix `ufs_scsi()` before anything else.
 2. Never fastboot a >2 GiB image at userdata; use tools/stream-image-adb.sh from
    OrangeFox recovery.
 3. After ANY change to the local image, re-stream all 16 segments and verify the

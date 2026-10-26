@@ -22,36 +22,59 @@ console ring to bulk IN. No root, no host IP config, no network stack.
 wanted. Verified streaming kernel printf and `|SpringBoard|`/`|backboardd|`
 stderr from `/dev/null` tees.
 
-### The stall is INTERMITTENT and still unexplained (watchdog theory disproved)
+### The stall: INTERMITTENT, and the CPU stops taking timer interrupts
 
-History, measured today with the live USB console (builds usb6..usb9, all with
-`sweetwdt=0`, i.e. the in-kernel panic watchdog disabled):
+Measured today with the live USB console and the UFS flight recorder (all
+builds `sweetwdt=0`, i.e. the in-kernel panic watchdog disabled):
 
-- **usb6** (no periodic heartbeat printed): reached the **iOS lock screen**, UI
-  clock updating, still healthy after 6 minutes (user confirmed). Console output
-  went quiet at ~60 s, and re-opening the tty later still delivered buffered
-  output, so the kernel was alive the whole time.
-- **usb7 / usb8** (5 s `SWEET LIVE` heartbeat printed from the USB log thread):
-  heartbeats advanced every 5 s to T=147..157 s, then the console stopped and the
-  screen stayed on the **Apple logo**.
-- **usb9** (heartbeat off by default, everything else identical to usb8): console
-  quiet at ~70 s, screen **Apple logo**, no data on re-open.
+| build | USB | console tee | UFS log | result |
+|---|---|---|---|---|
+| usb6  | CDC-ACM | on | on | **reached + kept the iOS lock screen** (user confirmed, clock updating, 6 min) |
+| usb7/8 | CDC-ACM | on | on | heartbeat every 5 s to T=147..157 s, then silent, Apple logo |
+| usb9  | CDC-ACM | on | on | silent at ~70 s, Apple logo |
+| nousb1 | **off** | on | on | heartbeat to T=136 s, Apple logo (pulled: boot_id 14, free 24828) |
+| slotsample | off | on | on | heartbeat to T=156 s, `svc_runs` froze at 31 (~155 s) |
+| quiet | CDC-ACM | **off** | **off** | Apple logo |
 
-So (a) the old "whole-kernel freeze at ~150 s" is **not** a watchdog panic —
-`sweetwdt=0` boots still stop — and (b) it is **not** deterministic: one boot in
-four reached and kept the lock screen. Do not treat any single boot as canonical.
+**Falsified today** (do not re-test these first): watchdog panic, USB gadget or
+its traffic, console/tee spam, "it is just slow / pageout thrashing" (left
+stalled 9.5 min, never recovered), the UFS-lock-wedge story (see below).
 
-Both good and stalled logs reach the same SpringBoard lock-screen code path
-(`SBCoverSheetPrimarySlidingViewController` appears in usb6 and usb9), so the
-difference is how far the UI gets and/or whether it keeps presenting, not whether
-SpringBoard starts. usb6 ran 531 `exec`s, usb9 279.
+**What the recorder says.** `slotsample` gave the cleanest data: the heartbeat
+thread wrote at uptime 156 s with `ufs_users=1`, `free_pages=17957`, and
+`svc_runs=31` (31 rate-limited probe runs ~ 155 s). After that:
+- **no stall samples at all**, although a new interrupt-side recorder now writes
+  them through **UTRL slot 1** (its own UCD + bounce buffer, so it works even
+  while a thread holds `sweet_ufs_lock`) and would have written one every 5 s
+  for the next 4 minutes before the pull.
+- Therefore the **timer interrupt itself stops** at ~150 s. Two readings, both
+  still open:
+  1. the CPU spins with interrupts masked (spinlock/deadlock at high IPL), or
+  2. the CPU idles with **no armed timer deadline** (nothing re-arms the
+     decrementer), which on this port is plausible because `ml_timer_evaluate()`
+     is empty and only thread-wait deadlines arm it.
+  The `ufs_users=1` at the last write is a hint that a thread was blocked inside
+  the UFS driver at that moment, but it is one sample.
 
-Free-page trend seen in the 5 s heartbeat (usb7/usb8): 111632 at boot ->
-39658 at T=112 s -> 24611 at T=147 s (~340 pages/s). Worth checking whether the
-stalled boots die later in a VM-pressure/compressor path with cpus=1; not proven.
+**The intermittent success matters.** One boot in ~8 reached the lock screen, so
+whatever breaks is a race, not a deterministic wall. Keep `usb6` as the reference
+image (`out/citrus-diagnostic/citrus-xnu-boot-usb6.img`).
 
-The "UFS wedge holding sweet_ufs_lock" theory remains unproven (it rested on
-`ufs_users=1` in a recorder written by a boot that also had the watchdog on).
+**Next diagnostic (do this first):** add an *independent* 1 Hz tick on the ARM
+**physical** timer (CNTP, INTID 18 per the DT; XNU itself uses the virtual timer,
+INTID 19). Its ISR must do nothing but bump a counter, and every 5 s write a
+stall record through the existing slot-1 path (`ufs_diag_write_block()`). That
+answers spin-vs-sleep directly:
+- counter keeps advancing after the stall => the CPU still takes interrupts =>
+  the bug is a missing timer deadline in the scheduler/rtclock arming.
+- counter stops too => interrupts are masked => it is a spin, and a second CPU
+  (SMP) is the only way to see it.
+Both outcomes are actionable; implement this before more hypothesis testing.
+
+**Boot-speed work already done (keep it):** `sweetlog=0` (no UFS log fsync every
+2-5 s), `sweetsample=-` (no 90 s process walk), USB polling reduced to 10 ms once
+configured, 1 KiB console chunks. Use these for ordinary boots; re-enable the
+UFS log only when a boot must be inspected after a reset.
 
 ### USB port status (new, working)
 

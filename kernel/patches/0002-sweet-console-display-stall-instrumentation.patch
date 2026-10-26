@@ -40,7 +40,16 @@
  #define REG_CAP         0x00
  #define REG_IS          0x20
  #define REG_IE          0x24
-@@ -96,7 +118,13 @@
+@@ -76,6 +98,8 @@
+ #define CMD_TIMEOUT_NS  (5ull * NSEC_PER_SEC)
+ #define CMD_SPIN_NS     (50ull * NSEC_PER_USEC)
+ #define CMD_SLEEP_NS    (200ull * NSEC_PER_USEC)
++#define RING_STOP_NS    (100ull * NSEC_PER_MSEC)
++#define RING_DRAIN_MS   20
+ 
+ struct utrd {
+ 	uint32_t dw0, dw1, dw2, dw3;
+@@ -96,14 +120,20 @@
  #define DMA_UTRL        0x0000                  /* 1 KiB aligned */
  #define DMA_UCD         0x1000                  /* 128 byte aligned */
  #define DMA_BOUNCE      0x4000
@@ -55,7 +64,15 @@
  
  static struct {
  	vm_offset_t regs;
-@@ -116,6 +144,17 @@
+ 	vm_offset_t dma;                        /* kernel VA of the DMA allocation */
+ 	uint64_t dma_pa;
+ 	uint8_t lun;
+-	uint8_t tag;
++	_Atomic uint8_t tag;
+ 	uint64_t first_block, nblocks;          /* partition, in 4 KiB device blocks */
+ 	uint32_t secsize;                       /* logical sector size for the BSD layer */
+ 	bool writable;                          /* boot-arg ufsrw=1 */
+@@ -116,6 +146,17 @@
  
  static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
  static LCK_MTX_DECLARE(sweet_ufs_lock, &sweet_ufs_grp);
@@ -73,34 +90,152 @@
  
  static inline uint32_t
  ufs_rd(uint32_t off)
-@@ -153,6 +192,7 @@
+@@ -139,6 +180,73 @@
+ dma_clean(uint32_t off, uint32_t len)
+ {
+ 	clean_dcache64((addr64_t)(su.dma_pa + off), len, TRUE);
++}
++
++/*
++ * Task tags are shared with the interrupt-side slot-1 recorder, so allocate
++ * them atomically. Skip 0: an all-zero response UPIU must never look valid.
++ */
++static inline uint8_t
++ufs_next_tag(void)
++{
++	uint8_t tag = (uint8_t)(os_atomic_inc_orig(&su.tag, relaxed) + 1);
++	return tag ? tag : 1;
++}
++
++/*
++ * Give up on slot 0 and reinitialize the transfer list. Clearing the doorbell
++ * alone is not enough: the device may still deliver the abandoned completion
++ * later. Stop the ring, drain the doorbell, let any response already on the
++ * link land while the ring is stopped, then publish the list again. A late
++ * response is additionally rejected by the task-tag check in ufs_scsi().
++ */
++static int
++ufs_ring_restart(void)
++{
++	uint64_t list = su.dma_pa + DMA_UTRL;
++	uint64_t deadline, now;
++
++	nanoseconds_to_absolutetime(RING_STOP_NS, &deadline);
++	deadline += mach_absolute_time();
++
++	ufs_wr(REG_UTRLRSR, 0);
++	__builtin_arm_dsb(0xf);
++	while ((ufs_rd(REG_UTRLRSR) & 1) && (now = mach_absolute_time()) < deadline) {
++		delay(1);
++	}
++	ufs_wr(REG_UTRLCLR, ~0u);
++	__builtin_arm_dsb(0xf);
++	while (ufs_rd(REG_UTRLDBR) && (now = mach_absolute_time()) < deadline) {
++		delay(1);
++	}
++	if (ufs_rd(REG_UTRLDBR)) {
++		printf("SWEET UFS: ring would not drain (dbr 0x%x hcs 0x%x)\n",
++		    ufs_rd(REG_UTRLDBR), ufs_rd(REG_HCS));
++		return ETIMEDOUT;
++	}
++
++	/*
++	 * The doorbell is clear but the device can still be finishing the old
++	 * command. It must finish before slot 0 is reused, otherwise its response
++	 * could overwrite the next command's UTRD/UCD.
++	 */
++	delay(RING_DRAIN_MS);
++	ufs_wr(REG_UTRLCLR, ~0u);
++	ufs_wr(REG_IS, ufs_rd(REG_IS));
++	__builtin_arm_dsb(0xf);
++
++	ufs_wr(REG_UTRLBA, (uint32_t)list);
++	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
++	ufs_wr(REG_UTRLRSR, 1);
++	__builtin_arm_dsb(0xf);
++	if (ufs_rd(REG_UTRLBA) != (uint32_t)list ||
++	    ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
++	    !(ufs_rd(REG_UTRLRSR) & 1)) {
++		printf("SWEET UFS: ring restart failed (ba 0x%x%08x rsr 0x%x)\n",
++		    ufs_rd(REG_UTRLBAU), ufs_rd(REG_UTRLBA), ufs_rd(REG_UTRLRSR));
++		return EIO;
++	}
++	return 0;
+ }
+ 
+ /*
+@@ -153,13 +261,15 @@
  	uint64_t ucd_pa = su.dma_pa + DMA_UCD, bounce_pa = su.dma_pa + DMA_BOUNCE;
  
  	assert(len <= BOUNCE_SIZE);
 +	sweet_ufs_op_begin(cdb[0], len, write);
++	uint8_t tag = ufs_next_tag();
  	bzero(utrd, sizeof(*utrd));
  	bzero(ucd, sizeof(*ucd));
  
-@@ -221,6 +261,7 @@
+ 	ucd->cmd[0] = 0x01;                     /* COMMAND UPIU */
+ 	ucd->cmd[1] = len ? (write ? 0x20 : 0x40) : 0x00;      /* W: data out, R: data in */
+ 	ucd->cmd[2] = su.lun;
+-	ucd->cmd[3] = ++su.tag;
++	ucd->cmd[3] = tag;
+ 	ucd->cmd[12] = (uint8_t)(len >> 24);
+ 	ucd->cmd[13] = (uint8_t)(len >> 16);
+ 	ucd->cmd[14] = (uint8_t)(len >> 8);
+@@ -219,8 +329,13 @@
+ 	while (ufs_rd(REG_UTRLDBR) & 1) {
+ 		uint64_t now = mach_absolute_time();
  		if (now > deadline) {
- 			ufs_wr(REG_UTRLCLR, ~1u);
- 			printf("SWEET UFS: command 0x%02x timed out\n", cdb[0]);
+-			ufs_wr(REG_UTRLCLR, ~1u);
+-			printf("SWEET UFS: command 0x%02x timed out\n", cdb[0]);
++			printf("SWEET UFS: command 0x%02x tag 0x%02x timed out (dbr 0x%x hcs 0x%x)\n",
++			    cdb[0], tag, ufs_rd(REG_UTRLDBR), ufs_rd(REG_HCS));
++			int rerr = ufs_ring_restart();
++			if (rerr) {
++				printf("SWEET UFS: ring recovery failed %d\n", rerr);
++			}
 +			sweet_ufs_op_end();
  			return ETIMEDOUT;
  		}
  		if (sleepable && now >= spin_until) {
-@@ -251,8 +292,10 @@
+@@ -248,11 +363,37 @@
+ 	}
+ 
+ 	uint32_t ocs = utrd->dw2 & 0xff;
++	uint8_t rsp_tag = ucd->resp[3];
++	uint32_t residual = ((uint32_t)ucd->resp[8] << 24) |
++	    ((uint32_t)ucd->resp[9] << 16) | ((uint32_t)ucd->resp[10] << 8) |
++	    (uint32_t)ucd->resp[11];
++
++	if (rsp_tag != tag) {
++		/*
++		 * A response from an older command was accepted by the host. This is
++		 * exactly the stale-completion case that used to corrupt reads; do
++		 * not use its data and reinitialize the ring before the next command.
++		 */
++		printf("SWEET UFS: stale response for 0x%02x: tag 0x%02x wanted 0x%02x ocs 0x%x upiu 0x%x\n",
++		    cdb[0], rsp_tag, tag, ocs, ucd->resp[0]);
++		(void)ufs_ring_restart();
++		sweet_ufs_op_end();
++		return EIO;
++	}
  	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
  		printf("SWEET UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
  		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
 +		sweet_ufs_op_end();
  		return EIO;
  	}
++	if (residual) {
++		/* A short transfer used to look like valid zero-filled data. */
++		printf("SWEET UFS: short transfer for 0x%02x tag 0x%02x: residual %u of %u\n",
++		    cdb[0], tag, residual, len);
++		sweet_ufs_op_end();
++		return EIO;
++	}
 +	sweet_ufs_op_end();
  	return 0;
  }
  
-@@ -448,7 +491,7 @@
+@@ -448,7 +589,7 @@
  	if (!su.ready) {
  		return EAGAIN;
  	}
@@ -109,7 +244,7 @@
  	uint8_t saved = su.lun;
  	error = ufs_lookup_part(want, &slot);
  	uint64_t bytes = error ? 0 : part_cache[slot].nblocks * UFS_BLOCK;
-@@ -468,7 +511,7 @@
+@@ -468,7 +609,7 @@
  		}
  	}
  	su.lun = saved;
@@ -118,7 +253,7 @@
  	return error;
  }
  
-@@ -532,6 +575,8 @@
+@@ -532,6 +673,8 @@
  
  	bool rd = buf_flags(bp) & B_READ;
  
@@ -127,7 +262,7 @@
  	buf_setresid(bp, count);
  	if (!rd && !su.writable) {
  		error = EROFS;
-@@ -549,7 +594,7 @@
+@@ -549,7 +692,7 @@
  		goto done;
  	}
  
@@ -136,7 +271,7 @@
  	for (uint32_t done = 0; done < count;) {
  		uint64_t pos = off + done;
  		uint64_t lba = pos / UFS_BLOCK;
-@@ -578,7 +623,7 @@
+@@ -578,7 +721,7 @@
  		done += want;
  		buf_setresid(bp, count - done);
  	}
@@ -145,7 +280,7 @@
  	buf_unmap(bp);
  
  done:
-@@ -622,9 +667,9 @@
+@@ -622,9 +765,9 @@
  		if (!su.writable) {
  			return 0;
  		}
@@ -157,7 +292,7 @@
  		return error;
  	}
  	case DKIOCGETMAXBLOCKCOUNTREAD:
-@@ -715,7 +760,7 @@
+@@ -715,7 +858,7 @@
  
  		uint32_t h = 0, e = 0, bh = 0;
  		bool ok;
@@ -166,7 +301,7 @@
  		ok = ufs_read_blocks(1, 1) == 0 && memcmp(b, "EFI PART", 8) == 0;
  		if (ok) {
  			memcpy(&h, b + 16, 4);
-@@ -726,7 +771,7 @@
+@@ -726,7 +869,7 @@
  				memcpy(&bh, b + 16, 4);
  			}
  		}
@@ -175,7 +310,7 @@
  		if (!ok || h != gpt_hcrc || e != gpt_ecrc || (gpt_bhcrc && bh != gpt_bhcrc)) {
  			uint64_t ns;
  			absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
-@@ -774,7 +819,7 @@
+@@ -774,7 +917,7 @@
  	su.lun = 0;
  	su.secsize = DEV_BSIZE;
  
@@ -184,7 +319,7 @@
  	error = ufs_take_over_host();
  	if (!error) {
  		static const uint8_t tur[6] = { 0x00 };
-@@ -785,7 +830,7 @@
+@@ -785,7 +928,7 @@
  	if (!error) {
  		error = ufs_find_partition(want);
  	}
@@ -193,7 +328,7 @@
  	if (error) {
  		return error;
  	}
-@@ -808,6 +853,8 @@
+@@ -808,6 +951,8 @@
  	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
  	    su.writable ? "read-write" : "read-only", su.dma_pa);
  	sweet_log_start();
@@ -202,7 +337,7 @@
  	sweet_sample_start();
  	thread_t gpt_thread;
  	if (kernel_thread_start(sweet_gpt_watch, NULL, &gpt_thread) == KERN_SUCCESS) {
-@@ -819,14 +866,18 @@
+@@ -819,14 +964,18 @@
  	 * topaz; sweettouch=0 / sweetkeys=0 disable them. USB still pokes SM7150
  	 * MMIO (DWC3 at 0xa600000), so it only runs with sweethw=1.
  	 */
@@ -224,7 +359,7 @@
  	}
  	return 0;
  }
-@@ -850,6 +901,9 @@
+@@ -850,6 +999,9 @@
  
  static char sweet_log_ring[SWEET_LOG_SIZE];
  static uint64_t _Atomic sweet_log_total;
@@ -234,7 +369,7 @@
  static int sweet_log_chan;
  static uint32_t sweet_log_secs = SWEET_LOG_SECS;
  
-@@ -863,6 +917,9 @@
+@@ -863,6 +1015,9 @@
  		return;
  	}
  	uint64_t at = os_atomic_add_orig(&sweet_log_total, (uint64_t)size, relaxed);
@@ -244,10 +379,12 @@
  	for (int i = 0; i < size; i++) {
  		sweet_log_ring[(at + (uint64_t)i) % SWEET_LOG_SIZE] = c[i];
  	}
-@@ -898,13 +955,868 @@
+@@ -896,15 +1051,870 @@
+ sweet_log_position(void)
+ {
  	return os_atomic_load(&sweet_log_total, relaxed);
- }
- 
++}
++
 +/* What the flush thread last persisted; printed by the stall watchdog. */
 +static uint64_t _Atomic sweet_log_flushed;
 +
@@ -294,7 +431,7 @@
 +	c->cmd[0] = 0x01;
 +	c->cmd[1] = 0x20;                       /* data out */
 +	c->cmd[2] = su.lun;
-+	c->cmd[3] = ++su.tag;
++	c->cmd[3] = ufs_next_tag();
 +	c->cmd[12] = 0; c->cmd[13] = 0; c->cmd[14] = 0x10; c->cmd[15] = 0;
 +	memcpy(&c->cmd[16], cdb, sizeof(cdb));
 +	u->dw0 = (1u << 28) | (1u << 25) | (1u << 24);
@@ -322,8 +459,8 @@
 +	}
 +	ufs_wr(REG_UTRLCLR, 1u << 1);            /* give the slot back */
 +	return -1;
-+}
-+
+ }
+ 
 +/*
 + * The UFS command that is in flight right now. A healthy thread can read this
 + * and print it without taking any lock, which is how the live USB console
@@ -1113,7 +1250,7 @@
  sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
  {
  	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
-@@ -915,6 +1827,8 @@
+@@ -915,6 +1925,8 @@
  	    SWEET_LOG_BLOCKS * UFS_BLOCK >> 10, base);
  	for (;;) {
  		(void)tsleep(&sweet_log_chan, PZERO, "sweetlog", hz * (int)sweet_log_secs);
@@ -1122,7 +1259,7 @@
  		uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
  		if (total == flushed) {
  			continue;
-@@ -922,7 +1836,7 @@
+@@ -922,7 +1934,7 @@
  		uint64_t pos = total - flushed >= SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : flushed;
  		int error = 0;
  
@@ -1131,7 +1268,7 @@
  		while (pos < total && !error) {
  			uint32_t off = (uint32_t)(pos % SWEET_LOG_SIZE);
  			uint32_t blk = off / UFS_BLOCK;
-@@ -945,12 +1859,14 @@
+@@ -945,12 +1957,14 @@
  		if (!error) {
  			error = ufs_sync_cache();
  		}
@@ -1147,7 +1284,7 @@
  	}
  }
  
-@@ -971,6 +1887,9 @@
+@@ -971,6 +1985,9 @@
  	if (kernel_thread_start(sweet_log_thread, NULL, &thread) == KERN_SUCCESS) {
  		thread_deallocate(thread);
  	}

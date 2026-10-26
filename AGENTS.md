@@ -1,6 +1,6 @@
 # Citrus XNU port — active handoff
 
-Updated 2026-10-26 08:20 (Asia/Jakarta). **Read this file top to bottom once; the
+Updated 2026-10-26 08:30 (Asia/Jakarta). **Read this file top to bottom once; the
 first three sections are the whole story.** Everything below "Historical" is old
 context kept only for reference.
 
@@ -9,21 +9,44 @@ context kept only for reference.
 XNU boots from the 16 GiB HFSX iOS root on UFS, launchd and the daemons run,
 backboardd + SpringBoard composite on the MDF, and on a good boot the phone shows
 **the real iOS lock screen with a live updating clock** (confirmed 2026-10-26
-06:26). The kernel console is now streamed **live over USB** (`/dev/cu.usbmodem*`,
-`tools/usb-log.py`), which replaced the old "flash, stall, reset, pull from
-recovery" loop. Two things are missing for a usable device: (1) the boot is
-**non-deterministic** — only about one boot in eight shows the lock screen, the
-rest stop somewhere between the Apple logo and SpringBoard's start, and (2) the
-port has no touch / GPU / Wi-Fi yet, so the lock screen cannot be unlocked.
+06:26). The kernel console streams **live over USB** (`/dev/cu.usbmodem*`,
+`tools/usb-log.py`). The first `ufs_scsi()` reliability fix was built and tried at
+08:22 today: it booted through SpringBoard and PosterBoard, but the panel **stayed
+on the Apple logo** and no lock screen appeared. That boot logged **no UFS
+timeouts, stale tags or short transfers**, so the UFS fix is in place but is not
+yet proven to improve the boot rate. The current failure is now clearly after
+userspace starts, not a dead kernel.
 
-## 1. The current blocker, stated correctly: it is NOT one stall
+## 1. The UFS-fix trial (2026-10-26 08:22) did not restore the lock screen
 
-Previous checkpoints called this "the ~150 s whole-kernel freeze". That framing is
-**wrong and wasted a day**. What is actually happening:
+The previous checkpoint correctly described the failure as intermittent bad/missing
+I/O, not one deadlock. `sweet_ufs.c` was changed (section 2) and booted once as
+`citrus-xnu-boot-ufsfix.img`. Boot args omitted every optional perturbation:
+`sweetusb=2 sweetlog=0 sweetsample=- sweetnull=- sweetwdt=0`, no heartbeat, no
+physical-timer tick.
 
-The boot fails at a **different point every time**, and the failures look like
-**bad or missing I/O results**, not a single deadlock. Measured today (all with
-`sweetwdt=0`, i.e. the in-kernel panic watchdog disabled):
+What that boot did (`out/ios16/logs/ufsfix-live.txt`, 119,113 bytes, last output
+08:24:09):
+
+- UFS mounted userdata normally (`GPT ...`, `"userdata" on LUN 0`), and **no
+  `SWEET UFS:` error line appeared after that** — no timeout, no stale-response,
+  no short-transfer, no ring-restart message.
+- `exec SpringBoard`, `exec PosterBoard`, SpringBoard AKS/sandbox/surface ops,
+  backboardd created 1080x2340 buffer surfaces, `SWEET FB: display on`.
+- `SWEET INTF1` reported ~316 frames / 5 s with tearing enabled.
+- The last full-screen present was surface 3 (`nz 25862/26054`), then the
+  empty-swap fallback presented surface 2 (`nz 282`) — i.e. the Apple logo.
+- After that, SpringBoard created only small surfaces (272x184, 312x202,
+  230x186); **no further full-screen present**. The panel stayed on the Apple
+  logo for more than four minutes. The USB console then went silent, as it also
+  did on the one successful usb6 boot after userspace settled.
+
+So this trial is a **failure** by the milestone test (no lock screen), but not a
+UFS failure. It got further than the old stalls and left no UFS complaint. Whether
+the fix improves the one-in-eight lock-screen rate is still unmeasured: only one
+boot of this image has been run, and it needs 3–4 repeats plus a process sampler.
+
+The old observed outcomes remain useful context (all with `sweetwdt=0`):
 
 | build | config difference | observed outcome |
 |---|---|---|
@@ -34,6 +57,7 @@ The boot fails at a **different point every time**, and the failures look like
 | slotsample | slot-1 IRQ recorder | heartbeat to T=156 s, `svc_runs` frozen at 31, no stall samples |
 | quiet | **no userspace tee, no UFS log** | Apple logo |
 | ptimer | 1 Hz physical-timer tick | **kernel alive to 271 s** but userspace died: `shared_region ... vm_shared_region_start_address() failed`, `libignition: failed to lookup preboot`, only 12 KB of log, 107k free pages |
+| **ufsfix** | **tag/residual/ring fixes, no other instrumentation** | **SpringBoard + PosterBoard ran, small surfaces created, no full-screen present; Apple logo only** |
 
 Hysteresis check: a stalled boot left for **9.5 minutes never recovers**.
 
@@ -42,41 +66,47 @@ So:
 - it is **not** USB (a boot with the gadget entirely off stalls);
 - it is **not** console spam (a build with the tee and UFS log off stalls);
 - it is **not** "just slow / pageout thrashing" (see the 9.5 min above);
-- it is **not** one reproducible deadlock — the failure point moves.
+- it is **not** one reproducible deadlock — the failure point moves;
+- the first UFS fix did **not** by itself produce a visible lock screen.
 
-## 2. The working hypothesis to act on (highest value next step)
+## 2. What changed in `ufs_scsi()` and what to test next
 
-**The UFS driver occasionally returns late, stale, short or wrong completions, so
-file reads/writes fail or hang. Userspace then derails in whatever subsystem
-touched that I/O next** — hence "shared region can't be mapped", "ignition can't
-find preboot", "SpringBoard stops after loading its store-demo plugin", and total
-stalls. Stalled boots always leave a thread inside the driver (`ufs_users=1`).
+`bsd/dev/sweet_ufs.c` still uses **one** UTRL slot, one UCD and one bounce buffer,
+but now has the three missing safety checks:
 
-`bsd/dev/sweet_ufs.c` uses exactly **one** UTRL slot, one UCD and one bounce
-buffer, and `ufs_scsi()` has four concrete defects:
+1. **Response tag validation.** The sent task tag is remembered; the returned
+   UPIU byte 3 must match it, otherwise the response is discarded, logged as
+   `stale response`, the ring is restarted and the command fails with EIO. Tags
+   are allocated atomically (they are shared with the slot-1 interrupt recorder)
+   and tag 0 is skipped so an all-zero response cannot look valid.
+2. **Real timeout recovery.** `ufs_ring_restart()` stops UTRLRSR, clears the
+   whole doorbell with `UTRLCLR=~0`, waits up to 100 ms for it to drain, waits
+   20 ms for a response already on the link to land, clears the interrupt status,
+   re-programs UTRLBA/UTRLBAU, restarts the ring and verifies the registers.
+   The old code wrote `~1u` to `UTRLCLR` (which left slot 0 set) and returned.
+3. **Residual check.** The response UPIU bytes 8–11 (residual transfer count)
+   must be zero; a short read/write is logged as `short transfer` and fails with
+   EIO instead of looking like valid zero-filled data.
 
-1. **No response-tag check.** `su.tag` is a byte bumped with `++` and the returned
-   UPIU's tag is never compared, so a late completion from an earlier (timed-out)
-   command is accepted as the current one.
-2. **Timeout does not drain.** On timeout it writes `REG_UTRLCLR` and returns; the
-   device may still deliver that response later, into the *next* command. Needs a
-   real stop/clear/restart of the ring (stop UTRLRSR, clear doorbell, re-program
-   UTRLBA/UTRLBAU, restart) or at minimum draining + tag matching.
-3. **No residual/short-transfer check.** Only OCS and response bytes 0/6/7 are
-   inspected; a short read is invisible and looks like valid zeros — exactly the
-   symptom of an empty/broken dyld shared-cache mapping.
-4. **Cache maintenance defaults to the conservative path** (`ufscache=0` → every
-   transfer is a full clean+invalidate). Audit read direction against
-   `flush_dcache64(pa, len, TRUE)` and `clean_dcache64(...)` in that file.
+The conservative cache path (`ufscache=0`) was audited: command/UTRDs and the
+bounce buffer are cleaned before DMA and invalidated after completion, and the
+read direction is covered by `flush_dcache64(pa, len, TRUE)`. No cache change was
+made because the trial did not fault the I/O path.
 
-Suggested order: tag validation + completion drain first (cheap, low risk), then
-the residual check, then re-run the same image 3–4 times and count how many boots
-reach the lock screen. Fixing this is expected to fix both reliability and boot
-time (retries/timeouts vanish).
+Next test, in order:
 
-If that does not explain it, the next instrument already exists: the **1 Hz
-physical-timer tick** (`sweetptimer=1`, PPI 18) whose ISR records through UTRL
-slot 1 and survives when the virtual-timer path dies.
+1. **Run `citrus-xnu-boot-ufsfix.img` 3–4 more times, unchanged**, and count lock
+   screens. This is the only way to know whether the UFS repair changed the rate.
+   The current trial is one data point: it reached SpringBoard but not the lock
+   screen.
+2. If it still sticks at the Apple logo, **sample this exact image**:
+   `sweetsample=SpringBoard,backboardd,launchd,lsd,chronod,pkd` plus
+   `sweetlog=1` (and `sweetptimer=1` only if the sampler stops), then pull the
+   flight recorder and symbolicate SpringBoard/backboardd. The new boot's last
+   state (small surfaces only, no full-screen present) points at compositing or
+   a SpringBoard startup wait, not at a dead kernel.
+3. Do not redo the UFS work unless a repeat logs `stale response`, `short
+   transfer` or `timed out`; those paths are now instrumented.
 
 ## 3. What was built and proven today (do not redo)
 
@@ -205,41 +235,52 @@ python3 tools/usb-log.py -o out/ios16/logs/<name>-live.txt   # live console
 # only when the boot must be inspected after a reset:
 fastboot reboot recovery && tools/pull-sweetlog.sh <name>
 ```
-`kernels/patches/0002-*.patch` must be regenerated after kernel edits: it is a
+`kernel/patches/0002-*.patch` must be regenerated after kernel edits: it is a
 `diff -u` of the changed files against `/tmp/origbt/xnu/...` extracted from
 `out/upstream-artifacts/xnu-buildtree.zip`. The current file list is: sweet_ufs.c,
 sweet_sample.c, sweet_usb.c, osfmk/kern/exception.c, osfmk/arm/rtclock.c,
 osfmk/arm64/sleh.c, osfmk/console/video_console.c, osfmk/console/serial_console.c,
 pexpert/arm/pe_fiq.c, iokit/Kernel/arm/SweetFramebuffer.cpp.
 
-## 7. Phone state at STOP (2026-10-26 08:20)
+## 7. Phone state at STOP (2026-10-26 08:30)
 
-Phone is in **OrangeFox recovery** (`adb devices` → `recovery`), boot partition
-holds `out/citrus-diagnostic/citrus-xnu-boot-ptimer.img`
-(`sweetptimer=1`, `sweetlog=1`, `sweetnull=-`, `sweetusb=1`, `sweetwdt=0`).
-Its recorder was already pulled: the kernel was alive at uptime 271 s while
-userspace failed in `shared_region`/`ignition` (see the table in section 1).
-No image is currently mid-test; the next boot is free to use.
+Phone is showing the **Apple logo** from
+`out/citrus-diagnostic/citrus-xnu-boot-ufsfix.img`; it is not in recovery and
+does not answer adb. This is the failed UFS-fix trial described in section 1.
+The boot partition holds that image. To test anything else the user must reset
+with Power + Volume Down, then the next image can be flashed normally.
+
+The USB live-console listener is stopped. Its captured log is
+`out/ios16/logs/ufsfix-live.txt` (119,113 bytes; last output 08:24:09). No
+flight-recorder block was pulled from this boot because `sweetlog=0` and
+`sweetsample=-`.
 
 Reference images worth keeping: `citrus-xnu-boot-usb6.img` (the one that reached
-the lock screen), `citrus-xnu-boot-ptimer.img` (latest diagnostics), and the
+the lock screen), `citrus-xnu-boot-ufsfix.img` (this trial; UFS safety fixes in,
+no lock screen), `citrus-xnu-boot-ptimer.img` (latest old diagnostics), and the
 `usb5..usb10` series for the USB port's evolution.
 
 ## 8. Next work, in order
 
-1. **Fix `ufs_scsi()`** (section 2): response-tag validation, drain/reset on
-   timeout, residual-length check. Rebuild, boot the *same* image 3–4 times, count
-   how many reach the lock screen. Expected: reliability goes up and boot gets
-   faster. This is the highest-value change in the project right now.
-2. If reliability is still poor, use the physical-timer recorder
-   (`sweetptimer=1`) plus `tools/pull-sweetlog.sh` to capture the interrupted PC
-   and in-flight command at the moment of failure, and check whether the tick ISR
-   keeps running (CPU alive with a broken scheduler) or stops (interrupts masked).
-3. Then continue the original list: **touch (FT8719 over SPI, QUP SE2
+1. **Run the existing `citrus-xnu-boot-ufsfix.img` 3–4 more times, unchanged.**
+   The one trial reached SpringBoard/PosterBoard and logged no UFS error, so the
+   UFS repair did not cause the Apple-logo hang there. The rate of successful lock
+   screens is still unknown; count it before changing the driver again.
+2. **Sample the Apple-logo hang with userspace instrumentation.** Use
+   `sweetsample=SpringBoard,backboardd,launchd,lsd,chronod,pkd` and `sweetlog=1`,
+   then `tools/pull-sweetlog.sh ufsfix-sampled` and symbolicate. Evidence from the
+   current trial: SpringBoard ran and created small surfaces, but there was no
+   full-screen present after the Apple-logo fallback; the last full-screen content
+   was the boot logo. This points at SpringBoard/compositing startup, not a dead
+   kernel. Add `sweetptimer=1` only if samples stop arriving.
+3. If a repeat logs `stale response`, `short transfer` or `timed out`, then the
+   UFS fix did hit the real fault: capture that log and iterate on ring recovery
+   / slot reuse instead of sampling userspace first.
+4. Then continue the original list: **touch (FT8719 over SPI, QUP SE2
    `0x04a88000`, IRQ 93, reset GPIO 103)** to unlock the lock screen and reach the
    home/setup screen; mobileactivationd SIGTRAP; sandbox container-path patches
    0149/0936 (still not applied); GPU (Adreno 610); Wi-Fi.
-4. Boot speed: after the I/O fix, measure boot-to-lock-screen and consider
+5. Boot speed: after reliability, measure boot-to-lock-screen and consider
    trimming daemons/`sweetscan`, and enabling more than one CPU (SMP is unported —
    there is no PSCI CPU start path in the kernel, only the shim's single CPU_ON
    handoff; a second CPU would also give the robust watchdog the port keeps
@@ -255,6 +296,8 @@ the lock screen), `citrus-xnu-boot-ptimer.img` (latest diagnostics), and the
   because the timer interrupt stopped (`svc_runs` froze at 31).
 - `ptimer-{sweetlog,heartbeat}.txt` — the alive-to-271 s boot with the
   `shared_region` / `ignition` failures.
+- `ufsfix-live.txt` — the 08:22 UFS-fix trial: SpringBoard/PosterBoard reached,
+  no UFS errors, no full-screen present after the Apple-logo fallback.
 - `nousb1-*`, `ptimer-*`, `usbprobe4-*`, `usb1-*` heartbeats document every
   `boot_id` of the day.
 
@@ -870,8 +913,9 @@ be the wrong model; the failure is intermittent I/O, see section 1.)
 ## Immediate handoff checklist
 
 1. Read **sections 0–8 at the top** first; they replace every older checkpoint.
-   The most important sentence in the file: the boot failure is intermittent and
-   looks like bad/missing I/O results, so fix `ufs_scsi()` before anything else.
+   The most important sentence in the file: the first `ufs_scsi()` fix is already
+   built and booted, but the lock screen still did not appear; the next step is
+   repeated boots plus a userspace sampler, not another blind UFS rewrite.
 2. Never fastboot a >2 GiB image at userdata; use tools/stream-image-adb.sh from
    OrangeFox recovery.
 3. After ANY change to the local image, re-stream all 16 segments and verify the

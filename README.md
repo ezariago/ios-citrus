@@ -2,15 +2,192 @@
 
 Target: POCO M3 `citrus`, M2010J19CG, Indonesian region, 4 GB / 64 GB.
 Unlocked bootloader, rooted Android 13 AOSP, OrangeFox recovery (version unknown).
-User milestones: XNU running → display and iOS UI → touch → GPU and Wi-Fi.
 
-This is an early hardware port. The standalone diagnostic runs on the phone,
-hands off from Silver to Gold, and confirms 16K support. A Citrus-adjusted XNU
-kernel now builds locally and executes on the phone through scheduler/logging
-initialization, then panics. The precise panic is being collected. No iOS root
-filesystem or home screen has been installed yet.
+## Current milestone: iOS home screen with working touch
 
-## XNU build and first boot
+Status as of **2026-10-27 (Asia/Jakarta)**: XNU boots **iOS 16.7.16
+(20H392, iPhone10,3 userland)** from a 16 GiB HFSX root on UFS. The phone has
+been unlocked and the SpringBoard home screen reached by touching the panel.
+The current baseline uses **four Gold cores**, **1792 MiB of verified RAM**,
+software rendering, and the bootloader-initialized 1080×2340 display.
+**GPU acceleration is the next porting milestone.**
+
+This is an experimental hardware port. Reaching the home screen establishes
+boot, presentation, and input; the remaining hardware and iOS integration work
+is tracked below. Checked items are demonstrated on Citrus. Unchecked items
+are goals, with completion criteria rather than promised dates.
+
+| Subsystem | Demonstrated on Citrus | Remaining work |
+|---|---|---|
+| Boot and CPU | XNU entry, scheduler, four Gold cores selected | Repeatable boots and longer stability runs; Silver cores need a separate 4K-page port |
+| Storage | UFS root mount and iOS boot from HFSX | Broader I/O stress and recovery validation |
+| Display | Native 1080×2340 framebuffer presentation and SpringBoard | Full display/panel ownership, brightness, blanking, suspend/resume |
+| Touch | FT8719 firmware download, reports, HID delivery, unlock and home screen | Release debounce, early initialization, normal driver integration |
+| GPU | Adreno 610 identified; upstream backport investigated offline | Hardware bring-up, Mesa/EAGL, accelerated CoreAnimation |
+| USB | CDC-ACM serial console and reconnecting host capture | Other USB functions and lifecycle testing |
+| Wireless and cellular | No working iOS connectivity established | Wi-Fi, Bluetooth, modem, telephony, and data integration |
+| Power and peripherals | Enough inherited hardware state to boot | Battery/charging reporting, power policy, audio, sensors, cameras |
+
+The earlier 136–161 s failures included a confirmed framebuffer diagnostic
+scan overread in `present()`, now bounded by the surface allocation size.
+The later apparent smp4 stop at 408 s was a failed host logger: the kernel
+continued running, and smp4 reached roughly 36 minutes before an intentional
+reboot. The four-core touch run recorded 17 minutes without a panic before a
+USB disappearance whose cause was not established. Multi-hour stability is
+still an open milestone; a silent console alone does not establish a kernel
+failure. See [the active handoff](AGENTS.md) for evidence, image hashes, and
+current device state.
+
+## Porting milestones
+
+### 1. Boot, storage, UI, and input — achieved baseline
+
+- [x] Boot a Citrus-adjusted XNU kernel through the Android boot-image path.
+- [x] Mount the UFS-backed iOS root and reach the lock screen and SpringBoard.
+- [x] Present at the native 1080×2340 panel geometry.
+- [x] Boot with four Gold CPU nodes and matching `cpus=4`; the captured console
+  confirms `requested=4 selected=4`. The current 16K-page kernel cannot use
+  the four Silver cores.
+- [x] Bring up the FT8719 from ROM, download its PRAM firmware, read contact
+  reports, and deliver HID digitizer events consumed by iOS.
+- [x] Unlock and reach the home screen using the physical touchscreen.
+- [ ] Finish input integration: debounce missing-contact releases, initialize
+  before userspace, remove per-frame logging, and replace diagnostic mode 10
+  with the normal driver path. Verify dragging, edge gestures, multiple
+  contacts, app launch, and touch after a reboot.
+
+### 2. Adreno 610 GPU acceleration — NEXT
+
+**Goal:** render iOS UI through the GPU, with repeatable command submission
+and correct presentation. Publishing a GPU service or compiling the driver
+alone does not complete this milestone.
+
+The local Topaz backport investigation found that the IOSurface prerequisites
+and GPU patch series apply cleanly to a scratch tree and the new driver
+sources compile. Citrus hardware execution and final linking remain untested.
+The candidate stack is **RedwoodGPU → Mesa freedreno → EAGL → CoreAnimation**;
+Metal support is outside this initial milestone.
+
+- [ ] Verify Citrus GPU/GPUCC/SMMU resources and reserved firmware memory
+  against the captured device tree. Obtain and record provenance for the
+  device's `a610_zap` and SQE firmware; preserve firmware reservations.
+- [ ] Integrate the kernel objects and IOSurface prerequisites while retaining
+  Citrus's 16K-page configuration and existing display bounds fixes. Produce
+  a reproducible linked kernel with an opt-in GPU path.
+- [ ] Establish TrustZone/PAS access and required clock/power sequencing, then
+  authenticate firmware and initialize the GPU SMMU and command processor.
+- [ ] Submit a minimal command buffer that writes a known result and completes
+  a fence. Exercise repeated submissions, bounded timeouts, and error handling
+  before attaching the compositor.
+- [ ] Build Mesa freedreno and the Redwood DRM bridge for the iOS target;
+  reconstruct the missing EAGL dispatch generator/build pieces. Validate a
+  standalone rendered triangle through IOSurface and readback.
+- [ ] Connect EAGL to CoreAnimation/backboardd on the exact iOS build. Verify
+  GPU-rendered lock screen, unlock, home screen, transitions, and app content.
+- [ ] Measure frame times, CPU load, memory use, and sustained behavior. Keep
+  GPU allocations within verified RAM and preserve a software-rendered
+  fallback boot profile.
+
+**Completion:** hardware-rendered UI survives repeated unlock/app/gesture
+cycles without corruption, GPU hangs, or new kernel faults, with logs and a
+reproducible image identifying the working configuration. The existing
+framebuffer copy path can serve initial GPU bring-up; full display-driver
+ownership is a separate milestone.
+
+### 3. Display driver, panel control, and brightness
+
+**Goal:** own the display lifecycle in XNU and make the iOS brightness control
+change the physical backlight. Current presentation inherits the bootloader's
+panel setup and backlight duty cycle.
+
+- [ ] Port the Citrus-specific MDP/DSI and panel initialization sequence,
+  including clocks, regulators, reset, timing, and synchronization. Preserve
+  working scanout while moving away from inherited bootloader state.
+- [ ] Implement the panel's `bl_ctrl_pwm` / `pm6125_pwm` backlight control with
+  a verified range and safe defaults; connect it to the iOS brightness path.
+- [ ] Verify minimum/maximum brightness, smooth adjustment, dimming, blanking,
+  lock/unlock, and panel power-off/on without losing touch or scanout.
+- [ ] Improve buffer ownership, cache coherency, frame pacing, and presentation
+  efficiency alongside the GPU; evaluate reducing CPU frame copies.
+
+**Completion:** brightness works from iOS, the panel reliably turns off and
+back on, and repeated display cycles preserve a correctly paced image.
+Automatic brightness additionally depends on the ambient-light sensor.
+
+### 4. Wi-Fi and Bluetooth
+
+- [ ] Identify and bring up the board's radio transport, firmware, clocks,
+  regulators, interrupts, and shared-memory dependencies.
+- [ ] Provide the iOS driver/service integration needed for discovery,
+  configuration, and connection state.
+- [ ] Validate Wi-Fi association, authentication, DHCP, DNS, sustained traffic,
+  disconnect/reconnect, and recovery after display sleep.
+- [ ] Bring up Bluetooth discovery and pairing, then validate a practical
+  peripheral. Bluetooth audio also depends on the audio milestone.
+
+**Completion:** networking works from ordinary iOS apps and survives repeated
+connection cycles; Bluetooth supports a tested peripheral through iOS.
+
+### 5. Cellular modem and telephony
+
+**Goal:** integrate the Qualcomm modem with iOS, progressing from modem
+communication to data and then voice services. A running modem alone does
+not establish usable cellular support.
+
+- [ ] Audit modem firmware, reserved memory, power, remote-processor startup,
+  IPC transport, and recovery behavior using Citrus-specific evidence.
+- [ ] Establish control communication and SIM detection, then expose network
+  registration and signal state to an iOS-compatible telephony integration.
+- [ ] Implement and validate APN configuration, packet-data sessions, routing,
+  DNS, reconnect, and airplane-mode transitions.
+- [ ] Investigate SMS and voice/IMS integration, including call audio and
+  carrier requirements; track these separately from basic mobile data.
+
+**Completion:** SIM recognition, registration, and mobile data are repeatable
+in iOS. Calls and SMS require their own successful end-to-end tests before
+being marked supported. Preserve modem/persist partitions and calibration;
+this roadmap does not require rewriting them.
+
+### 6. Power management and remaining phone hardware
+
+- [ ] **Battery and charging:** implement accurate capacity, voltage,
+  temperature, and charger-state reporting; validate charging policy and
+  thermal behavior rather than relying on bootloader settings.
+- [ ] **Idle and suspend/resume:** integrate required RPM/LDO and clock control,
+  coordinated panel/radio sleep, wake sources, and long idle tests. Keep the
+  unverified physical-timer path disabled during the current bring-up.
+- [ ] **Audio:** port codec, speaker, earpiece, microphones, routing, and volume;
+  validate playback/recording before call audio.
+- [ ] **Sensors and controls:** accelerometer/orientation, proximity,
+  ambient light, buttons, and haptics, with the corresponding iOS services.
+- [ ] **Cameras:** investigate sensor/ISP firmware and memory dependencies,
+  then iOS capture integration, preview, photo, and video paths.
+- [ ] **System integration:** resolve remaining activation/sandbox/service
+  issues and validate app launch, installation, and persistence across boots.
+
+### 7. Reproducible and durable port
+
+- [ ] Retain a known-good boot profile and document firmware, patches, build
+  inputs, hashes, and recovery procedures for each newly working subsystem.
+- [ ] Complete multi-hour active and idle runs with durable console capture,
+  storage activity, touch, GPU load, and repeated screen/connection cycles.
+- [ ] Validate cold boot, reboot, shutdown, and failure recovery. Distinguish
+  host-capture failures from device failures using the recorder and screen.
+- [ ] Publish a tested support matrix and reproducible build instructions;
+  keep partial bring-up results distinct from completed user-facing features.
+
+GPU is the next major porting milestone. The sections after it describe the
+remaining work and dependencies, not fixed delivery dates or a requirement to
+finish every subsystem in strict order.
+
+## Historical bring-up notes
+
+The sections below preserve the early checkpoints and commands from
+2026-10-25. Their statements about missing hardware, one-core boot, first
+panics, and device availability describe those checkpoints; use the current
+status and roadmap above for today's capabilities.
+
+## Historical: XNU build and first boot
 
 The matching published Topaz artifacts provide both the complete kernel object
 archive and generated source/header tree. This permits recompiling selected

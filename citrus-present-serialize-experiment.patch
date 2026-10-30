@@ -1,0 +1,63 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -52,6 +52,8 @@
+  * reads the u64 at +0x18 of the shared state page; held from SwapEnd until
+  * one vsync after the next frame replaced it on the panel.
+  */
++/* Opt-in experiment: serializes present + hold transitions, not FIFO ordering. */
++static IOLock *sweet_fb_serial_lock;
+ static uint32_t sweet_touch_lat;
+ static int sweet_fb_scaler_log;
+ static int sweet_fb_noscale;	/* fbnoscale=1: fetch the small buffer with no scaler (A/B) */                 /* fbdump=1: log the scaler programming */
+@@ -671,6 +673,11 @@
+ 	uint32_t lock = 0;
+ 	fVLock = PE_parse_boot_argn("sweetfb_lock", &lock, sizeof(lock)) && lock != 0 && fIntf1 != NULL && fVTotal > 100;
+ 	fPanelUS = 8333;
++	uint32_t serial_present = 0;
++	if (PE_parse_boot_argn("fbserial", &serial_present, sizeof(serial_present)) && serial_present != 0) {
++		sweet_fb_serial_lock = IOLockAlloc();
++		IOLog("SWEET FB: experimental present serialization %s\n", sweet_fb_serial_lock ? "enabled" : "allocation failed");
++	}
+ 	IOLog("SWEET FB: vsync %s the panel (%u lines a frame)\n", fVLock ? "follows" : "does not follow", fVTotal);
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 	uint32_t depth = 3;
+@@ -816,6 +823,9 @@
+ 		fb->flipBack();
+ 	}
+ 	if (rec != NULL) {
++		if (sweet_fb_serial_lock != NULL) {
++			IOLockLock(sweet_fb_serial_lock);
++		}
+ 		if (__atomic_fetch_add(&fb_present_active, 1, __ATOMIC_RELAXED) != 0) {
+ 			__atomic_fetch_add(&fb_present_overlap, 1, __ATOMIC_RELAXED);
+ 		}
+@@ -826,6 +836,9 @@
+ 		memcpy(fb->fRetireHold, fb->fShowHold, sizeof(taken));
+ 		memcpy(fb->fShowHold, taken, sizeof(taken));
+ 		IOLockUnlock(fb->fLock);
++		if (sweet_fb_serial_lock != NULL) {
++			IOLockUnlock(sweet_fb_serial_lock);
++		}
+ 	}
+ 	sender->setTimeoutUS(fb->fVLock ? fb->vsyncNext() : SWEET_FB_VSYNC_US);
+ }
+@@ -1187,6 +1200,9 @@
+ 	frameShown();
+ 	SweetSurface *held[4];
+ 	memcpy(held, heldIn, sizeof(held));
++	if (sweet_fb_serial_lock != NULL) {
++		IOLockLock(sweet_fb_serial_lock);
++	}
+ 	{
+ 		SweetSurface *dropped[4], *shown[4], *retired[4];
+ 		IOLockLock(fLock);
+@@ -1282,6 +1298,9 @@
+ 		if ((++sweet_fb_swap_count % 1000) == 0) {
+ 			IOLog("SWEET FB: %llu swaps (direct)\n", sweet_fb_swap_count);
+ 		}
++	}
++	if (sweet_fb_serial_lock != NULL) {
++		IOLockUnlock(sweet_fb_serial_lock);
+ 	}
+ }
+ 

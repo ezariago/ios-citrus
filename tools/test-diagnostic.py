@@ -38,7 +38,11 @@ def run(base, valid, loader=False):
     if loader:
         cpu.mem_map(0x80000000, 0x4000000)
         cpu.mem_map(0x0f200000, 0x200000)
-        cpu.mem_write(0x0f300008, struct.pack('<Q', 0x100 << 32))
+        # Synthetic GICv3 redistributor frames for both clusters. typer[63:32]
+        # is Aff1:Aff0; the last frame carries GICR_TYPER.Last.
+        for index, affinity in enumerate((0, 1, 2, 3, 0x100, 0x101, 0x102, 0x103)):
+            typer = (affinity << 32) | (16 if index == 7 else 0)
+            cpu.mem_write(0x0f300008 + index * 0x20000, struct.pack('<Q', typer))
         symbols = subprocess.check_output(['/opt/homebrew/opt/llvm/bin/llvm-nm', '-n', str(OUT / 'shim.elf')], text=True)
         boundary = int(next(line.split()[0] for line in symbols.splitlines() if line.endswith(' _end')), 16)
         assert IMAGE[boundary:boundary+8] == b'CITRUSPL'

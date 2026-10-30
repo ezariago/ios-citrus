@@ -1,0 +1,59 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -57,6 +57,9 @@
+ static uint32_t sweet_fb_serial_mode, sweet_fb_serial_deferred;
+ /* Experimental: let held non-pool screen surfaces scan out without a copy. */
+ static uint32_t sweet_fb_scan_all, sweet_fb_scan_cached;
++/* Best-effort: changed fence means GPU named the surface, not necessarily wrote it. */
++static uint32_t fb_cached_shown_sid, fb_cached_shown_fence;
++static uint32_t fb_cached_recheck, fb_cached_fence_changed;
+ static uint32_t sweet_touch_lat;
+ static int sweet_fb_scaler_log;
+ static int sweet_fb_noscale;	/* fbnoscale=1: fetch the small buffer with no scaler (A/B) */                 /* fbdump=1: log the scaler programming */
+@@ -1241,6 +1244,17 @@
+ 	{
+ 		SweetSurface *dropped[4], *shown[4], *retired[4];
+ 		IOLockLock(fLock);
++		if (sweet_fb_scan_all && fb_cached_shown_sid != 0) {
++			for (unsigned i = 0; i < 4; i++) {
++				SweetSurface *previous = fShowHold[i];
++				if (previous != NULL && previous->id == fb_cached_shown_sid) {
++					fb_cached_recheck++;
++					fb_cached_fence_changed += previous->drawn != fb_cached_shown_fence;
++					break;
++				}
++			}
++			fb_cached_shown_sid = 0;
++		}
+ 		memcpy(dropped, fPendHold, sizeof(dropped));
+ 		bzero(fPendHold, sizeof(fPendHold));
+ 		fDirty = false;                                 /* (anything older not shown at all) */
+@@ -1305,6 +1319,11 @@
+ 			    __atomic_exchange_n(&fb_present_overlap, 0, __ATOMIC_RELAXED),
+ 			    __atomic_exchange_n(&fb_scan_samples, 0, __ATOMIC_RELAXED),
+ 			    __atomic_exchange_n(&fb_scan_regressions, 0, __ATOMIC_RELAXED));
++			if (sweet_fb_scan_all) {
++				IOLog("SWEET FB: cached shown surface fence rechecks %u changed %u (GPU named, not necessarily wrote)\n",
++				    fb_cached_recheck, fb_cached_fence_changed);
++				fb_cached_recheck = fb_cached_fence_changed = 0;
++			}
+ 			if (sweet_fb_serial_mode == 2) {
+ 				IOLog("SWEET FB: timer present deferrals %u, cached direct scans %u\n",
+ 				    __atomic_exchange_n(&sweet_fb_serial_deferred, 0, __ATOMIC_RELAXED),
+@@ -1330,6 +1349,16 @@
+ 		IOLockLock(fLock);
+ 		memcpy(shown, fShowHold, sizeof(shown));
+ 		memcpy(retired, fRetireHold, sizeof(retired));
++		if (sweet_fb_scan_all && fb_observed_scan) {
++			for (unsigned i = 0; i < 4; i++) {
++				SweetSurface *current = held[i];
++				if (current != NULL && !current->gpuPool && current->id == fb_observed_sid) {
++					fb_cached_shown_sid = current->id;
++					fb_cached_shown_fence = current->drawn;
++					break;
++				}
++			}
++		}
+ 		memcpy(fShowHold, held, sizeof(held));
+ 		bzero(fRetireHold, sizeof(fRetireHold));
+ 		IOLockUnlock(fLock);

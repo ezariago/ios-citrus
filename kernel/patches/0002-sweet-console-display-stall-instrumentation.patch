@@ -1,14 +1,17 @@
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -31,6 +31,7 @@
+@@ -31,8 +31,10 @@
  #include <kern/locks.h>
  #include <kern/clock.h>
  #include <kern/sched_prim.h>
 +#include <kern/timer_call.h>
  #include <machine/machine_routines.h>
  #include <arm/caches_internal.h>
++#include <arm/sweet_idle_stats.h>
  #include <vm/pmap.h>
-@@ -50,10 +51,31 @@
+ #include <vm/vm_kern.h>
+ #include <pexpert/pexpert.h>
+@@ -50,10 +52,35 @@
  extern int hz;
  static void sweet_log_start(void);
  extern void sweet_sample_start(void);
@@ -19,12 +22,16 @@
 +static void sweet_ufs_op_begin(uint8_t cdb0, uint32_t len, bool write);
 +#define SWEET_PTIMER_INTID 18
 +void sweet_ptimer_enable(void);
-+void sweet_ptimer_tick(uintptr_t pc);
++void sweet_ptimer_tick(uintptr_t pc, int user_mode);
 +void sweet_ptimer_rearm(void);
 +static void sweet_ufs_op_end(void);
 +static bool sweet_panel_on(void);
 +static bool sweet_irq_ufs_writes(void);
 +static void sweet_irq_writes_resolve(void);
++/* Lock-free console ring append (defined below); safe in any context. */
++void sweet_log_append(const char *c, int size);
++/* SMP observer thread, osfmk/arm64/cpu.c; no-op unless cpus>=2 is running. */
++extern void sweet_obs_start(void);
 +/* vm/vm_page.h, not included here */
 +extern unsigned int vm_page_free_count;
 +extern unsigned int vm_page_wire_count;
@@ -40,7 +47,46 @@
  #define REG_CAP         0x00
  #define REG_IS          0x20
  #define REG_IE          0x24
-@@ -76,6 +98,8 @@
+@@ -69,6 +96,38 @@
+ #define HCS_UTRLRDY     (1u << 1)
+ #define CAP_64AS        (1u << 24)              /* 64-bit DMA addressing */
+ 
++/*
++ * bengal GCC (DT /soc/qcom,gcc@1400000, "qcom,bengal-gcc"). Offsets are from
++ * drivers/clk/qcom/gcc-sm6115.c; the same block the USB driver already uses.
++ * The UFS host controller lives in the gcc_ufs_phy power domain (the sm6115
++ * DTSI gives ufshc "power-domains = <&gcc GCC_UFS_PHY_GDSC>"), so if that
++ * GDSC ever powers down every register access to 0x04804000 hangs the bus --
++ * exactly the stop the sweetufstrace boots found. Linux's gdsc driver leaves
++ * this domain SW-controlled and on; a bootloader that leaves HW_CONTROL set
++ * lets the hardware collapse it after an idle period. Force it on and keep it
++ * on, and record what the registers looked like in the flight recorder.
++ */
++#define SWEET_GCC_PA            0x01400000
++#define SWEET_GCC_SIZE          0x001f0000
++#define GCC_UFS_PHY_GDSCR       0x45004
++#define GCC_UFS_PHY_AXI_CBCR    0x45010
++#define GCC_UFS_PHY_AHB_CBCR    0x45014
++#define GCC_UFS_PHY_TX_CBCR     0x45018
++#define GCC_UFS_PHY_RX_CBCR     0x4501c
++#define GCC_UFS_PHY_UNIPRO_CBCR 0x45040
++#define GCC_UFS_PHY_ICE_CBCR    0x45044
++#define GCC_UFS_PHY_PHYAUX_CBCR 0x45078
++#define GCC_SYS_NOC_UFS_CBCR    0x45098
++#define GCC_UFS_CLKREF_CBCR     0x8c000
++
++#define GDSCR_SW_COLLAPSE       (1u << 0)       /* 1 = request power collapse */
++#define GDSCR_HW_CONTROL        (1u << 1)       /* 1 = hardware may collapse */
++#define GDSCR_SW_OVERRIDE       (1u << 2)
++#define GDSCR_PWR_ON            (1u << 31)      /* read-only status */
++#define CBCR_CLK_ENABLE         (1u << 0)
++#define CBCR_HWCG               (1u << 1)       /* 1 = hardware may gate */
++#define CBCR_CLK_OFF            (1u << 31)      /* read-only status */
++
+ #define UFS_BLOCK       4096u
+ #define BOUNCE_SIZE     (1u << 20)
+ #define PRDT_CHUNK      (256u << 10)            /* PRDT byte count field: 18 bits */
+@@ -76,6 +135,8 @@
  #define CMD_TIMEOUT_NS  (5ull * NSEC_PER_SEC)
  #define CMD_SPIN_NS     (50ull * NSEC_PER_USEC)
  #define CMD_SLEEP_NS    (200ull * NSEC_PER_USEC)
@@ -49,14 +95,13 @@
  
  struct utrd {
  	uint32_t dw0, dw1, dw2, dw3;
-@@ -96,14 +120,20 @@
+@@ -96,14 +157,19 @@
  #define DMA_UTRL        0x0000                  /* 1 KiB aligned */
  #define DMA_UCD         0x1000                  /* 128 byte aligned */
  #define DMA_BOUNCE      0x4000
 -#define DMA_SIZE        (DMA_BOUNCE + BOUNCE_SIZE)
-+/* The interrupt-side stall recorder owns UTRL slot 1 with its own UCD and
-+ * bounce buffer, so it can record a stall even while a thread holds
-+ * sweet_ufs_lock (the case that matters). */
++/* The interrupt-side recorder owns slot 1, a UCD and a bounce buffer.
++ * Slot 0/1 UTRDs share a cache line, so diagnostic writes require idle DMA. */
 +#define DMA_DIAG_UCD    (DMA_BOUNCE + BOUNCE_SIZE)
 +#define DMA_DIAG_BOUNCE (DMA_DIAG_UCD + 0x2000)
 +#define DMA_DIAG_BLOCK  0x1000
@@ -72,7 +117,7 @@
  	uint64_t first_block, nblocks;          /* partition, in 4 KiB device blocks */
  	uint32_t secsize;                       /* logical sector size for the BSD layer */
  	bool writable;                          /* boot-arg ufsrw=1 */
-@@ -116,6 +146,17 @@
+@@ -116,8 +182,190 @@
  
  static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
  static LCK_MTX_DECLARE(sweet_ufs_lock, &sweet_ufs_grp);
@@ -88,15 +133,239 @@
 +#define SWEET_UFS_UNLOCK() do { lck_mtx_unlock(&sweet_ufs_lock); \
 +	os_atomic_dec(&sweet_ufs_users, relaxed); } while (0)
  
++static void sweet_ufs_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
++
++/*
++ * UFS clock/power-domain state (see the GCC block above). A dedicated 1 Hz
++ * thread keeps the domain forced on and records the raw register values; the
++ * normal 5 s heartbeat copies them to the flight recorder so the last state
++ * before a wedge survives. "v" is what the most recent read saw.
++ */
++static vm_offset_t sweet_gcc_regs;
++static int sweet_ufs_clk_mode = 1;      /* sweetufsclk: 0 off, 1 force, 2 watch */
++static int sweet_gcc_mapped;
++static _Atomic uint64_t sweet_gcc_changes;
++
++static struct {
++	uint32_t gdsc, axi, ahb, unipro, noc, clkref;
++	uint32_t forced;                /* last state we wrote, bit per item */
++	uint32_t collapse_count;        /* times the domain was found collapsed/off */
++} sweet_gcc_state;
++
  static inline uint32_t
- ufs_rd(uint32_t off)
-@@ -139,6 +180,73 @@
- dma_clean(uint32_t off, uint32_t len)
- {
- 	clean_dcache64((addr64_t)(su.dma_pa + off), len, TRUE);
++gcc_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(sweet_gcc_regs + off);
++}
++
++static inline void
++gcc_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(sweet_gcc_regs + off) = v;
++	__builtin_arm_dsb(0xf);
++}
++
++static const struct {
++	const char *name;
++	uint32_t off;
++} ufs_cbcr[] = {
++	{ "ufs-axi",     GCC_UFS_PHY_AXI_CBCR },
++	{ "ufs-ahb",     GCC_UFS_PHY_AHB_CBCR },
++	{ "ufs-tx-sym",  GCC_UFS_PHY_TX_CBCR },
++	{ "ufs-rx-sym",  GCC_UFS_PHY_RX_CBCR },
++	{ "ufs-unipro",  GCC_UFS_PHY_UNIPRO_CBCR },
++	{ "ufs-ice",     GCC_UFS_PHY_ICE_CBCR },
++	{ "ufs-phyaux",  GCC_UFS_PHY_PHYAUX_CBCR },
++	{ "ufs-sys-noc", GCC_SYS_NOC_UFS_CBCR },
++	{ "ufs-clkref",  GCC_UFS_CLKREF_CBCR },
++};
++
++static void
++sweet_ufs_gcc_read_state(void)
++{
++	if (!sweet_gcc_mapped) {
++		return;
++	}
++	sweet_gcc_state.gdsc = gcc_rd(GCC_UFS_PHY_GDSCR);
++	sweet_gcc_state.axi = gcc_rd(GCC_UFS_PHY_AXI_CBCR);
++	sweet_gcc_state.ahb = gcc_rd(GCC_UFS_PHY_AHB_CBCR);
++	sweet_gcc_state.unipro = gcc_rd(GCC_UFS_PHY_UNIPRO_CBCR);
++	sweet_gcc_state.noc = gcc_rd(GCC_SYS_NOC_UFS_CBCR);
++	sweet_gcc_state.clkref = gcc_rd(GCC_UFS_CLKREF_CBCR);
 +}
 +
 +/*
++ * Make the UFS power domain and its clock branches unconditionally on.
++ *  - GDSCR: clear SW_COLLAPSE (request off), HW_CONTROL (let the hardware
++ *    collapse it) and SW_OVERRIDE; this is what Linux's gdsc_init does for a
++ *    software-controlled domain. Wait for PWR_ON.
++ *  - CBCR: set CLK_ENABLE, clear HWCG so the branch cannot be auto-gated.
++ * Every write is a read-modify-write of only those bits; already-correct
++ * registers are left untouched, so a healthy boot sees zero changes.
++ */
++static void
++sweet_ufs_gcc_force(bool first)
++{
++	uint32_t v, want, bad, changed = 0;
++	bool collapsed = false;
++
++	if (!sweet_gcc_mapped || sweet_ufs_clk_mode == 0) {
++		return;
++	}
++	sweet_ufs_gcc_read_state();
++
++	v = sweet_gcc_state.gdsc;
++	bad = GDSCR_SW_COLLAPSE | GDSCR_HW_CONTROL | GDSCR_SW_OVERRIDE;
++	if ((v & bad) || !(v & GDSCR_PWR_ON)) {
++		collapsed = !(v & GDSCR_PWR_ON);
++		if (collapsed) {
++			sweet_gcc_state.collapse_count++;
++		}
++		gcc_wr(GCC_UFS_PHY_GDSCR, v & ~bad);
++		for (int i = 0; i < 100; i++) {
++			if (gcc_rd(GCC_UFS_PHY_GDSCR) & GDSCR_PWR_ON) {
++				break;
++			}
++			delay(1);
++		}
++		changed++;
++	}
++
++	if (sweet_ufs_clk_mode == 1) {
++		for (unsigned i = 0; i < sizeof(ufs_cbcr) / sizeof(ufs_cbcr[0]); i++) {
++			v = gcc_rd(ufs_cbcr[i].off);
++			want = (v | CBCR_CLK_ENABLE) & ~CBCR_HWCG;
++			if (v != want) {
++				gcc_wr(ufs_cbcr[i].off, want);
++				changed++;
++			}
++		}
++	}
++
++	sweet_ufs_gcc_read_state();
++	if (changed) {
++		os_atomic_inc(&sweet_gcc_changes, relaxed);
++		sweet_ufs_log("SWEET UFS: GCC forced on (%u writes)%s: gdsc 0x%08x ahb 0x%08x axi 0x%08x unipro 0x%08x noc 0x%08x clkref 0x%08x\n",
++		    changed, collapsed ? " [domain was COLLAPSED]" : "",
++		    sweet_gcc_state.gdsc, sweet_gcc_state.ahb, sweet_gcc_state.axi,
++		    sweet_gcc_state.unipro, sweet_gcc_state.noc, sweet_gcc_state.clkref);
++	} else if (first) {
++		printf("SWEET UFS: GCC ufs domain already on: gdsc 0x%08x ahb 0x%08x axi 0x%08x unipro 0x%08x noc 0x%08x clkref 0x%08x\n",
++		    sweet_gcc_state.gdsc, sweet_gcc_state.ahb, sweet_gcc_state.axi,
++		    sweet_gcc_state.unipro, sweet_gcc_state.noc, sweet_gcc_state.clkref);
++	}
++}
++
++static int
++sweet_ufs_gcc_map(void)
++{
++	if (!sweet_gcc_mapped) {
++		sweet_gcc_regs = ml_io_map(SWEET_GCC_PA, SWEET_GCC_SIZE);
++		if (sweet_gcc_regs == 0) {
++			printf("SWEET UFS: GCC map failed; clock keep-alive disabled\n");
++			return -1;
++		}
++		sweet_gcc_mapped = 1;
++	}
++	return 0;
++}
++
++/*
++ * Host-controller state sample (heartbeat v5). Boots 33/34 show the CPU stop
++ * inside the *second* UTRLDBR read of a completion poll, with the command in
++ * flight and every GCC clock branch still on. To catch a precursor, the 1 Hz
++ * thread records HCE/HCS/IS/UTRLDBR/UTRLRSR once a second. These are the same
++ * read-only HCI registers the driver itself polls; adding them here is the
++ * experiment: if hc_seq stops advancing at the failure instant, the MMIO read
++ * itself is what dies; if it keeps advancing, the controller is alive and only
++ * the driver's own path is stuck.
++ */
++static struct {
++	uint32_t hce, hcs, is, utrldbr, utrlrsr;
++	uint32_t seq;                   /* successful samples this boot */
++} sweet_hc_state;
++
++static void sweet_ufs_hc_sample(void);  /* defined after ufs_rd() below */
++
++/*
++ * 1 Hz keep-alive. If something in the SoC collapses the UFS domain anyway,
++ * this finds it within a second and puts it back, and either way the raw
++ * register values are in the heartbeat for the next pull.
++ */
++static void
++sweet_ufs_clk_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	for (;;) {
++		(void)tsleep(&sweet_gcc_state, PZERO, "sweetclk", hz);
++		if (sweet_ufs_clk_mode != 0) {
++			sweet_ufs_gcc_force(false);
++		}
++		sweet_ufs_hc_sample();
++	}
++}
++
++static inline uint32_t
+ ufs_rd(uint32_t off)
+ {
+ 	return *(volatile uint32_t *)(su.regs + off);
+@@ -130,6 +378,53 @@
+ }
+ 
+ static void
++sweet_ufs_hc_sample(void)
++{
++	if (su.regs == 0) {
++		return;
++	}
++	/*
++	 * Boot 35 died right after a *completed* UFS command at t=140.6 with the
++	 * controller idle, and hc_seq showed the 1 Hz sampler alive to t=136.
++	 * Mark the sample around its reads so the next live log localizes the
++	 * hang: a trailing "HCSAMPLE begin" with no "done" means this thread's
++	 * own MMIO read is what stops the CPU. Lock-free append, no locks.
++	 */
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	sweet_ufs_log("SWEET HCSAMPLE begin seq=%u t=%llu\n",
++	    sweet_hc_state.seq + 1, ns / 1000000000ull);
++	uint32_t hce = ufs_rd(REG_HCE);
++	uint32_t hcs = ufs_rd(REG_HCS);
++	uint32_t is = ufs_rd(REG_IS);
++	uint32_t dbr = ufs_rd(REG_UTRLDBR);
++	uint32_t rsr = ufs_rd(REG_UTRLRSR);
++	uint64_t cv_ctl = __builtin_arm_rsr64("cntv_ctl_el0");
++	int64_t cv_tval = (int64_t)__builtin_arm_rsr64("cntv_tval_el0");
++	uint64_t cvct = __builtin_arm_rsr64("cntvct_el0");
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	sweet_ufs_log("SWEET HCSAMPLE done seq=%u t=%llu hce=0x%x hcs=0x%x is=0x%x dbr=0x%x rsr=0x%x cvctl=0x%llx cvtval=%lld cvct=%llu\n",
++	    sweet_hc_state.seq + 1, ns / 1000000000ull, hce, hcs, is, dbr, rsr,
++	    cv_ctl, cv_tval, cvct);
++	{
++		sweet_idle_stats_t ids;
++		sweet_idle_stats_snapshot(&ids);
++		sweet_ufs_log("SWEET IDLE seq=%u t=%llu mode=%u entries=%llu expired=%llu wfe=%llu wfi=%llu skip=%llu lat=%llu rec=0x%llx isr=0x%llx kctl=0x%llx rtcpop=%llu now=%llu lastexp=%u daif=0x%llx\n",
++		    sweet_hc_state.seq + 1, ns / 1000000000ull, ids.mode,
++		    ids.prox_entries, ids.prox_expired, ids.wfe_iters,
++		    ids.wfi_iters, ids.skipped, ids.idle_latency,
++		    ids.wfe_recommendation, ids.last_isr, ids.last_cntkctl,
++		    ids.last_rtcpop, ids.last_now, ids.last_expired, ids.last_daif);
++	}
++	sweet_hc_state.hce = hce;
++	sweet_hc_state.hcs = hcs;
++	sweet_hc_state.is = is;
++	sweet_hc_state.utrldbr = dbr;
++	sweet_hc_state.utrlrsr = rsr;
++	sweet_hc_state.seq++;
++}
++
++static void
+ dma_sync(uint32_t off, uint32_t len)
+ {
+ 	flush_dcache64((addr64_t)(su.dma_pa + off), len, TRUE);
+@@ -142,6 +437,117 @@
+ }
+ 
+ /*
 + * Task tags are shared with the interrupt-side slot-1 recorder, so allocate
 + * them atomically. Skip 0: an all-zero response UPIU must never look valid.
 + */
@@ -105,6 +374,50 @@
 +{
 +	uint8_t tag = (uint8_t)(os_atomic_inc_orig(&su.tag, relaxed) + 1);
 +	return tag ? tag : 1;
++}
++
++/*
++ * Optional per-command trace, boot-arg sweetufstrace=<uptime_s>: from that
++ * uptime on, log the LBA/op of every normal UFS command to the console (thread
++ * context, same print path as the existing error messages). This is how the
++ * last I/O before the reproducible ~150 s freeze is identified. Off when the
++ * argument is absent; 0 traces from the start of driver use.
++ */
++static int sweet_ufs_trace_after = -1;
++
++static bool
++sweet_ufs_tracing(void)
++{
++	uint64_t ns;
++
++	if (sweet_ufs_trace_after < 0) {
++		return false;
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000000ull >= (uint64_t)sweet_ufs_trace_after;
++}
++
++/*
++ * Error-path logging that never takes the console lock. The normal printf
++ * path can deadlock: a UFS waiter holds sweet_ufs_lock and blocks on the
++ * console lock while the console writer is blocked on sweet_ufs_lock, which
++ * is one explanation for the silent ~150 s freeze. Appending straight to the
++ * lock-free ring keeps the message and lets the driver finish the timeout and
++ * release the lock. sweet_log_append is documented as callable in any context.
++ */
++static void
++sweet_ufs_log(const char *fmt, ...)
++{
++	char buf[200];
++	va_list ap;
++	int n;
++
++	va_start(ap, fmt);
++	n = vsnprintf(buf, sizeof(buf), fmt, ap);
++	va_end(ap);
++	if (n > 0) {
++		sweet_log_append(buf, MIN(n, (int)sizeof(buf) - 1));
++	}
 +}
 +
 +/*
@@ -134,7 +447,7 @@
 +		delay(1);
 +	}
 +	if (ufs_rd(REG_UTRLDBR)) {
-+		printf("SWEET UFS: ring would not drain (dbr 0x%x hcs 0x%x)\n",
++		sweet_ufs_log("SWEET UFS: ring would not drain (dbr 0x%x hcs 0x%x)\n",
 +		    ufs_rd(REG_UTRLDBR), ufs_rd(REG_HCS));
 +		return ETIMEDOUT;
 +	}
@@ -156,20 +469,45 @@
 +	if (ufs_rd(REG_UTRLBA) != (uint32_t)list ||
 +	    ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
 +	    !(ufs_rd(REG_UTRLRSR) & 1)) {
-+		printf("SWEET UFS: ring restart failed (ba 0x%x%08x rsr 0x%x)\n",
++		sweet_ufs_log("SWEET UFS: ring restart failed (ba 0x%x%08x rsr 0x%x)\n",
 +		    ufs_rd(REG_UTRLBAU), ufs_rd(REG_UTRLBA), ufs_rd(REG_UTRLRSR));
 +		return EIO;
 +	}
 +	return 0;
- }
- 
- /*
-@@ -153,13 +261,15 @@
++}
++
++/*
+  * One SCSI command in slot 0, data (if any) to/from the bounce buffer
+  * (to the device when write is set). Returns 0 or an errno.
+  */
+@@ -153,13 +559,37 @@
  	uint64_t ucd_pa = su.dma_pa + DMA_UCD, bounce_pa = su.dma_pa + DMA_BOUNCE;
  
  	assert(len <= BOUNCE_SIZE);
 +	sweet_ufs_op_begin(cdb[0], len, write);
 +	uint8_t tag = ufs_next_tag();
++	bool trace = sweet_ufs_tracing();
++	/*
++	 * "enter" is logged BEFORE any UFS register read. Boots 35/36 stopped
++	 * right after a completed command with no partial line: if the next live
++	 * log ends at "enter" without "begin", the very first MMIO read of the
++	 * command (the HCS read in the begin line) is what wedges the CPU; if no
++	 * "enter" appears at all, the stop is outside this driver.
++	 */
++	uint32_t tlba = 0, tblocks = 0;
++	uint64_t tns = 0;
++	if (trace) {
++		tlba = ((uint32_t)cdb[2] << 24) | ((uint32_t)cdb[3] << 16) |
++		    ((uint32_t)cdb[4] << 8) | cdb[5];
++		tblocks = ((uint32_t)cdb[7] << 8) | cdb[8];
++		absolutetime_to_nanoseconds(mach_absolute_time(), &tns);
++		sweet_ufs_log("SWEET UFSTRACE enter t=%llu.%01llu op=0x%02x tag=0x%02x %s lba=0x%x n=%u len=%u\n",
++		    tns / 1000000000ull, (tns / 100000000ull) % 10ull, cdb[0], tag,
++		    write ? "w" : "r", tlba, tblocks, len);
++		sweet_ufs_log("SWEET UFSTRACE begin t=%llu.%01llu op=0x%02x tag=0x%02x %s lba=0x%x n=%u len=%u hcs=0x%x\n",
++		    tns / 1000000000ull, (tns / 100000000ull) % 10ull, cdb[0], tag,
++		    write ? "w" : "r", tlba, tblocks, len, ufs_rd(REG_HCS));
++	}
  	bzero(utrd, sizeof(*utrd));
  	bzero(ucd, sizeof(*ucd));
  
@@ -181,23 +519,48 @@
  	ucd->cmd[12] = (uint8_t)(len >> 24);
  	ucd->cmd[13] = (uint8_t)(len >> 16);
  	ucd->cmd[14] = (uint8_t)(len >> 8);
-@@ -219,8 +329,13 @@
+@@ -203,8 +633,15 @@
+ 		}
+ 	}
+ 	__builtin_arm_dsb(0xf);
++	if (trace) {
++		sweet_ufs_log("SWEET UFSTRACE armed op=0x%02x tag=0x%02x rsr=0x%x\n",
++		    cdb[0], tag, ufs_rd(REG_UTRLRSR));
++	}
+ 
+ 	ufs_wr(REG_UTRLDBR, 1);
++	if (trace) {
++		sweet_ufs_log("SWEET UFSTRACE rung op=0x%02x tag=0x%02x\n", cdb[0], tag);
++	}
+ 	uint64_t deadline;
+ 	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
+ 	deadline += mach_absolute_time();
+@@ -216,11 +653,22 @@
+ 		spin_until += mach_absolute_time();
+ 		nanoseconds_to_absolutetime(CMD_SLEEP_NS, &sleep_interval);
+ 	}
++	bool first_poll = true;
  	while (ufs_rd(REG_UTRLDBR) & 1) {
++		if (trace && first_poll) {
++			first_poll = false;
++			sweet_ufs_log("SWEET UFSTRACE poll1 op=0x%02x tag=0x%02x dbr=0x%x\n",
++			    cdb[0], tag, ufs_rd(REG_UTRLDBR));
++		}
  		uint64_t now = mach_absolute_time();
  		if (now > deadline) {
 -			ufs_wr(REG_UTRLCLR, ~1u);
 -			printf("SWEET UFS: command 0x%02x timed out\n", cdb[0]);
-+			printf("SWEET UFS: command 0x%02x tag 0x%02x timed out (dbr 0x%x hcs 0x%x)\n",
++			sweet_ufs_log("SWEET UFS: command 0x%02x tag 0x%02x timed out (dbr 0x%x hcs 0x%x)\n",
 +			    cdb[0], tag, ufs_rd(REG_UTRLDBR), ufs_rd(REG_HCS));
 +			int rerr = ufs_ring_restart();
 +			if (rerr) {
-+				printf("SWEET UFS: ring recovery failed %d\n", rerr);
++				sweet_ufs_log("SWEET UFS: ring recovery failed %d\n", rerr);
 +			}
 +			sweet_ufs_op_end();
  			return ETIMEDOUT;
  		}
  		if (sleepable && now >= spin_until) {
-@@ -248,11 +363,37 @@
+@@ -248,11 +696,43 @@
  	}
  
  	uint32_t ocs = utrd->dw2 & 0xff;
@@ -206,27 +569,34 @@
 +	    ((uint32_t)ucd->resp[9] << 16) | ((uint32_t)ucd->resp[10] << 8) |
 +	    (uint32_t)ucd->resp[11];
 +
++	if (trace) {
++		sweet_ufs_log("SWEET UFSTRACE done op=0x%02x tag=0x%02x ocs=0x%x upiu=0x%x rsp_tag=0x%x status=%u/%u resid=%u\n",
++		    cdb[0], tag, ocs, ucd->resp[0], rsp_tag, ucd->resp[6],
++		    ucd->resp[7], residual);
++	}
++
 +	if (rsp_tag != tag) {
 +		/*
 +		 * A response from an older command was accepted by the host. This is
 +		 * exactly the stale-completion case that used to corrupt reads; do
 +		 * not use its data and reinitialize the ring before the next command.
 +		 */
-+		printf("SWEET UFS: stale response for 0x%02x: tag 0x%02x wanted 0x%02x ocs 0x%x upiu 0x%x\n",
++		sweet_ufs_log("SWEET UFS: stale response for 0x%02x: tag 0x%02x wanted 0x%02x ocs 0x%x upiu 0x%x\n",
 +		    cdb[0], rsp_tag, tag, ocs, ucd->resp[0]);
 +		(void)ufs_ring_restart();
 +		sweet_ufs_op_end();
 +		return EIO;
 +	}
  	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
- 		printf("SWEET UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
+-		printf("SWEET UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
++		sweet_ufs_log("SWEET UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
  		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
 +		sweet_ufs_op_end();
  		return EIO;
  	}
 +	if (residual) {
 +		/* A short transfer used to look like valid zero-filled data. */
-+		printf("SWEET UFS: short transfer for 0x%02x tag 0x%02x: residual %u of %u\n",
++		sweet_ufs_log("SWEET UFS: short transfer for 0x%02x tag 0x%02x: residual %u of %u\n",
 +		    cdb[0], tag, residual, len);
 +		sweet_ufs_op_end();
 +		return EIO;
@@ -235,7 +605,16 @@
  	return 0;
  }
  
-@@ -448,7 +589,7 @@
+@@ -291,7 +771,7 @@
+ 	    lba < su.first_block || lba - su.first_block >= su.nblocks ||
+ 	    count > su.nblocks - (lba - su.first_block) || lba + count - 1 > UINT32_MAX ||
+ 	    lba < 6 || (gpt_alt && lba + count - 1 >= gpt_alt - 4)) {
+-		printf("SWEET UFS: refusing write of %u blocks at 0x%llx\n", count, lba);
++		sweet_ufs_log("SWEET UFS: refusing write of %u blocks at 0x%llx\n", count, lba);
+ 		return EPERM;
+ 	}
+ 	uint8_t cdb[10] = {
+@@ -448,7 +928,7 @@
  	if (!su.ready) {
  		return EAGAIN;
  	}
@@ -244,7 +623,7 @@
  	uint8_t saved = su.lun;
  	error = ufs_lookup_part(want, &slot);
  	uint64_t bytes = error ? 0 : part_cache[slot].nblocks * UFS_BLOCK;
-@@ -468,7 +609,7 @@
+@@ -468,7 +948,7 @@
  		}
  	}
  	su.lun = saved;
@@ -253,16 +632,16 @@
  	return error;
  }
  
-@@ -532,6 +673,8 @@
+@@ -531,6 +1011,8 @@
+ 	uint64_t part_bytes = su.nblocks * UFS_BLOCK;
  
  	bool rd = buf_flags(bp) & B_READ;
- 
-+	os_atomic_inc(&sweet_ufs_ios, relaxed);
 +
++	os_atomic_inc(&sweet_ufs_ios, relaxed);
+ 
  	buf_setresid(bp, count);
  	if (!rd && !su.writable) {
- 		error = EROFS;
-@@ -549,7 +692,7 @@
+@@ -549,7 +1031,7 @@
  		goto done;
  	}
  
@@ -271,7 +650,7 @@
  	for (uint32_t done = 0; done < count;) {
  		uint64_t pos = off + done;
  		uint64_t lba = pos / UFS_BLOCK;
-@@ -578,7 +721,7 @@
+@@ -578,7 +1060,7 @@
  		done += want;
  		buf_setresid(bp, count - done);
  	}
@@ -280,7 +659,7 @@
  	buf_unmap(bp);
  
  done:
-@@ -622,9 +765,9 @@
+@@ -622,9 +1104,9 @@
  		if (!su.writable) {
  			return 0;
  		}
@@ -292,7 +671,7 @@
  		return error;
  	}
  	case DKIOCGETMAXBLOCKCOUNTREAD:
-@@ -715,7 +858,7 @@
+@@ -715,7 +1197,7 @@
  
  		uint32_t h = 0, e = 0, bh = 0;
  		bool ok;
@@ -301,7 +680,7 @@
  		ok = ufs_read_blocks(1, 1) == 0 && memcmp(b, "EFI PART", 8) == 0;
  		if (ok) {
  			memcpy(&h, b + 16, 4);
-@@ -726,7 +869,7 @@
+@@ -726,7 +1208,7 @@
  				memcpy(&bh, b + 16, 4);
  			}
  		}
@@ -310,7 +689,27 @@
  		if (!ok || h != gpt_hcrc || e != gpt_ecrc || (gpt_bhcrc && bh != gpt_bhcrc)) {
  			uint64_t ns;
  			absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
-@@ -774,7 +917,7 @@
+@@ -760,6 +1242,19 @@
+ 	su.cache = (cache == 1);
+ 	su.wait = (wait == 1);
+ 
++	/*
++	 * Bring the GCC UFS power domain/clock branches up before the first
++	 * register read of the controller: if the bootloader left the domain
++	 * hardware-controlled it may already be collapsing, and the read that
++	 * detects it would itself hang the bus.
++	 */
++	int clk = 1;
++	(void)PE_parse_boot_argn("sweetufsclk", &clk, sizeof(clk));
++	sweet_ufs_clk_mode = clk;
++	if (clk != 0 && sweet_ufs_gcc_map() == 0) {
++		sweet_ufs_gcc_force(true);
++	}
++
+ 	su.regs = ml_io_map(reg[0], reg[1]);
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+@@ -774,7 +1269,7 @@
  	su.lun = 0;
  	su.secsize = DEV_BSIZE;
  
@@ -319,7 +718,7 @@
  	error = ufs_take_over_host();
  	if (!error) {
  		static const uint8_t tur[6] = { 0x00 };
-@@ -785,7 +928,7 @@
+@@ -785,7 +1280,7 @@
  	if (!error) {
  		error = ufs_find_partition(want);
  	}
@@ -328,16 +727,32 @@
  	if (error) {
  		return error;
  	}
-@@ -808,6 +951,8 @@
+@@ -807,11 +1302,24 @@
+ 	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
  	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
  	    su.writable ? "read-write" : "read-only", su.dma_pa);
++	printf("SWEET UFS: command completion wait mode: %s\n", su.wait ? "sleep" : "poll");
  	sweet_log_start();
 +	sweet_irq_writes_resolve();    /* resolve once, from thread context */
++	int trace_after = -1;
++	if (PE_parse_boot_argn("sweetufstrace", &trace_after, sizeof(trace_after))) {
++		sweet_ufs_trace_after = trace_after;
++	}
 +	sweet_ptimer_enable();
  	sweet_sample_start();
  	thread_t gpt_thread;
  	if (kernel_thread_start(sweet_gpt_watch, NULL, &gpt_thread) == KERN_SUCCESS) {
-@@ -819,14 +964,18 @@
+ 		thread_deallocate(gpt_thread);
++	}
++	if (sweet_gcc_mapped && sweet_ufs_clk_mode != 0) {
++		thread_t clk_thread;
++		if (kernel_thread_start(sweet_ufs_clk_thread, NULL, &clk_thread) == KERN_SUCCESS) {
++			thread_deallocate(clk_thread);
++		}
+ 	}
+ 	/*
+ 	 * Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp).
+@@ -819,15 +1327,26 @@
  	 * topaz; sweettouch=0 / sweetkeys=0 disable them. USB still pokes SM7150
  	 * MMIO (DWC3 at 0xa600000), so it only runs with sweethw=1.
  	 */
@@ -357,9 +772,17 @@
 -		printf("SWEET UFS: USB skipped (topaz, sweethw=0)\n");
 +		printf("SWEET UFS: USB skipped (sweetusb=0 sweethw=0)\n");
  	}
++	/*
++	 * SMP observer (osfmk/arm64/cpu.c): no-op unless cpus>=2 selected a
++	 * second Gold core, in which case CPU1 reports CPU0's timer/IPI/GIC
++	 * state into the lock-free ring. Started last so everything it samples
++	 * is already initialised.
++	 */
++	sweet_obs_start();
  	return 0;
  }
-@@ -850,6 +999,9 @@
+ 
+@@ -850,6 +1369,9 @@
  
  static char sweet_log_ring[SWEET_LOG_SIZE];
  static uint64_t _Atomic sweet_log_total;
@@ -369,7 +792,7 @@
  static int sweet_log_chan;
  static uint32_t sweet_log_secs = SWEET_LOG_SECS;
  
-@@ -863,6 +1015,9 @@
+@@ -863,6 +1385,9 @@
  		return;
  	}
  	uint64_t at = os_atomic_add_orig(&sweet_log_total, (uint64_t)size, relaxed);
@@ -379,12 +802,10 @@
  	for (int i = 0; i < size; i++) {
  		sweet_log_ring[(at + (uint64_t)i) % SWEET_LOG_SIZE] = c[i];
  	}
-@@ -896,15 +1051,870 @@
- sweet_log_position(void)
- {
+@@ -898,13 +1423,1140 @@
  	return os_atomic_load(&sweet_log_total, relaxed);
-+}
-+
+ }
+ 
 +/* What the flush thread last persisted; printed by the stall watchdog. */
 +static uint64_t _Atomic sweet_log_flushed;
 +
@@ -404,11 +825,18 @@
 +	return os_atomic_load(&sweet_ufs_ios, relaxed);
 +}
 +
++/* Persisted by the normal heartbeat even if the IRQ DMA writer cannot run. */
++struct sweet_irq_stats {
++	uint64_t ptimer_ticks, ptimer_pc, ptimer_user, ptimer_record;
++	uint64_t diag_attempts, diag_skips, diag_success, diag_errors, diag_status;
++	uint64_t ptimer_ctl, ptimer_tval, ptimer_frq;
++};
++static struct sweet_irq_stats sweet_irq_stats;
++
 +/*
 + * Interrupt-context one-block write through UTRL slot 1. Used only by the
-+ * stall recorder: the driver never touches slot 1, its UCD or its bounce
-+ * buffer, so this cannot corrupt an in-flight driver command. It is also
-+ * bounded in time and clears the doorbell if the controller does not.
++ * recorder with normal requests idle: slot 0/1 UTRDs share a cache line.
++ * Bounded in time; a timeout permanently disables this helper for this boot.
 + */
 +static int
 +ufs_diag_write_block(uint64_t lba)
@@ -423,11 +851,22 @@
 +		0, 0, 1, 0,
 +	};
 +
-+	if (!su.cache || su.dma == 0 || !su.ready) {
++	static bool disabled;
++	/* Slot 0 and slot 1 UTRDs share a cache line. With one CPU, no normal
++	 * request can start while this ISR runs; require all DMA to be idle
++	 * before cleaning that line, so we cannot overwrite a hardware result. */
++	sweet_irq_stats.diag_attempts++;
++	if (disabled || su.dma == 0 || !su.ready ||
++	    os_atomic_load(&sweet_ufs_users, relaxed) != 0 ||
++	    (ufs_rd(REG_UTRLDBR) & 3u) != 0) {
++		sweet_irq_stats.diag_skips++;
++		sweet_irq_stats.diag_status = disabled ? 1 :
++		    (!su.dma || !su.ready) ? 2 :
++		    os_atomic_load(&sweet_ufs_users, relaxed) ? 3 : 4;
 +		return -1;
 +	}
 +	bzero(u, sizeof(*u));
-+	bzero(c->cmd, 64);
++	bzero(c, sizeof(*c));
 +	c->cmd[0] = 0x01;
 +	c->cmd[1] = 0x20;                       /* data out */
 +	c->cmd[2] = su.lun;
@@ -443,24 +882,44 @@
 +	c->prdt[0].addr_hi = (uint32_t)(bpa >> 32);
 +	c->prdt[0].dbc = DMA_DIAG_BLOCK - 1;
 +	u->prdt = (1024u / 4) << 16 | 1;
-+	dma_clean(DMA_UTRL + sizeof(struct utrd), sizeof(*u));
-+	dma_clean(DMA_DIAG_UCD, 64 + sizeof(cdb));
-+	dma_clean(DMA_DIAG_UCD + offsetof(struct ucd, prdt), sizeof(c->prdt[0]));
-+	dma_clean(DMA_DIAG_BOUNCE, DMA_DIAG_BLOCK);
++	if (su.cache) {
++		dma_clean(DMA_UTRL + sizeof(struct utrd), sizeof(*u));
++		dma_clean(DMA_DIAG_UCD, sizeof(*c));
++		dma_clean(DMA_DIAG_BOUNCE, DMA_DIAG_BLOCK);
++	} else {
++		/* Match the conservative normal-command cache maintenance. */
++		dma_sync(DMA_UTRL + sizeof(struct utrd), sizeof(*u));
++		dma_sync(DMA_DIAG_UCD, sizeof(*c));
++		dma_sync(DMA_DIAG_BOUNCE, DMA_DIAG_BLOCK);
++	}
 +	__builtin_arm_dsb(0xf);
 +
 +	ufs_wr(REG_UTRLDBR, 1u << 1);            /* slot 1 doorbell */
 +	for (int i = 0; i < 2000; i++) {         /* <= ~20 ms, never spins forever */
 +		if (!(ufs_rd(REG_UTRLDBR) & (1u << 1))) {
++			__builtin_arm_dsb(0xf);
++			dma_sync(DMA_UTRL + sizeof(struct utrd), sizeof(*u));
++			dma_sync(DMA_DIAG_UCD, sizeof(*c));
 +			ufs_wr(REG_IS, ufs_rd(REG_IS));
-+			return 0;
++			bool valid = (u->dw2 & 0xff) == 0 && c->resp[0] == 0x21 &&
++			    c->resp[3] == c->cmd[3] && c->resp[6] == 0 &&
++			    c->resp[7] == 0 && c->resp[8] == 0 && c->resp[9] == 0 &&
++			    c->resp[10] == 0 && c->resp[11] == 0;
++			if (valid) sweet_irq_stats.diag_success++;
++			else sweet_irq_stats.diag_errors++;
++			sweet_irq_stats.diag_status = valid ? 0 : 5;
++			return valid ? 0 : -1;
 +		}
 +		delay(10);
 +	}
-+	ufs_wr(REG_UTRLCLR, 1u << 1);            /* give the slot back */
++	/* Never reuse timed-out descriptors or restart the driver's ring here.
++	 * Keep this optional recorder disabled until the next boot. */
++	disabled = true;
++	sweet_irq_stats.diag_errors++;
++	sweet_irq_stats.diag_status = 6;
 +	return -1;
- }
- 
++}
++
 +/*
 + * The UFS command that is in flight right now. A healthy thread can read this
 + * and print it without taking any lock, which is how the live USB console
@@ -523,7 +982,7 @@
 + * loop is visible after the fact. tools/pull-sweetlog.sh fetches it too.
 + */
 +#define SWEET_HB_SECS   5
-+#define SWEET_HB_VERSION 2u
++#define SWEET_HB_VERSION 5u
 +#define SWEET_HB_RUNNING 0u
 +#define SWEET_HB_DUMPING 1u
 +
@@ -545,17 +1004,76 @@
 +	    prev_console_seq, prev_ufs_ios, prev_flush_runs;
 +	/* interrupt-side liveness (written by the timer probe) */
 +	uint64_t svc_runs, panel_runs, intr_pc, ufs_users;
++	struct sweet_irq_stats irq; /* v3: tick/write diagnostics, twelve u64s */
++	/* v4: GCC UFS power-domain/clock state, sampled by the 1 Hz thread */
++	uint64_t gcc_changes;
++	uint32_t gcc_gdsc, gcc_axi, gcc_ahb, gcc_unipro, gcc_noc, gcc_clkref;
++	uint32_t gcc_collapses;
++	/* v5: host-controller HCI state, sampled by the same 1 Hz thread.
++	 * Six u32, so the block needs no padding. */
++	uint32_t hc_hce, hc_hcs, hc_is, hc_utrldbr, hc_utrlrsr, hc_seq;
 +};
 +
 +static int sweet_hb_chan;
 +static uint64_t sweet_hb_base;
 +static struct sweet_heartbeat sweet_hb_prev;   /* this boot's own last write */
++
++/*
++ * Panic persistence. panic_trap_to_debugger() calls sweet_early_panic() before
++ * anything is printed to the normal console, and with no USB serial reader a
++ * panic otherwise vanishes on reset. Store the text in one dedicated block just
++ * below the 16 stall-sample blocks, through the same polled slot-1 writer the
++ * interrupt recorder uses. On a UFS wedge the store simply fails.
++ */
++int sweet_panic_store(const char *text, unsigned int len);
++
++int
++sweet_panic_store(const char *text, unsigned int len)
++{
++	void *diag;
++
++	if (!su.ready || su.dma == 0 || sweet_hb_base == 0 || text == NULL || len == 0) {
++		return -1;
++	}
++	diag = (void *)(su.dma + DMA_DIAG_BOUNCE);
++	bzero(diag, DMA_DIAG_BLOCK);
++	memcpy(diag, text, MIN(len, (unsigned int)DMA_DIAG_BLOCK));
++	/* 16 = SWEET_STALL_SLOTS, which is defined further down. */
++	return ufs_diag_write_block(sweet_hb_base - 1 - 16 - 1);
++}
++
++/*
++ * SMP observer persistence (osfmk/arm64/cpu.c). One fixed block just above the
++ * 16 rotating stall samples and the panic block, so a reset cannot erase the
++ * cross-core capture. The slot-1 polled writer refuses while a normal UFS
++ * request is in flight, and the observer only calls this after CPU0 has
++ * stopped taking timer interrupts for two seconds.
++ */
++int sweet_obs_persist(const void *data, int len);
++
++int
++sweet_obs_persist(const void *data, int len)
++{
++	if (!su.ready || su.dma == 0 || sweet_hb_base == 0 || data == NULL ||
++	    len <= 0 || len > (int)DMA_DIAG_BLOCK) {
++		return -1;
++	}
++	void *diag = (void *)(su.dma + DMA_DIAG_BOUNCE);
++	bzero(diag, DMA_DIAG_BLOCK);
++	memcpy(diag, data, (size_t)len);
++	/* 16 = SWEET_STALL_SLOTS; this block is the one below the panic block. */
++	return ufs_diag_write_block(sweet_hb_base - 1 - 16);
++}
++
  static void
 +sweet_hb_write(uint32_t phase, bool try_only)
 +{
 +	static uint64_t seq;
 +	void *bounce = (void *)(su.dma + DMA_BOUNCE);
 +
++	sweet_irq_stats.ptimer_ctl = __builtin_arm_rsr64("cntp_ctl_el0");
++	sweet_irq_stats.ptimer_tval = __builtin_arm_rsr64("cntp_tval_el0");
++	sweet_irq_stats.ptimer_frq = __builtin_arm_rsr64("cntfrq_el0");
 +	struct sweet_heartbeat hb = {
 +		.magic = { 'S', 'W', 'E', 'E', 'T', 'H', 'B', '1' },
 +		.version = SWEET_HB_VERSION,
@@ -572,6 +1090,21 @@
 +		.panel_runs = os_atomic_load(&sweet_panel_runs, relaxed),
 +		.intr_pc = sweet_intr_pc,
 +		.ufs_users = os_atomic_load(&sweet_ufs_users, relaxed),
++		.irq = sweet_irq_stats,
++		.gcc_changes = os_atomic_load(&sweet_gcc_changes, relaxed),
++		.gcc_gdsc = sweet_gcc_state.gdsc,
++		.gcc_axi = sweet_gcc_state.axi,
++		.gcc_ahb = sweet_gcc_state.ahb,
++		.gcc_unipro = sweet_gcc_state.unipro,
++		.gcc_noc = sweet_gcc_state.noc,
++		.gcc_clkref = sweet_gcc_state.clkref,
++		.gcc_collapses = sweet_gcc_state.collapse_count,
++		.hc_hce = sweet_hc_state.hce,
++		.hc_hcs = sweet_hc_state.hcs,
++		.hc_is = sweet_hc_state.is,
++		.hc_utrldbr = sweet_hc_state.utrldbr,
++		.hc_utrlrsr = sweet_hc_state.utrlrsr,
++		.hc_seq = sweet_hc_state.seq,
 +	};
 +	uint64_t ns;
 +	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
@@ -646,7 +1179,7 @@
 +	uint64_t ufs_users;
 +	uint64_t op_age_ms;     /* v2: age of the in-flight UFS command */
 +	uint32_t op_cdb;        /* v2: its SCSI opcode, 0 = none */
-+	uint32_t op_flags;      /* v2: bit0 write, bit1 active */
++	uint32_t op_flags;      /* bit0 write, bit1 active; ptimer: bit2 user, bit3 periodic */
 +	uint64_t ptimer_runs;   /* v3: independent 1 Hz physical-timer ticks */
 +};
 +
@@ -658,6 +1191,8 @@
 + * runs. Boot-arg sweetptimer=1 enables it.
 + */
 +static int sweet_ptimer_on;
++static int sweet_ptimer_record;
++static int sweet_vtimer_record;
 +uint64_t sweet_ptimer_runs;
 +
 +void sweet_ptimer_rearm(void);
@@ -680,39 +1215,41 @@
 +	if (!PE_parse_boot_argn("sweetptimer", &on, sizeof(on)) || !on) {
 +		return;
 +	}
++	/* Boot-arg parsing stays in thread context, never in the ISR. */
++	PE_parse_boot_argn("sweetptrecord", &sweet_ptimer_record, sizeof(sweet_ptimer_record));
++	sweet_irq_stats.ptimer_record = sweet_ptimer_record;
 +	sweet_ptimer_on = 1;
 +	sweet_ptimer_rearm();
 +	printf("SWEET PTIMER: 1 Hz physical-timer tick enabled (INTID %u)\n",
 +	    SWEET_PTIMER_INTID);
 +}
 +
-+void sweet_ptimer_tick(uintptr_t pc);
++void sweet_ptimer_tick(uintptr_t pc, int user_mode);
 +void
-+sweet_ptimer_tick(uintptr_t pc)
++sweet_ptimer_tick(uintptr_t pc, int user_mode)
 +{
 +	static uint64_t last_out, last_ios, idle_since, samples;
 +	uint64_t now = mach_absolute_time();
 +	uint64_t out, ios, ns;
 +
 +	os_atomic_inc(&sweet_ptimer_runs, relaxed);
++	sweet_irq_stats.ptimer_ticks = sweet_ptimer_runs;
++	sweet_irq_stats.ptimer_pc = pc;
++	sweet_irq_stats.ptimer_user = user_mode;
 +	out = os_atomic_load(&sweet_log_total, relaxed);
 +	ios = os_atomic_load(&sweet_ufs_ios, relaxed);
-+	if (out != last_out || ios != last_ios) {
++	if (out != last_out || ios != last_ios || idle_since == 0) {
 +		last_out = out;
 +		last_ios = ios;
 +		idle_since = now;
-+		return;
-+	}
-+	if (idle_since == 0) {
-+		idle_since = now;
-+		return;
 +	}
 +	absolutetime_to_nanoseconds(now - idle_since, &ns);
-+	if (ns < SWEET_STALL_AFTER_NS) {
++	uint64_t idle_s = ns / 1000000000ull;
++	if (!sweet_ptimer_record && ns < SWEET_STALL_AFTER_NS) {
 +		return;
 +	}
-+	/* One sample every 5 s of stall; the v3 field carries the tick count, so a
-+	 * later pull shows whether this ISR kept running. */
++	/* One sample every 5 s when stalled, or regardless of progress with
++	 * sweetptrecord=1. v3 carries the tick count for the later pull. */
 +	if ((os_atomic_load(&sweet_ptimer_runs, relaxed) % 5) != 0 || sweet_hb_base == 0) {
 +		return;
 +	}
@@ -725,17 +1262,18 @@
 +	st.seq = samples;
 +	absolutetime_to_nanoseconds(now, &ns);
 +	st.uptime_s = ns / 1000000000ull;
-+	st.stall_s = (ns - 0) ? 0 : 0;          /* filled below */
++	st.stall_s = idle_s;
 +	st.pc = pc;
 +	st.last_pc = sweet_intr_pc;
-+	st.name[0] = 'p'; st.name[1] = 't'; st.name[2] = 'i'; st.name[3] = 'm';
-+	st.name[4] = 'e'; st.name[5] = 'r';
++	/* proc_selfname only copies the current process's resident name. */
++	proc_selfname(st.name, sizeof(st.name));
 +	st.console_bytes = out;
 +	st.ufs_ios = ios;
 +	st.free_pages = vm_page_free_count;
 +	st.ufs_users = os_atomic_load(&sweet_ufs_users, relaxed);
 +	st.op_cdb = sweet_cur_op.cdb0;
-+	st.op_flags = (sweet_cur_op.write ? 1u : 0u) | (sweet_cur_op.active ? 2u : 0u);
++	st.op_flags = (sweet_cur_op.write ? 1u : 0u) | (sweet_cur_op.active ? 2u : 0u) |
++	    (user_mode ? 4u : 0u) | (sweet_ptimer_record ? 8u : 0u);
 +	if (sweet_cur_op.active && now > sweet_cur_op.start) {
 +		absolutetime_to_nanoseconds(now - sweet_cur_op.start, &ns);
 +		st.op_age_ms = ns / 1000000ull;
@@ -745,6 +1283,43 @@
 +	bzero(diag, DMA_DIAG_BLOCK);
 +	memcpy(diag, &st, sizeof(st));
 +	(void)ufs_diag_write_block(sweet_hb_base - 1 - (st.slot % SWEET_STALL_SLOTS));
++}
++
++/* Periodic samples on the already-working virtual timer. Physical IRQ delivery
++ * is not assumed; sweetvrecord is resolved once during UFS initialization. */
++static void
++sweet_virtual_record(uintptr_t pc, int user_mode)
++{
++	static uint64_t samples;
++	uint64_t now = mach_absolute_time(), ns;
++	struct sweet_stall st;
++	if (sweet_hb_base == 0) return;
++	bzero(&st, sizeof(st));
++	memcpy(st.magic, "SWEETSTL", 8);
++	st.version = SWEET_STALL_VERSION;
++	st.slot = (uint32_t)(samples++ % SWEET_STALL_SLOTS);
++	st.seq = samples;
++	absolutetime_to_nanoseconds(now, &ns);
++	st.uptime_s = ns / 1000000000ull;
++	st.pc = pc;
++	st.last_pc = sweet_intr_pc;
++	proc_selfname(st.name, sizeof(st.name));
++	st.console_bytes = os_atomic_load(&sweet_log_total, relaxed);
++	st.ufs_ios = os_atomic_load(&sweet_ufs_ios, relaxed);
++	st.free_pages = vm_page_free_count;
++	st.ufs_users = os_atomic_load(&sweet_ufs_users, relaxed);
++	st.op_cdb = sweet_cur_op.cdb0;
++	st.op_flags = (sweet_cur_op.write ? 1u : 0u) |
++	    (sweet_cur_op.active ? 2u : 0u) | (user_mode ? 4u : 0u) | 8u;
++	if (sweet_cur_op.active && now > sweet_cur_op.start) {
++		absolutetime_to_nanoseconds(now - sweet_cur_op.start, &ns);
++		st.op_age_ms = ns / 1000000ull;
++	}
++	st.ptimer_runs = os_atomic_load(&sweet_ptimer_runs, relaxed);
++	void *diag = (void *)(su.dma + DMA_DIAG_BOUNCE);
++	bzero(diag, DMA_DIAG_BLOCK);
++	memcpy(diag, &st, sizeof(st));
++	(void)ufs_diag_write_block(sweet_hb_base - 1 - st.slot);
 +}
 +
 +static void sweet_stall_probe(void);
@@ -804,6 +1379,7 @@
 +static void
 +sweet_irq_writes_resolve(void)
 +{
++	PE_parse_boot_argn("sweetvrecord", &sweet_vtimer_record, sizeof(sweet_vtimer_record));
 +	if (sweet_irq_writes < 0) {
 +		int v = 1;
 +		PE_parse_boot_argn("sweetirqwr", &v, sizeof(v));
@@ -1045,6 +1621,9 @@
 +	if (!sweet_irq_ufs_writes()) {
 +		return;
 +	}
++	sweet_irq_stats.ptimer_ctl = __builtin_arm_rsr64("cntp_ctl_el0");
++	sweet_irq_stats.ptimer_tval = __builtin_arm_rsr64("cntp_tval_el0");
++	sweet_irq_stats.ptimer_frq = __builtin_arm_rsr64("cntfrq_el0");
 +	struct sweet_heartbeat hb = {
 +		.magic = { 'S', 'W', 'E', 'E', 'T', 'H', 'B', '1' },
 +		.version = SWEET_HB_VERSION,
@@ -1061,6 +1640,21 @@
 +		.panel_runs = os_atomic_load(&sweet_panel_runs, relaxed),
 +		.intr_pc = sweet_intr_pc,
 +		.ufs_users = os_atomic_load(&sweet_ufs_users, relaxed),
++		.irq = sweet_irq_stats,
++		.gcc_changes = os_atomic_load(&sweet_gcc_changes, relaxed),
++		.gcc_gdsc = sweet_gcc_state.gdsc,
++		.gcc_axi = sweet_gcc_state.axi,
++		.gcc_ahb = sweet_gcc_state.ahb,
++		.gcc_unipro = sweet_gcc_state.unipro,
++		.gcc_noc = sweet_gcc_state.noc,
++		.gcc_clkref = sweet_gcc_state.clkref,
++		.gcc_collapses = sweet_gcc_state.collapse_count,
++		.hc_hce = sweet_hc_state.hce,
++		.hc_hcs = sweet_hc_state.hcs,
++		.hc_is = sweet_hc_state.is,
++		.hc_utrldbr = sweet_hc_state.utrldbr,
++		.hc_utrlrsr = sweet_hc_state.utrlrsr,
++		.hc_seq = sweet_hc_state.seq,
 +	};
 +	uint64_t ns;
 +	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
@@ -1101,6 +1695,34 @@
 +	next_service = now + step;
 +	os_atomic_inc(&sweet_svc_runs, relaxed);
 +
++	/*
++	 * Lock-free liveness line from the timer interrupt, straight into the USB
++	 * console ring. This runs even while every thread is stuck, so after a
++	 * "silent" boot these lines say whether the CPU is still taking
++	 * interrupts (kernel alive, some thread/console lock stuck) or whether it
++	 * is really wedged on a load (no lines at all). Never printf here.
++	 */
++	{
++		char lv[256];
++		uint64_t lns = 0;
++		int ln;
++		sweet_idle_stats_t ids;
++		sweet_idle_stats_snapshot(&ids);
++		absolutetime_to_nanoseconds(now, &lns);
++		ln = snprintf(lv, sizeof(lv),
++		    "SWEET LV T=%llu SVC=%llu IOS=%llu CB=%llu U=%llu PC=%llx "
++		    "IDLE=%llu/%llu/%llu/%llu WFE=%llu REC=0x%llx KCTL=0x%llx\n",
++		    lns / 1000000000ull, os_atomic_load(&sweet_svc_runs, relaxed),
++		    os_atomic_load(&sweet_ufs_ios, relaxed),
++		    os_atomic_load(&sweet_log_total, relaxed),
++		    os_atomic_load(&sweet_ufs_users, relaxed), (uint64_t)sweet_intr_pc,
++		    ids.prox_entries, ids.prox_expired, ids.wfi_iters, ids.skipped,
++		    ids.wfe_iters, ids.wfe_recommendation, ids.last_cntkctl);
++		if (ln > 0) {
++			sweet_log_append(lv, MIN(ln, (int)sizeof(lv) - 1));
++		}
++	}
++
 +	if (sweet_panel_on()) {
 +		os_atomic_inc(&sweet_panel_runs, relaxed);
 +	}
@@ -1121,7 +1743,11 @@
 +		sweet_console_hold = 1;
 +	}
 +	sweet_hb_write_from_irq();
-+	sweet_stall_probe();
++	if (sweet_vtimer_record) {
++		sweet_virtual_record(pc, user_mode);
++	} else {
++		sweet_stall_probe();
++	}
 +}
 +
 +static void
@@ -1210,6 +1836,59 @@
 +	}
 +}
 +
++/*
++ * Read-only inventory of a firmware-reserved RAM window.
++ *
++ * ABL reserves 0xf3c00000..0xffc00000 (192 MiB) inside the OS bank; it has no
++ * device-tree node, so its owner is unknown. The window sits directly below
++ * 952 MiB that is free, so if it is dead RAM the ADT can publish one
++ * contiguous 2992 MiB range instead of today's 1792 MiB -- but only if it is
++ * not live co-processor or secure memory. This probe only reads: an XPU
++ * violation faults here instead of corrupting anyone's memory, which is the
++ * answer we want before touching the ADT.
++ *
++ * sweetresprobe=<seconds> (0 = off, default) runs once, from the heartbeat
++ * thread, so the console is already attached and the output is captured.
++ */
++#define SWEET_RESP_PA     0xf3c00000ull
++#define SWEET_RESP_SIZE   0x00c00000ull         /* 192 MiB */
++#define SWEET_RESP_POINTS 16
++
++static unsigned sweet_resprobe_s;
++static boolean_t sweet_resprobe_done;
++
++static void
++sweet_resprobe(void)
++{
++	uint64_t step = SWEET_RESP_SIZE / SWEET_RESP_POINTS;
++	unsigned busy = 0;
++	unsigned mapped = 0;
++
++	printf("SWEET RESP: probing %#llx..%#llx (192 MiB, read-only)\n",
++	    SWEET_RESP_PA, SWEET_RESP_PA + SWEET_RESP_SIZE);
++	for (unsigned i = 0; i < SWEET_RESP_POINTS; i++) {
++		uint64_t pa = SWEET_RESP_PA + (uint64_t)i * step;
++		vm_offset_t va = ml_io_map(pa, 0x1000);
++		if (va == 0) {
++			printf("SWEET RESP %#llx: map failed\n", pa);
++			continue;
++		}
++		uint32_t w0 = *(volatile uint32_t *)(va + 0x00);
++		uint32_t w1 = *(volatile uint32_t *)(va + 0x04);
++		uint32_t w2 = *(volatile uint32_t *)(va + 0x08);
++		uint32_t w3 = *(volatile uint32_t *)(va + 0x0c);
++		mapped++;
++		if (w0 | w1 | w2 | w3) {
++			busy++;
++		}
++		printf("SWEET RESP %#llx: %08x %08x %08x %08x\n", pa, w0, w1, w2, w3);
++	}
++	printf("SWEET RESP: %u/%u points readable, %u non-zero; window is %s\n",
++	    mapped, SWEET_RESP_POINTS, busy,
++	    (mapped == SWEET_RESP_POINTS && busy == 0) ? "all-zero (claimable candidate)" :
++	    "NOT empty (do not claim)");
++}
++
 +static void
 +sweet_hb_thread(__unused void *arg, __unused wait_result_t wr)
 +{
@@ -1226,7 +1905,8 @@
 +	}
 +	SWEET_UFS_UNLOCK();
 +
-+	if (error == 0 && memcmp(old.magic, "SWEETHB1", 8) == 0 && old.version == SWEET_HB_VERSION) {
++	if (error == 0 && memcmp(old.magic, "SWEETHB1", 8) == 0 &&
++	    old.version >= 2 && old.version <= SWEET_HB_VERSION) {
 +		sweet_hb_prev.boot_id = old.boot_id + 1;
 +		sweet_hb_prev.prev_boot_id = old.boot_id;
 +		sweet_hb_prev.prev_phase = old.phase;
@@ -1240,8 +1920,21 @@
 +	}
 +	sweet_hb_write(SWEET_HB_RUNNING, false);
 +	(void)sweet_panel_on();
++	(void)PE_parse_boot_argn("sweetresprobe", &sweet_resprobe_s,
++	    sizeof(sweet_resprobe_s));
++	if (sweet_resprobe_s > 600) {
++		sweet_resprobe_s = 0;
++	}
 +	for (;;) {
 +		(void)tsleep(&sweet_hb_chan, PZERO, "sweethb", hz * SWEET_HB_SECS);
++		if (!sweet_resprobe_done && sweet_resprobe_s != 0) {
++			uint64_t ns = 0;
++			absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++			if (ns / 1000000000ull >= (uint64_t)sweet_resprobe_s) {
++				sweet_resprobe_done = TRUE;
++				sweet_resprobe();
++			}
++		}
 +		sweet_hb_write(SWEET_HB_RUNNING, false);
 +	}
 +}
@@ -1250,7 +1943,7 @@
  sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
  {
  	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
-@@ -915,6 +1925,8 @@
+@@ -915,6 +2567,8 @@
  	    SWEET_LOG_BLOCKS * UFS_BLOCK >> 10, base);
  	for (;;) {
  		(void)tsleep(&sweet_log_chan, PZERO, "sweetlog", hz * (int)sweet_log_secs);
@@ -1259,7 +1952,7 @@
  		uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
  		if (total == flushed) {
  			continue;
-@@ -922,7 +1934,7 @@
+@@ -922,7 +2576,7 @@
  		uint64_t pos = total - flushed >= SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : flushed;
  		int error = 0;
  
@@ -1268,7 +1961,7 @@
  		while (pos < total && !error) {
  			uint32_t off = (uint32_t)(pos % SWEET_LOG_SIZE);
  			uint32_t blk = off / UFS_BLOCK;
-@@ -945,12 +1957,14 @@
+@@ -945,12 +2599,14 @@
  		if (!error) {
  			error = ufs_sync_cache();
  		}
@@ -1284,7 +1977,7 @@
  	}
  }
  
-@@ -971,6 +1985,9 @@
+@@ -971,6 +2627,9 @@
  	if (kernel_thread_start(sweet_log_thread, NULL, &thread) == KERN_SUCCESS) {
  		thread_deallocate(thread);
  	}
@@ -1384,7 +2077,16 @@
  }
 --- a/bsd/dev/sweet_usb.c
 +++ b/bsd/dev/sweet_usb.c
-@@ -39,29 +39,51 @@
+@@ -16,6 +16,8 @@
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
++#include <mach/thread_act.h>
++#include <mach/thread_policy.h>
+ #include <machine/machine_routines.h>
+ #include <arm/caches_internal.h>
+ #include <vm/pmap.h>
+@@ -39,29 +41,51 @@
  static void sweet_usb_gadget_start(vm_offset_t dwc);
  extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
  
@@ -1451,7 +2153,7 @@
  static uint32_t
  usb_rd(vm_offset_t base, uint32_t off)
  {
-@@ -70,67 +92,132 @@
+@@ -70,67 +94,132 @@
  	return v;
  }
  
@@ -1550,10 +2252,6 @@
 +	    usb_rd(gcc, GCC_QUSB2PHY_PRIM_BCR));
  	if (enabled >= 2) {
 -		sweet_usb_gadget_start(dwc);
--	}
--	if (cbcr[5] & CBCR_CLK_OFF) {
--		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
--		return;
 +		/* Never inline: a mistake in the bring-up must not take the boot
 +		 * (and the console log) down with it. The thread also waits until
 +		 * the recorder has flushed at least once. */
@@ -1562,8 +2260,8 @@
 +			thread_deallocate(thread);
 +		}
  	}
--	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
--	if (phy == 0) {
+-	if (cbcr[5] & CBCR_CLK_OFF) {
+-		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
 +}
 +
 +static void
@@ -1579,16 +2277,14 @@
 +	if (!sweet_usb_map_gcc(&gcc)) {
  		return;
  	}
--	/* DT qcom,qusb-phy-reg-offset order (Linux phy-msm-qusb-v2.c): PORT_TUNE1 0x240,
--	 * PLL_COMMON_STATUS_ONE 0x1a0, PWR_CTRL1 0x210, INTR_CTRL 0x230,
--	 * PLL_CORE_INPUT_OVERRIDE 0x0a8, TEST1 0x254. */
--	printf("SWEET USB: QUSB2 PLL_STATUS 0x%08x PWR_CTRL1 0x%08x PORT_TUNE1 0x%08x TEST1 0x%08x\n",
--	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
+-	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
+-	if (phy == 0) {
+-		return;
 +	printf("SWEET USB: bringing up the Citrus DWC3 (bengal)\n");
 +	sweet_usb_gadget_start(gcc);
 +	printf("SWEET USB: bring-up thread done\n");
- }
- 
++}
++
 +static int
 +sweet_usb_map_gcc(vm_offset_t *gcc_out)
 +{
@@ -1598,11 +2294,16 @@
 +		if (gcc == 0) {
 +			printf("SWEET USB: GCC map failed\n");
 +		}
-+	}
+ 	}
+-	/* DT qcom,qusb-phy-reg-offset order (Linux phy-msm-qusb-v2.c): PORT_TUNE1 0x240,
+-	 * PLL_COMMON_STATUS_ONE 0x1a0, PWR_CTRL1 0x210, INTR_CTRL 0x230,
+-	 * PLL_CORE_INPUT_OVERRIDE 0x0a8, TEST1 0x254. */
+-	printf("SWEET USB: QUSB2 PLL_STATUS 0x%08x PWR_CTRL1 0x%08x PORT_TUNE1 0x%08x TEST1 0x%08x\n",
+-	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
 +	*gcc_out = gcc;
 +	return gcc != 0;
-+}
-+
+ }
+ 
 +static void
 +sweet_usb_clk_set(vm_offset_t gcc, uint32_t off, bool on)
 +{
@@ -1625,7 +2326,7 @@
  /*
   * Step 2: USB device mode with only the default control endpoint, enough
   * for the host to enumerate the phone (boot-arg sweetusb=2). ABL leaves
-@@ -148,6 +235,10 @@
+@@ -148,6 +237,10 @@
  #define GEVNTADRHI      0xc404
  #define GEVNTSIZ        0xc408
  #define GEVNTCOUNT      0xc40c
@@ -1636,7 +2337,7 @@
  #define DCFG            0xc700
  #define DCTL            0xc704
  #define DEVTEN          0xc708
-@@ -164,7 +255,11 @@
+@@ -164,7 +257,11 @@
   * session; Linux dwc3-qcom forces that in software when the charger
   * reports a cable (dwc3_qcom_vbus_override_enable).
   */
@@ -1649,9 +2350,31 @@
  #define QSCRATCH_HS_PHY_CTRL    0x10
  #define   UTMI_OTG_VBUS_VALID   (1u << 20)
  #define   SW_SESSVLD_SEL        (1u << 28)
-@@ -203,7 +298,8 @@
- #define UD_DATA         0x1100          /* ep0 data stage, 512 bytes */
- #define UD_NOTIFY       0x1300          /* 16-byte notification */
+@@ -191,19 +288,22 @@
+ #define TRBCTL_STATUS3  (4u << 4)
+ #define TRBCTL_DATA     (5u << 4)
+ 
+-/* DMA area layout */
++/* DMA area layout. Each hardware-owned TRB needs its own cache line:
++ * cleaning a neighboring CPU-written TRB must not write stale HWO/completion
++ * bits over a descriptor the controller has just updated. */
+ #define UD_EVT          0x0000          /* event buffer, 4 KiB */
+ #define UD_EVT_SIZE     0x1000
+ #define UD_TRB_OUT      0x1000          /* ep0 OUT TRB */
+-#define UD_TRB_IN       0x1010          /* ep0 IN TRB */
+-#define UD_TRB_RX       0x1020          /* ep1 OUT (bulk, host -> phone) */
+-#define UD_TRB_TX       0x1030          /* ep1 IN (bulk, phone -> host) */
+-#define UD_TRB_INT      0x1050          /* ep2 IN (interrupt, notifications) */
+-#define UD_SETUP        0x1040          /* 8-byte setup packet */
+-#define UD_DATA         0x1100          /* ep0 data stage, 512 bytes */
+-#define UD_NOTIFY       0x1300          /* 16-byte notification */
++#define UD_TRB_IN       0x1040          /* ep0 IN TRB */
++#define UD_TRB_RX       0x1080          /* ep1 OUT (bulk, host -> phone) */
++#define UD_TRB_TX       0x10c0          /* ep1 IN (bulk, phone -> host) */
++#define UD_TRB_INT      0x1100          /* ep2 IN (interrupt, notifications) */
++#define UD_SETUP        0x1140          /* 8-byte setup packet */
++#define UD_DATA         0x1200          /* ep0 data stage, 512 bytes */
++#define UD_NOTIFY       0x1400          /* 16-byte notification */
  #define UD_RX           0x2000          /* one received frame */
 -#define UD_TX           0x2800          /* one frame to send */
 +#define UD_TX           0x2800          /* console stream scratch (6 KiB) */
@@ -1659,7 +2382,7 @@
  #define UD_FRAME_MAX    0x800
  #define UD_SIZE         0x4000
  
-@@ -232,6 +328,7 @@
+@@ -232,6 +332,7 @@
  	mbuf_t      txq[UD_TXQ];
  	unsigned    txq_head, txq_count;
  	bool        tx_busy;
@@ -1667,7 +2390,7 @@
  	uint64_t    rx_frames, tx_frames;
  } ud;
  
-@@ -332,24 +429,31 @@
+@@ -332,24 +433,31 @@
   */
  static const uint8_t ud_dev_desc[18] = {
  	18, 1, 0x00, 0x02, 0x02, 0x00, 0x00, 64,
@@ -1715,7 +2438,7 @@
  static const uint8_t ud_phone_mac[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x02 };
  
  static uint32_t
-@@ -426,8 +530,22 @@
+@@ -426,8 +534,22 @@
  
  	printf("SWEET USB: setup %02x %02x %04x %04x len %u\n", type, req, value, index, length);
  	ud.data_in = (type & 0x80) != 0;
@@ -1740,7 +2463,7 @@
  	} else if ((type & 0x60) != 0) {
  		ok = false;
  	} else if (req == 6) {          /* GET_DESCRIPTOR */
-@@ -453,9 +571,6 @@
+@@ -453,9 +575,6 @@
  	} else if (req == 11) {         /* SET_INTERFACE */
  		if (index == 1) {
  			ud.data_alt = (uint8_t)value;
@@ -1750,22 +2473,66 @@
  		}
  	} else if (req == 10) {         /* GET_INTERFACE */
  		data[0] = index == 1 ? ud.data_alt : 0; n = 1;
-@@ -760,7 +875,10 @@
+@@ -735,7 +854,28 @@
+ 			uint32_t ctl = ud.state == EP0_WAIT_STATUS3 ? TRBCTL_STATUS3 : TRBCTL_STATUS2;
+ 			ud.state = EP0_STATUS;
+ 			ud_start(ep, UD_DATA, 0, ctl);
++		}
++	}
++}
++
++/* One owner drains the event ring: the usual poll thread, or the console
++ * thread in spin mode. A timer-independent TX loop also needs to reap its
++ * own completions when the normal sleeping poller cannot run. */
++static void
++ud_poll_events(void)
++{
++	uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffff;
++	if (count) {
++		ud_sync(UD_EVT, UD_EVT_SIZE);
++		for (uint32_t done = 0; done < count; done += 4) {
++			uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
++			ud.evt_pos = (ud.evt_pos + 4) % UD_EVT_SIZE;
++			if (ud.events++ < 200) {
++				printf("SWEET USB: event 0x%08x\n", ev);
++			}
++			ud_event(ev);
+ 		}
++		dwc_wr(GEVNTCOUNT, count);
+ 	}
+ }
+ 
+@@ -744,23 +884,11 @@
+ {
+ 	uint32_t ticks = 0;
+ 	for (;;) {
+-		uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffff;
+-		if (count) {
+-			ud_sync(UD_EVT, UD_EVT_SIZE);
+-			for (uint32_t done = 0; done < count; done += 4) {
+-				uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
+-				ud.evt_pos = (ud.evt_pos + 4) % UD_EVT_SIZE;
+-				if (ud.events++ < 200) {
+-					printf("SWEET USB: event 0x%08x\n", ev);
+-				}
+-				ud_event(ev);
+-			}
+-			dwc_wr(GEVNTCOUNT, count);
+-		}
++		ud_poll_events();
  		if ((++ticks % 30000) == 0) {
  			printf("SWEET USB: ue0 rx %llu tx %llu frames\n", ud.rx_frames, ud.tx_frames);
  		}
 -		ud_sleep_ms(1);
-+		/* 1 ms while the host enumerates (EP0 latency), then 10 ms: with
-+		 * cpus=1 a 1 ms poll loop during a heavy boot steals measurable
-+		 * CPU from SpringBoard. */
 +		ud_sleep_ms(ud.configured ? 10 : 1);
  	}
  }
  
-@@ -773,51 +891,210 @@
+@@ -773,51 +901,266 @@
   */
  extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
  extern uint64_t sweet_log_position(void);
++extern void sweet_log_append(const char *c, int size);
 +extern uint32_t vm_page_free_count;   /* vm_resident.c */
 +extern uint64_t sweet_ufs_ios_count(void);
 +extern int sweet_ufs_op_string(char *buf, int max);
@@ -1797,15 +2564,70 @@
 +	 */
 +	int want_beat = 0;
 +	PE_parse_boot_argn("sweetusbbeat", &want_beat, sizeof(want_beat));
++	/* Spin only after userland has had time to start. Lower this probe to
++	 * timeshare scheduling before spinning; a runnable priority-81 kernel
++	 * thread otherwise starves all userland on the single CPU. */
++	int spin = 0, spin_start_s = 130, spinning = 0;
++	PE_parse_boot_argn("sweetusbspin", &spin, sizeof(spin));
++	PE_parse_boot_argn("sweetusbspinstart", &spin_start_s, sizeof(spin_start_s));
++	if (spin_start_s < 0) {
++		spin_start_s = 130;
++	}
++	uint64_t next_alive = 0, alive_step = 0, spin_start = 0;
++	if (spin) {
++		nanoseconds_to_absolutetime(1ull * 1000000000ull, &alive_step);
++		nanoseconds_to_absolutetime((uint64_t)spin_start_s * 1000000000ull, &spin_start);
++	}
  	for (;;) {
 -		ud_sleep_ms(100);
-+		ud_sleep_ms(10);
++		if (spin && !spinning && mach_absolute_time() >= spin_start) {
++			spinning = 1;
++			thread_extended_policy_data_t policy = { .timeshare = TRUE };
++			thread_kern_set_pri(current_thread(), 31); /* BASEPRI_DEFAULT */
++			kern_return_t kr = thread_policy_set(current_thread(),
++			    THREAD_EXTENDED_POLICY, (thread_policy_t)&policy,
++			    THREAD_EXTENDED_POLICY_COUNT);
++			if (kr != KERN_SUCCESS) {
++				thread_kern_set_pri(current_thread(), 4); /* fallback */
++			}
++			printf("SWEET USB: spin timeshare policy result %d\n", kr);
++		}
++		if (spinning) {
++			/* delay() may sleep or use WFE on this port. This probe must
++			 * need only counter reads, even when no interrupts arrive. */
++			uint64_t until = mach_absolute_time() + alive_step / 100000;
++			while (mach_absolute_time() < until) {
++				__asm__ volatile ("yield");
++			}
++		} else {
++			ud_sleep_ms(spin ? (ud.configured ? 10 : 1) : 10);
++		}
++		if (spin) {
++			ud_poll_events();
++		}
 +		/*
 +		 * Live heartbeat: if these lines stop while the phone is still
 +		 * running, only this channel died; if they stop and the UI is
 +		 * frozen too, the kernel stopped scheduling.
 +		 */
 +		uint64_t now = mach_absolute_time();
++		if (spinning && now >= next_alive) {
++			uint64_t ans = 0;
++			char ab[192];
++			next_alive = now + alive_step;
++			absolutetime_to_nanoseconds(now, &ans);
++			int an = snprintf(ab, sizeof(ab),
++			    "SWEET ALIVE t=%llu cvctl=0x%llx cvtval=%lld daif=0x%llx pmr=0x%llx grp1=%llu\n",
++			    ans / 1000000000ull,
++			    __builtin_arm_rsr64("CNTV_CTL_EL0"),
++			    (int64_t)(int32_t)__builtin_arm_rsr64("CNTV_TVAL_EL0"),
++			    __builtin_arm_rsr64("DAIF"),
++			    __builtin_arm_rsr64("ICC_PMR_EL1"),
++			    __builtin_arm_rsr64("ICC_IGRPEN1_EL1"));
++			if (an > 0) {
++				sweet_log_append(ab, an);
++			}
++		}
 +		if (want_beat && now >= next_beat) {
 +			char op[96];
 +			uint64_t ns = 0;
@@ -1995,7 +2817,7 @@
  	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
  	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
  		printf("SWEET USB: no DMA memory\n");
-@@ -828,8 +1105,37 @@
+@@ -828,8 +1171,37 @@
  		return;
  	}
  	ud.dma_pa = ptoa_64(pn);
@@ -2034,7 +2856,7 @@
  	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
  	dwc_wr(DCTL, DCTL_CSFTRST);
  	int i;
-@@ -854,11 +1160,11 @@
+@@ -854,11 +1226,11 @@
  	/* Events: disconnect, USB reset, connect done */
  	dwc_wr(DEVTEN, 0x7);
  
@@ -2049,7 +2871,7 @@
  	    ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
  		printf("SWEET USB: endpoint 0 setup failed\n");
  		return;
-@@ -866,7 +1172,6 @@
+@@ -866,7 +1238,6 @@
  	dwc_wr(DALEPENA, 0x3);
  	ud_start_setup();
  
@@ -2057,50 +2879,2063 @@
  	if (qs != 0) {
  		uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL), ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
  		printf("SWEET USB: QSCRATCH HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x GENERAL_CFG 0x%08x\n",
-@@ -888,7 +1193,7 @@
+@@ -883,13 +1254,22 @@
+ 		delay(1000);
  	}
- 	int livelog = 1;
+ 	printf("SWEET USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", dwc_rd(DSTS), i, ud.dma_pa);
+-	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
+-		thread_deallocate(thread);
+-	}
+-	int livelog = 1;
++	int livelog = 1, spin = 0;
  	PE_parse_boot_argn("sweetusblog", &livelog, sizeof(livelog));
 -	if (livelog && ud.ifp != NULL && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
-+	if (livelog && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
- 		thread_deallocate(thread);
+-		thread_deallocate(thread);
++	PE_parse_boot_argn("sweetusbspin", &spin, sizeof(spin));
++	/* Spin mode combines RX events and console TX in one thread so neither
++	 * endpoint completions nor enumeration depend on a sleeping poller. */
++	if (livelog && spin) {
++		if (kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		}
++	} else {
++		if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		}
++		if (livelog && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		}
  	}
  }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -24,6 +24,9 @@
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void sweet_touch_init(void);
+ 
++/* Generated by tools/embed-touch-fw.py from devices/citrus-ft8719-fw.bin. */
++#include "sweet_touch_fw.h"
++
+ #define TOUCH_SE_PA      0x04a88000u /* QUP0 SE2 */
+ #define TOUCH_GCC_PA     0x01400000u
+ #define TOUCH_WEST_PA    0x00500000u /* TLMM 0x400000 + WEST tile: GPIO 6/7/80/86 */
+@@ -731,7 +734,1870 @@
+ 		    st.stage ? st.stage : "?", st.dead, st.d_vote, st.d_cfg, st.d_cbcr,
+ 		    st.d_fw, st.d_status, st.d_hwtx, st.d_hwrx, st.d_ge,
+ 		    st.d_fe1, st.d_fe2, st.d_fid1, st.d_fid2, st.irq_status);
++	}
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* Citrus FT8719 SPI foundation. Both modes are read-only inventories:
++ * 1 = GCC only; 2 = also inspect SE2 if all wrapper/SE clocks are running;
++ * 3 = enable only the SE2 branch vote, verify the halt bit clears, then do
++ * the mode-2 inventory; 4/6 = also mux the SPI pins, pulse reset and run the
++ * vendor FTS SPI status + boot-ID protocol; 5 = pinmux + reset only (no SE
++ * writes). Mode 6 is the corrected transfer path (mode 4 is kept as an alias).
++ * Addresses: captured Citrus live DT + Xiaomi gcc-bengal.c at02ca1a919564.
++ * This does not upload firmware or publish HID data. */
++static int citrus_touch_probe_mode;
++static unsigned citrus_touch_probe_delay_s;
++
++/* ---- Citrus (bengal) touch bring-up: first bounded SPI attempt ---------- */
++#define CITRUS_WEST_PA   0x00500000u   /* TLMM WEST: GPIO 6/7/71/80/93 */
++#define CITRUS_SOUTH_PA  0x00900000u   /* TLMM SOUTH: GPIO 103 (reset) */
++#define CITRUS_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
++#define CITRUS_GPIO_IO(n)  (CITRUS_GPIO_CFG(n) + 4u)
++#define CITRUS_PIN_MOSI  6u
++#define CITRUS_PIN_MISO  7u
++#define CITRUS_PIN_CLK   71u
++#define CITRUS_PIN_CS0   80u
++#define CITRUS_PIN_IRQ   93u
++#define CITRUS_PIN_RESET 103u
++
++/* GENI SE / SPI registers (vendor qcom-geni-se.h, spi-geni-qcom.c). */
++#define SE_DMA_MODE      0x258u
++#define SE_TX_PACK0      0x260u
++#define SE_TX_PACK1      0x264u
++#define SE_RX_PACK0      0x284u
++#define SE_RX_PACK1      0x288u
++#define SE_BYTE_GRAN     0x254u
++#define SE_SPI_CPHA      0x224u
++#define SE_SPI_LOOPBACK  0x22cu
++#define SE_SPI_CPOL      0x230u
++#define SE_SPI_DEMUX_INV 0x24cu
++#define SE_SPI_DEMUX_SEL 0x250u
++#define SE_SPI_TRANS_CFG 0x25cu
++#define SE_SPI_WORD_LEN  0x268u
++#define SE_SPI_TX_LEN    0x26cu
++#define SE_SPI_RX_LEN    0x270u
++#define SE_SPI_DELAYS    0x278u
++#define SE_CLK_SEL       0x07cu
++#define SE_SER_M_CLK     0x048u
++#define SE_M_CMD0        0x600u
++#define SE_M_CMD_CTRL    0x604u
++#define SE_M_IRQ         0x610u
++#define SE_M_IRQ_EN      0x614u
++#define SE_M_IRQ_CLR     0x618u
++#define SE_TX_FIFO       0x700u
++#define SE_RX_FIFO       0x780u
++#define SE_TX_FIFO_ST    0x800u
++#define SE_RX_FIFO_ST    0x804u
++#define SE_TX_WM         0x80cu
++#define SE_M_IRQ_DONE    (1u << 0)
++#define SE_M_IRQ_ERR     ((1u << 1) | (1u << 2) | (1u << 3) | (1u << 4) | \
++                          (1u << 5)) /* overrun/illegal/failure/cancel/abort */
++#define SE_PACKING_4X8_0 0x0007f8feu
++#define SE_PACKING_4X8_1 0x000ffefeu
++
++static void
++citrus_gpio(vm_offset_t tile, unsigned pin, unsigned mux, unsigned pull,
++    unsigned drive, bool out, bool high)
++{
++	uint32_t cfg = touch_rd(tile, CITRUS_GPIO_CFG(pin));
++	uint32_t io = touch_rd(tile, CITRUS_GPIO_IO(pin));
++	/* TLMM: IO bit0 = input value (read-only), bit1 = output latch,
++	 * CFG bit9 = output enable. Writing bit0 left reset asserted. */
++	io = (io & ~2u) | (high ? 2u : 0u);
++	touch_wr(tile, CITRUS_GPIO_IO(pin), io);
++	cfg &= ~0x3ffu;
++	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
++	touch_wr(tile, CITRUS_GPIO_CFG(pin), cfg);
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++/*
++ * FT8719 SPI transport, following the vendor
++ * drivers/input/touchscreen/FT8719/focaltech_spi.c:
++ *  - every package is sent as two GENI fragments: the package byte alone,
++ *    a 30 us gap, then the payload (CS stays asserted via FRAGMENTATION);
++ *  - responses are shifted by that first byte;
++ *  - READ_CMD (0xA0) appends a little-endian CRC16/Kermit over the payload;
++ *  - the boot ID is write[0x55]+data[0xAA], 12 ms, read[0x90 0 0 0] -> 2 B.
++ * All waits are bounded; a failed engine is cancelled and not retried.
++ */
++#define CITRUS_FTS_STATUS  0x05u
++#define CITRUS_FTS_CMD     0xC0u
++#define CITRUS_FTS_DATA    0x3Fu
++#define CITRUS_FTS_READ    0xA0u
++#define CITRUS_FTS_GAP_US  30u
++#define CITRUS_FTS_MAX     64u
++
++static void
++citrus_fts_crc(const uint8_t *data, unsigned len, uint16_t *crc_out)
++{
++	uint16_t crc = 0xffffu;
++	for (unsigned i = 0; i < len; i++) {
++		crc ^= data[i];
++		for (unsigned j = 0; j < 8; j++) {
++			crc = (crc & 1u) ? (uint16_t)((crc >> 1) ^ 0x8408u)
++					 : (uint16_t)(crc >> 1);
++		}
++	}
++	*crc_out = crc;
++}
++
++/* One GENI FIFO command. fragment=true keeps CS asserted for the next one. */
++static bool
++citrus_spi_cmd(vm_offset_t se, const uint8_t *tx, uint8_t *rx, unsigned len,
++    bool fragment)
++{
++	uint32_t irq = 0;
++	unsigned i, j, words = (len + 3u) / 4u;
++	bool done = false;
++
++	if (len == 0 || len > CITRUS_FTS_MAX) {
++		return false;
++	}
++	/* Do not gate on M_GENI_CMD_ACTIVE: the vendor spi-geni driver never
++	 * reads it before submitting, and ABL leaves it set on this SE. The
++	 * probe cancels/aborts that stale state once before the first command. */
++	touch_wr(se, SE_M_IRQ_CLR, 0xffffffffu);
++	/* Vendor order: lengths and watermark, start the command, then fill
++	 * the FIFO (spi_geni_handle_tx). */
++	touch_wr(se, SE_TX_WM, 1);
++	touch_wr(se, SE_SPI_TX_LEN, len);
++	touch_wr(se, SE_SPI_RX_LEN, len);
++	touch_wr(se, SE_M_CMD0, (3u << 27) | (fragment ? (1u << 2) : 0));
++	for (i = 0; i < len; i += 4) {
++		uint32_t w = 0;
++		for (j = 0; j < 4 && i + j < len; j++) {
++			w |= (uint32_t)tx[i + j] << (8u * j);
++		}
++		touch_wr(se, SE_TX_FIFO, w);
++	}
++	for (i = 0; i < 2000; i++) {
++		irq = touch_rd(se, SE_M_IRQ);
++		if (irq & SE_M_IRQ_ERR) {
++			break;
++		}
++		if (irq & SE_M_IRQ_DONE) {
++			done = true;
++			break;
++		}
++		delay(10);
++	}
++	if (done) {
++		for (i = 0; i < words; i++) {
++			uint32_t w = touch_rd(se, SE_RX_FIFO);
++			for (j = 0; j < 4 && i * 4u + j < len; j++) {
++				rx[i * 4u + j] = (uint8_t)(w >> (8u * j));
++			}
++		}
++	} else {
++		printf("CITRUS TOUCH: SE2 cmd len=%u frag=%u irq=%#x status=%#x\n",
++		    len, fragment ? 1u : 0u, irq, touch_rd(se, 0x40));
++	}
++	touch_wr(se, SE_M_IRQ_CLR, 0xffffffffu);
++	return done;
++}
++
++/* Two-fragment FTS package. */
++static bool
++citrus_fts_xfer(vm_offset_t se, const uint8_t *tx, uint8_t *rx, unsigned len)
++{
++	if (!citrus_spi_cmd(se, tx, rx, 1, len > 1)) {
++		return false;
++	}
++	if (len > 1) {
++		delay(CITRUS_FTS_GAP_US);
++		if (!citrus_spi_cmd(se, tx + 1, rx + 1, len - 1, false)) {
++			return false;
++		}
++	}
++	delay(150); /* vendor CS_HIGH_DELAY */
++	return true;
++}
++
++/* 0x05 status package: the chip status is the second byte. */
++static bool
++citrus_fts_status(vm_offset_t se, uint8_t *status)
++{
++	uint8_t tx[2] = {CITRUS_FTS_STATUS, 0x00};
++	uint8_t rx[2] = {0, 0};
++	if (!citrus_fts_xfer(se, tx, rx, sizeof(tx))) {
++		return false;
++	}
++	*status = rx[1];
++	return true;
++}
++
++/* Vendor fts_write(): command package, then an optional data package. */
++static bool
++citrus_fts_write(vm_offset_t se, uint8_t cmd, const uint8_t *data,
++    unsigned dlen)
++{
++	uint8_t tx[CITRUS_FTS_MAX], rx[CITRUS_FTS_MAX];
++	unsigned n = 0;
++
++	if (dlen > 4) {
++		return false;
++	}
++	memset(tx, 0, sizeof(tx));
++	memset(rx, 0, sizeof(rx));
++	tx[n++] = CITRUS_FTS_CMD;
++	tx[n++] = 0x00u | 1u; /* WRITE_CMD | cmdlen */
++	tx[n++] = cmd;
++	if (!citrus_fts_xfer(se, tx, rx, n)) {
++		return false;
++	}
++	if (!data || !dlen) {
++		return true;
++	}
++	touch_wait(1);
++	memset(tx, 0, sizeof(tx));
++	memset(rx, 0, sizeof(rx));
++	n = 0;
++	tx[n++] = CITRUS_FTS_DATA;
++	for (unsigned i = 0; i < dlen; i++) {
++		tx[n++] = data[i];
++	}
++	return citrus_fts_xfer(se, tx, rx, n);
++}
++
++/* Vendor fts_read(): command package, then a data package with CRC. */
++static bool
++citrus_fts_read(vm_offset_t se, const uint8_t *cmd, unsigned cmdlen,
++    uint8_t *data, unsigned dlen, bool fw_running)
++{
++	uint8_t tx[CITRUS_FTS_MAX], rx[CITRUS_FTS_MAX];
++	unsigned n = 0, pkg = cmdlen + (fw_running ? 2u : 0u);
++	uint16_t crc = 0, want;
++
++	if (cmdlen == 0 || dlen == 0 || dlen > CITRUS_FTS_MAX - 8u ||
++	    pkg > 15u) {
++		return false;
++	}
++	memset(tx, 0, sizeof(tx));
++	memset(rx, 0, sizeof(rx));
++	tx[n++] = CITRUS_FTS_CMD;
++	tx[n++] = CITRUS_FTS_READ | pkg;
++	for (unsigned i = 0; i < cmdlen; i++) {
++		tx[n++] = cmd[i];
++	}
++	if (fw_running) {
++		tx[n++] = (uint8_t)(dlen >> 8);
++		tx[n++] = (uint8_t)dlen;
++	}
++	if (!citrus_fts_xfer(se, tx, rx, n)) {
++		return false;
++	}
++	touch_wait(1); /* let the IC prepare the response */
++	memset(tx, 0, sizeof(tx));
++	memset(rx, 0, sizeof(rx));
++	n = dlen + 3u; /* data package byte + payload + 2 CRC bytes */
++	tx[0] = CITRUS_FTS_DATA;
++	if (!citrus_fts_xfer(se, tx, rx, n)) {
++		return false;
++	}
++	memcpy(data, rx + 1, dlen);
++	citrus_fts_crc(rx + 1, dlen, &crc);
++	want = (uint16_t)rx[dlen + 1] | ((uint16_t)rx[dlen + 2] << 8);
++	if (crc != want) {
++		printf("CITRUS TOUCH: FTS crc calc=%#x read=%#x raw=%02x %02x %02x %02x %02x %02x %02x %02x\n",
++		    crc, want, rx[0], rx[1], rx[2], rx[3], rx[4], rx[5],
++		    rx[6], rx[7]);
++		return false;
++	}
++	return true;
++}
++
++/*
++ * Program gcc_qupv3_wrap0_s2_clk_src to the vendor's 6 MHz selection:
++ * 48 MHz from P_GPLL0_OUT_AUX2 (300 MHz * 4/25), pre-div 1, dual-edge M/N.
++ * clk-rcg2 requires force-enable (CMD_ROOT_EN, bit 1) around the update.
++ * CFG = pre_div 1 | src 2 << 8 | CFG_MODE_DUAL_EDGE 2 << 12.
++ * M = 4, N = ~(25 - 4), D = ~25.
++ */
++static bool
++citrus_se_clock_48m(vm_offset_t gcc)
++{
++	uint32_t cfg_before = touch_rd(gcc, TOUCH_RCG + 4u);
++	uint32_t cmd = touch_rd(gcc, TOUCH_RCG);
++	bool updated = false;
++
++	touch_wr(gcc, TOUCH_RCG, cmd | (1u << 1)); /* force enable */
++	touch_wr(gcc, TOUCH_RCG + 0x8u, 4u);
++	touch_wr(gcc, TOUCH_RCG + 0xcu, 0xffeau);
++	touch_wr(gcc, TOUCH_RCG + 0x10u, 0xffe6u);
++	touch_wr(gcc, TOUCH_RCG + 4u, 0x2201u);
++	touch_wr(gcc, TOUCH_RCG, (1u << 1) | (1u << 0)); /* ROOT_EN | UPDATE */
++	for (unsigned i = 0; i < 1000; i++) {
++		if (!(touch_rd(gcc, TOUCH_RCG) & 1u)) {
++			updated = true;
++			break;
++		}
++		delay(1);
++	}
++	touch_wr(gcc, TOUCH_RCG, 0); /* clear force enable */
++	__asm__ volatile("dsb sy" ::: "memory");
++	printf("CITRUS TOUCH: RCG 48M cfg=%#x->%#x updated=%d root_off=%u\n",
++	    cfg_before, touch_rd(gcc, TOUCH_RCG + 4u), updated,
++	    (touch_rd(gcc, TOUCH_RCG) >> 31) & 1u);
++	return updated && !(touch_rd(gcc, TOUCH_RCG) & (1u << 31));
++}
++
++/* Internal loopback: proves the sequencer, serial clock and FIFO packing. */
++static bool
++citrus_spi_loopback_test(vm_offset_t se)
++{
++	static const uint8_t ltx[4] = {0xa5, 0x5a, 0x3c, 0xc3};
++	uint8_t lrx[4] = {0, 0, 0, 0};
++	bool l;
++
++	touch_wr(se, SE_SPI_LOOPBACK, 1);
++	l = citrus_spi_cmd(se, ltx, lrx, sizeof(ltx), false);
++	printf("CITRUS TOUCH: SPI loopback ok=%d sel=%#x mclk=%#x rx=%02x %02x %02x %02x\n",
++	    l, touch_rd(se, SE_CLK_SEL), touch_rd(se, SE_SER_M_CLK),
++	    lrx[0], lrx[1], lrx[2], lrx[3]);
++	touch_wr(se, SE_SPI_LOOPBACK, 0);
++	return l;
++}
++
++/*
++ * First real SPI milestone: mux the QUP0 SE2 pins, pulse the FT8719 reset,
++ * then run the vendor status + boot-ID protocol on the polled GENI engine.
++ * No interrupt handler, no DMA, no firmware upload, no HID data.
++ */
++static void
++citrus_touch_spi_probe(vm_offset_t gcc, bool do_spi)
++{
++	vm_offset_t west, south, se;
++	uint8_t status = 0xff;
++	bool ok = false;
++	unsigned i;
++
++	west = ml_io_map(CITRUS_WEST_PA, 0x80000);
++	south = ml_io_map(CITRUS_SOUTH_PA, 0x80000);
++	se = ml_io_map(0x04a88000u, 0x4000);
++	if (!west || !south || !se) {
++		printf("CITRUS TOUCH: TLMM/SE2 mapping failed west=%d south=%d se=%d\n",
++		    west != 0, south != 0, se != 0);
++		return;
++	}
++	/* All four SPI pins are QUP0 SE2 mux 1 on WEST. */
++	citrus_gpio(west, CITRUS_PIN_MOSI, 1, 0, 3, false, false);
++	citrus_gpio(west, CITRUS_PIN_MISO, 1, 0, 3, false, false);
++	citrus_gpio(west, CITRUS_PIN_CLK,  1, 0, 3, false, false);
++	citrus_gpio(west, CITRUS_PIN_CS0,  1, 0, 3, false, false);
++	/* IRQ stays GPIO input, no pull; not used for the probe. */
++	citrus_gpio(west, CITRUS_PIN_IRQ, 0, 0, 0, false, false);
++	/* Reset is active low on SOUTH tile. */
++	citrus_gpio(south, CITRUS_PIN_RESET, 0, 0, 0, true, true);
++	touch_wait(1);
++	citrus_gpio(south, CITRUS_PIN_RESET, 0, 0, 0, true, false);
++	touch_wait(2);
++	citrus_gpio(south, CITRUS_PIN_RESET, 0, 0, 0, true, true);
++	touch_wait(120);
++	printf("CITRUS TOUCH: SPI pins muxed, reset released: cfg103=%#x io103=%#x irq_io=%#x\n",
++	    touch_rd(south, CITRUS_GPIO_CFG(CITRUS_PIN_RESET)),
++	    touch_rd(south, CITRUS_GPIO_IO(CITRUS_PIN_RESET)),
++	    touch_rd(west, CITRUS_GPIO_IO(CITRUS_PIN_IRQ)));
++	if (!do_spi) {
++		printf("CITRUS TOUCH: pinmux/reset-only mode; SE2 untouched\n");
++		return;
++	}
++	printf("CITRUS TOUCH: SE2 pre status=%#x irq=%#x\n",
++	    touch_rd(se, 0x40), touch_rd(se, SE_M_IRQ));
++
++	/*
++	 * Vendor geni_se_io_init() (qcom-geni-se.c). The decisive one is
++	 * GENI_FORCE_DEFAULT (0x20 = 1): it resets the sequencer, which is
++	 * what clears the command ABL left active. Without it, the first
++	 * submission overruns (M_IRQ bit 1) or is ignored (irq 0).
++	 */
++	touch_wr(se, 0x28, touch_rd(se, 0x28) | 0x7fu);   /* GENI_CGC_CTRL */
++	touch_wr(se, 0xe30, touch_rd(se, 0xe30) | 0x0fu); /* DMA general cfg */
++	touch_wr(se, 0x24, 0x7fu);                        /* GENI_OUTPUT_CTRL */
++	touch_wr(se, 0x20, 1u);                           /* FORCE_DEFAULT */
++	delay(100);
++	printf("CITRUS TOUCH: SE2 reset status=%#x irq=%#x force=%#x\n",
++	    touch_rd(se, 0x40), touch_rd(se, SE_M_IRQ), touch_rd(se, 0x20));
++	/* FIFO mode selection: no GSI/DMA, clear all GENI IRQ state. */
++	touch_wr(se, 0xe18, 0);
++	touch_wr(se, 0x640, 0xffffffffu); /* S_IRQ_CLEAR */
++	touch_wr(se, SE_M_IRQ_CLR, 0xffffffffu);
++
++	/* FIFO mode, 4x8 packing, 8-bit words, SPI mode 0, CS0. */
++	touch_wr(se, SE_DMA_MODE, 0);
++	touch_wr(se, SE_TX_PACK0, SE_PACKING_4X8_0);
++	touch_wr(se, SE_TX_PACK1, SE_PACKING_4X8_1);
++	touch_wr(se, SE_RX_PACK0, SE_PACKING_4X8_0);
++	touch_wr(se, SE_RX_PACK1, SE_PACKING_4X8_1);
++	touch_wr(se, SE_BYTE_GRAN, 0);
++	touch_wr(se, SE_SPI_WORD_LEN, 4);       /* (8 bits - MIN_WORD_LEN) */
++	touch_wr(se, SE_SPI_LOOPBACK, 0);
++	touch_wr(se, SE_SPI_DEMUX_SEL, 0);
++	touch_wr(se, SE_SPI_DEMUX_INV, 0);
++	touch_wr(se, SE_SPI_CPHA, 0);
++	touch_wr(se, SE_SPI_CPOL, 0);
++	touch_wr(se, SE_SPI_TRANS_CFG, 0);
++	touch_wr(se, SE_SPI_DELAYS, 0);
++	/*
++	 * Vendor geni_se_init(): the RX ready-for-receive watermark is flow
++	 * control, not an interrupt threshold. Left at 0 the RX FIFO reports
++	 * full after the first word, so a full-duplex command starts (status
++	 * 0x41) and never reaches DONE. RX depth is 16 words -> 14.
++	 */
++	touch_wr(se, 0x810, 0);
++	touch_wr(se, 0x814, 14u);
++	touch_wr(se, 0xe1c, 0x0cu); /* SE_IRQ_EN: GENI M|S */
++	/*
++	 * Attempt 1: RCG is parked at CXO 19.2 MHz (CFG 0x100000), which is
++	 * DFS level 2; serial divider 4 gives 4.8 MHz.
++	 * Attempt 2 (vendor path for the DT's 6 MHz): RCG 48 MHz, DFS level 5,
++	 * serial divider 8 -> 6 MHz. Two GENI streams can hang, so try both.
++	 */
++	uint32_t mclk0 = touch_rd(se, SE_SER_M_CLK);
++	touch_wr(se, SE_CLK_SEL, 2);
++	touch_wr(se, SE_SER_M_CLK, 0x41u);
++	printf("CITRUS TOUCH: SE2 cfg word_len=%#x pack=%#x/%#x clk_sel=%#x ser_m_clk=%#x->%#x status=%#x\n",
++	    touch_rd(se, SE_SPI_WORD_LEN), touch_rd(se, SE_TX_PACK0),
++	    touch_rd(se, SE_RX_PACK0), touch_rd(se, SE_CLK_SEL), mclk0,
++	    touch_rd(se, SE_SER_M_CLK), touch_rd(se, 0x40));
++	touch_wr(se, SE_M_IRQ_CLR, 0xffffffffu);
++	touch_wr(se, SE_M_IRQ_EN, SE_M_IRQ_DONE | SE_M_IRQ_ERR);
++	touch_wr(se, SE_TX_WM, 0);
++	/*
++	 * ABL can leave the primary sequencer marked active with no pending
++	 * IRQ. Cancel, then abort, with bounded waits; continue either way
++	 * because the vendor driver does not treat this bit as a gate.
++	 */
++	if (touch_rd(se, 0x40) & 1u) {
++		printf("CITRUS TOUCH: SE2 stale active, cancelling status=%#x\n",
++		    touch_rd(se, 0x40));
++		touch_wr(se, SE_M_CMD_CTRL, 4); /* cancel */
++		for (i = 0; i < 200 && !(touch_rd(se, SE_M_IRQ) & (1u << 4)); i++) {
++			delay(100);
++		}
++		touch_wr(se, SE_M_CMD_CTRL, 2); /* abort */
++		for (i = 0; i < 200 && !(touch_rd(se, SE_M_IRQ) & (1u << 5)); i++) {
++			delay(100);
++		}
++		touch_wr(se, SE_M_IRQ_CLR, 0xffffffffu);
++		printf("CITRUS TOUCH: SE2 after cancel/abort status=%#x irq=%#x\n",
++		    touch_rd(se, 0x40), touch_rd(se, SE_M_IRQ));
++	}
++	/*
++	 * Control: internal SPI loopback. If the GENI sequencer and serial
++	 * clock run, the received bytes are the transmitted ones regardless of
++	 * the FT8719, its power or the pin mux. A failure here is upstream of
++	 * the touch IC. Try the CXO clock plan first, then the vendor 48 MHz
++	 * plan (a command that never clocks leaves the sequencer active, so
++	 * the second attempt starts with a fresh FORCE_DEFAULT).
++	 */
++	bool loop_ok = citrus_spi_loopback_test(se);
++	if (!loop_ok) {
++		touch_wait(20);
++		if (citrus_se_clock_48m(gcc)) {
++			touch_wr(se, 0x20, 1u); /* FORCE_DEFAULT again */
++			delay(100);
++			touch_wr(se, SE_CLK_SEL, 5);
++			touch_wr(se, SE_SER_M_CLK, 0x81u);
++			delay(100);
++			loop_ok = citrus_spi_loopback_test(se);
++		}
++	}
++	if (!loop_ok) {
++		printf("CITRUS TOUCH: SPI loopback failed on both clock plans\n");
++	}
++	touch_wait(1);
++	/*
++	 * The chip answers every read with 0x08, which looks like its status
++	 * byte rather than data: it is not ready. Sweep CPHA and the serial
++	 * divider with a status package before trusting any register read.
++	 * mclk 0x41 = 19.2/4 (4.8 MHz), 0x101 = 19.2/16 (1.2 MHz); a result
++	 * with (status & 0x81) == 0x01 or 0x00 is idle.
++	 */
++	{
++		static const unsigned cphas[2] = {0, 1};
++		static const uint32_t mclks[2] = {0x41u, 0x101u};
++		for (unsigned ci = 0; ci < 2; ci++) {
++			for (unsigned mi = 0; mi < 2; mi++) {
++				uint8_t s = 0xff;
++				bool sok = false;
++				touch_wr(se, SE_SPI_CPHA, cphas[ci]);
++				touch_wr(se, SE_SER_M_CLK, mclks[mi]);
++				delay(1000);
++				for (unsigned t = 0; t < 4; t++) {
++					sok = citrus_fts_status(se, &s);
++					if (sok && ((s & 0x81u) == 1u ||
++					    (s & 0x81u) == 0u)) {
++						break;
++					}
++					delay(150);
++				}
++				printf("CITRUS TOUCH: status sweep cpha=%u mclk=%#x ok=%d status=%#x\n",
++				    cphas[ci], mclks[mi], sok, s);
++			}
++		}
++		touch_wr(se, SE_SPI_CPHA, 0);
++		touch_wr(se, SE_SER_M_CLK, 0x41u);
++	}
++
++	for (i = 0; i < 3; i++) {
++		ok = citrus_fts_status(se, &status);
++		printf("CITRUS TOUCH: FTS status try=%u ok=%d status=%#x irq=%#x\n",
++		    i, ok, status, touch_rd(se, SE_M_IRQ));
++		if (ok) {
++			break;
++		}
++		touch_wait(5);
++	}
++	if (!ok) {
++		printf("CITRUS TOUCH: SPI status failed; no chip ID attempt\n");
++		goto abort;
++	}
++	{
++		/*
++		 * After reset the FT8719 runs its factory firmware, so the
++		 * normal register reads use the fw-running framing (two length
++		 * bytes). 0xA3/0x9F are the chip-ID pair the vendor's
++		 * fts_wait_tp_to_valid() polls; 0xA6/0xA8 add firmware/vendor.
++		 */
++		static const uint8_t reg_idh[1] = {0xa3};
++		static const uint8_t reg_idl[1] = {0x9f};
++		static const uint8_t reg_fw[1] = {0xa6};
++		static const uint8_t reg_vendor[1] = {0xa8};
++		uint8_t idh = 0, idl = 0, fw = 0, vendor = 0;
++		bool a = citrus_fts_read(se, reg_idh, 1, &idh, 1, true);
++		bool b = a && citrus_fts_read(se, reg_idl, 1, &idl, 1, true);
++		bool c = b && citrus_fts_read(se, reg_fw, 1, &fw, 1, true);
++		bool d = c && citrus_fts_read(se, reg_vendor, 1, &vendor, 1, true);
++
++		printf("CITRUS TOUCH: FTS normal id ok=%d/%d/%d/%d id=%02x%02x fw=%02x vendor=%02x\n",
++		    a, b, c, d, idh, idl, fw, vendor);
++	}
++	{
++		/*
++		 * Fallback: the boot-ROM ID path. _FT8719 = 0x8719080D has
++		 * FLAG_IDC_BIT (bit 11) set, so is_incell is true and the
++		 * vendor uses FTS_CMD_READ_ID_LEN_INCELL = 1 (0x90 only).
++		 */
++		static const uint8_t idcmd[1] = {0x90};
++		const uint8_t start = 0xaa;
++		uint8_t id[2] = {0, 0};
++		bool w = citrus_fts_write(se, 0x55, &start, 1);
++
++		printf("CITRUS TOUCH: FTS boot start ok=%d\n", w);
++		touch_wait(12);
++		bool r = w && citrus_fts_read(se, idcmd, sizeof(idcmd), id,
++		    sizeof(id), false);
++		printf("CITRUS TOUCH: FTS boot id ok=%d id=%02x%02x (%s)\n",
++		    r, id[0], id[1],
++		    (id[0] == 0x87 && (id[1] == 0x19 || id[1] == 0xa9 ||
++		    id[1] == 0xb9)) ? "FT8719" : "unexpected");
++	}
++abort:
++	printf("CITRUS TOUCH: SPI end irq=%#x status=%#x txcount=%#x rxcount=%#x\n",
++	    touch_rd(se, SE_M_IRQ), touch_rd(se, 0x40),
++	    touch_rd(se, SE_TX_FIFO_ST), touch_rd(se, SE_RX_FIFO_ST));
++	touch_wr(se, SE_M_IRQ_CLR, 0xffffffffu);
++	touch_wr(se, SE_TX_WM, 0);
++	if (!ok || (touch_rd(se, 0x40) & 1u)) {
++		touch_wr(se, SE_M_CMD_CTRL, 4); /* cancel */
++		delay(100);
++		touch_wr(se, SE_M_CMD_CTRL, 2); /* abort */
++	}
++}
++
++/*
++ * Mode 7: the vendor focaltech_flash.c boot path.
++ *
++ * The FT8719 has no non-volatile application store. After reset its boot ROM
++ * listens on SPI; the vendor driver then downloads
++ * /vendor/firmware/focaltech_ts_fw.bin into PRAM before the touch application
++ * runs (FTS_AUTO_UPGRADE_EN=1 and FTS_FW_REQUEST_SUPPORT=1 in
++ * focaltech_config.h, and the OrangeFox "juice" recovery tree ships exactly
++ * that file). A chip left in boot ROM answers its status byte (0x08) to every
++ * package, which is what modes 4/6 observed.
++ *
++ * Protocol, from drivers/input/touchscreen/FT8719/focaltech_*.c at 02ca1a919564:
++ *  - fts_wait_idle(): poll the 0x05 status package before every package;
++ *    boot mode is idle at (status & 0x81) == 0x00, app mode at == 0x01.
++ *  - fts_enter_into_boot(): reset (1 ms low), 8 ms, write 0x55, 8 ms, read
++ *    0x90 into two bytes; 30 outer x 3 inner attempts.
++ *  - download: 0xAE, then a data package of addr[2:0] + len[1:0] + payload.
++ *  - fts_pram_start(): command 0x08, then app framing (length bytes + CRC).
++ * `setting_nf` for rom id 0x8719 is {app2 64K, ecclen 128K, delay 8, spi_pe,
++ * fd_check, no dram}: only the PRAM slice is written and the DRAM half is not
++ * used. The ECC self-check is skipped; the start is verified by reading the
++ * application chip id instead.
++ */
++#define CITRUS7_STATUS    0x05u
++#define CITRUS7_CMD       0xC0u
++#define CITRUS7_DATA      0x3Fu
++#define CITRUS7_READ      0xA0u
++#define CITRUS7_ROM_WRITE 0xAEu
++#define CITRUS7_ROM_START 0x08u
++#define CITRUS7_CHUNK     48u  /* FIFO is 16 x 4 B; packet stays at 14 words */
++#define CITRUS7_POLL_US   150u
++#define CITRUS7_POLLS     100u
++
++/* Vendor fts_wait_idle(): the status package is a 2-byte transaction. */
++static bool
++citrus7_wait_idle(vm_offset_t se, bool fw_running, uint8_t *out)
++{
++	uint8_t status = 0xff;
++	unsigned i;
++
++	for (i = 0; i < CITRUS7_POLLS; i++) {
++		delay(CITRUS7_POLL_US);
++		if (!citrus_fts_status(se, &status)) {
++			continue;
++		}
++		if ((status & 0x81u) == (fw_running ? 0x01u : 0x00u)) {
++			if (out) {
++				*out = status;
++			}
++			return true;
++		}
++	}
++	if (out) {
++		*out = status;
++	}
++	return false;
++}
++
++/* Vendor fts_boot_write(): idle, command package, idle, data package. */
++static bool
++citrus7_write(vm_offset_t se, uint8_t cmd, const uint8_t *data, unsigned dlen)
++{
++	uint8_t tx[CITRUS_FTS_MAX], rx[CITRUS_FTS_MAX];
++	unsigned n = 0;
++
++	if (dlen > CITRUS_FTS_MAX - 8u) {
++		return false;
++	}
++	if (!citrus7_wait_idle(se, false, NULL)) {
++		printf("CITRUS TOUCH: mode7 write %02x: chip never idle\n", cmd);
++		return false;
++	}
++	tx[n++] = CITRUS7_CMD;
++	tx[n++] = 0x00u | 1u; /* WRITE_CMD | one command byte */
++	tx[n++] = cmd;
++	if (!citrus_fts_xfer(se, tx, rx, n)) {
++		printf("CITRUS TOUCH: mode7 write %02x: command package failed\n", cmd);
++		return false;
++	}
++	if (!data || !dlen) {
++		return true;
++	}
++	if (!citrus7_wait_idle(se, false, NULL)) {
++		printf("CITRUS TOUCH: mode7 write %02x: busy before data\n", cmd);
++		return false;
++	}
++	memset(tx, 0, sizeof(tx));
++	memset(rx, 0, sizeof(rx));
++	n = 0;
++	tx[n++] = CITRUS7_DATA;
++	memcpy(tx + n, data, dlen);
++	n += dlen;
++	if (!citrus_fts_xfer(se, tx, rx, n)) {
++		printf("CITRUS TOUCH: mode7 write %02x: data package failed\n", cmd);
++		return false;
++	}
++	return true;
++}
++
++/* Vendor fts_read(): idle, command package, idle, data package with CRC. */
++static bool
++citrus7_read(vm_offset_t se, uint8_t cmd, uint8_t *data, unsigned dlen,
++    bool fw_running)
++{
++	uint8_t tx[CITRUS_FTS_MAX], rx[CITRUS_FTS_MAX];
++	uint16_t crc = 0, want;
++	unsigned n = 0, pkg;
++
++	if (dlen == 0 || dlen > 16u) {
++		return false;
++	}
++	pkg = 1u + (fw_running ? 2u : 0u);
++	if (!citrus7_wait_idle(se, fw_running, NULL)) {
++		return false;
++	}
++	tx[n++] = CITRUS7_CMD;
++	tx[n++] = (uint8_t)(CITRUS7_READ | pkg);
++	tx[n++] = cmd;
++	if (fw_running) {
++		tx[n++] = (uint8_t)(dlen >> 8);
++		tx[n++] = (uint8_t)(dlen & 0xffu);
++	}
++	if (!citrus_fts_xfer(se, tx, rx, n)) {
++		return false;
++	}
++	if (!citrus7_wait_idle(se, fw_running, NULL)) {
++		return false;
++	}
++	memset(tx, 0, sizeof(tx));
++	memset(rx, 0, sizeof(rx));
++	n = dlen + 3u; /* data package byte + payload + 2 CRC bytes */
++	tx[0] = CITRUS7_DATA;
++	if (!citrus_fts_xfer(se, tx, rx, n)) {
++		return false;
++	}
++	memcpy(data, rx + 1, dlen);
++	citrus_fts_crc(rx + 1, dlen, &crc);
++	want = (uint16_t)rx[dlen + 1] | ((uint16_t)rx[dlen + 2] << 8);
++	if (crc != want) {
++		printf("CITRUS TOUCH: mode7 read %02x crc=%#x/%#x raw=%02x %02x %02x %02x\n",
++		    cmd, crc, want, rx[0], rx[1], rx[2], rx[3]);
++		return false;
++	}
++	return true;
++}
++
++/* Reset with the vendor timing: 1 ms low, then settle. */
++static void
++citrus7_reset(vm_offset_t south, unsigned settle_ms)
++{
++	citrus_gpio(south, CITRUS_PIN_RESET, 0, 3, 8, true, false);
++	touch_wait(1);
++	citrus_gpio(south, CITRUS_PIN_RESET, 0, 3, 8, true, true);
++	touch_wait(settle_ms);
++}
++
++/* geni_se_io_init + SPI setup, identical to the working mode-4/6 path. */
++static void
++citrus7_se_init(vm_offset_t se)
++{
++	touch_wr(se, 0x28, touch_rd(se, 0x28) | 0x7fu);   /* GENI_CGC_CTRL */
++	touch_wr(se, 0xe30, touch_rd(se, 0xe30) | 0x0fu); /* DMA general cfg */
++	touch_wr(se, 0x24, 0x7fu);                        /* GENI_OUTPUT_CTRL */
++	touch_wr(se, 0x20, 1u);                           /* FORCE_DEFAULT */
++	delay(100);
++	touch_wr(se, 0xe18, 0);                           /* FIFO mode */
++	touch_wr(se, 0x640, 0xffffffffu);                 /* S_IRQ_CLEAR */
++	touch_wr(se, SE_M_IRQ_CLR, 0xffffffffu);
++	touch_wr(se, SE_DMA_MODE, 0);
++	touch_wr(se, SE_TX_PACK0, SE_PACKING_4X8_0);
++	touch_wr(se, SE_TX_PACK1, SE_PACKING_4X8_1);
++	touch_wr(se, SE_RX_PACK0, SE_PACKING_4X8_0);
++	touch_wr(se, SE_RX_PACK1, SE_PACKING_4X8_1);
++	touch_wr(se, SE_BYTE_GRAN, 0);
++	touch_wr(se, SE_SPI_WORD_LEN, 4);                 /* 8 bits - 4 */
++	touch_wr(se, SE_SPI_LOOPBACK, 0);
++	touch_wr(se, SE_SPI_DEMUX_SEL, 0);
++	touch_wr(se, SE_SPI_DEMUX_INV, 0);
++	touch_wr(se, SE_SPI_CPHA, 0);
++	touch_wr(se, SE_SPI_CPOL, 0);
++	touch_wr(se, SE_SPI_TRANS_CFG, 0);
++	touch_wr(se, SE_SPI_DELAYS, 0);
++	touch_wr(se, 0x810, 0);                           /* RX watermark */
++	touch_wr(se, 0x814, 14u);                         /* RX RFR watermark */
++	touch_wr(se, 0xe1c, 0x0cu);                       /* SE_IRQ_EN M|S */
++	touch_wr(se, SE_CLK_SEL, 2);                      /* 19.2 MHz DFS level */
++	touch_wr(se, SE_SER_M_CLK, 0x41u);                /* 19.2 / 4 = 4.8 MHz */
++	touch_wr(se, SE_M_IRQ_CLR, 0xffffffffu);
++	touch_wr(se, SE_M_IRQ_EN, SE_M_IRQ_DONE | SE_M_IRQ_ERR);
++	touch_wr(se, SE_TX_WM, 1);
++}
++
++/* Write the PRAM application slice, then start it. */
++static bool
++citrus7_download(vm_offset_t se)
++{
++	uint32_t addr = 0;
++	unsigned packets = 0;
++
++	while (addr < citrus_ft8719_fw_len) {
++		uint8_t pkt[5u + CITRUS7_CHUNK];
++		unsigned n = citrus_ft8719_fw_len - addr;
++
++		if (n > CITRUS7_CHUNK) {
++			n = CITRUS7_CHUNK;
++		}
++		pkt[0] = (uint8_t)(addr >> 16);
++		pkt[1] = (uint8_t)(addr >> 8);
++		pkt[2] = (uint8_t)addr;
++		pkt[3] = (uint8_t)(n >> 8);
++		pkt[4] = (uint8_t)(n & 0xffu);
++		memcpy(pkt + 5, citrus_ft8719_fw + addr, n);
++		if (!citrus7_write(se, CITRUS7_ROM_WRITE, pkt, n + 5u)) {
++			printf("CITRUS TOUCH: mode7 fw write failed at %#x (%u/%u)\n",
++			    addr, addr, citrus_ft8719_fw_len);
++			return false;
++		}
++		addr += n;
++		if ((++packets & 0x7fu) == 0) {
++			printf("CITRUS TOUCH: mode7 fw %u/%u\n", addr,
++			    citrus_ft8719_fw_len);
++			touch_wait(0); /* yield; do not spin the CPU for seconds */
++		}
++	}
++	return true;
++}
++
++/* Mode 7 entry: pads, reset, boot handshake, firmware, application id. */
++static void
++citrus_touch_vendor_bringup(void)
++{
++	vm_offset_t west, south, se;
++	uint8_t status = 0xff, id[2] = {0, 0};
++	bool boot = false;
++	unsigned attempt, inner;
++
++	west = ml_io_map(CITRUS_WEST_PA, 0x80000);
++	south = ml_io_map(CITRUS_SOUTH_PA, 0x80000);
++	se = ml_io_map(0x04a88000u, 0x4000);
++	if (!west || !south || !se) {
++		printf("CITRUS TOUCH: mode7 mapping failed west=%d south=%d se=%d\n",
++		    west != 0, south != 0, se != 0);
++		return;
++	}
++	/* MOSI/MISO/CLK and CS0 are QUP0 SE2 mux 1; the live DTB gives pins
++	 * 6/7/71 and 80, pull-down, 6 mA. INT is GPIO93 and reset GPIO103;
++	 * the pmx_ts_* pinctrl groups name stale pins 80/71 and are not used. */
++	citrus_gpio(west, CITRUS_PIN_MOSI, 1, 1, 3, false, false);
++	citrus_gpio(west, CITRUS_PIN_MISO, 1, 1, 3, false, false);
++	citrus_gpio(west, CITRUS_PIN_CLK,  1, 1, 3, false, false);
++	citrus_gpio(west, CITRUS_PIN_CS0,  1, 3, 3, false, false);
++	citrus_gpio(west, CITRUS_PIN_IRQ,  0, 3, 8, false, false);
++	citrus7_reset(south, 12);
++	printf("CITRUS TOUCH: mode7 pads irq93=%#x reset103=%#x/%#x\n",
++	    touch_rd(west, CITRUS_GPIO_IO(CITRUS_PIN_IRQ)),
++	    touch_rd(south, CITRUS_GPIO_CFG(CITRUS_PIN_RESET)),
++	    touch_rd(south, CITRUS_GPIO_IO(CITRUS_PIN_RESET)));
++	citrus7_se_init(se);
++	if (citrus7_wait_idle(se, false, &status)) {
++		printf("CITRUS TOUCH: mode7 pre-handshake status=%#x (boot idle)\n",
++		    status);
++	} else {
++		printf("CITRUS TOUCH: mode7 pre-handshake status=%#x (not boot idle)\n",
++		    status);
++	}
++	/* fts_enter_into_boot(): 30 outer attempts, 3 reads each, reset per try. */
++	for (attempt = 0; attempt < 30 && !boot; attempt++) {
++		uint8_t last[2] = {0xee, 0xee};
++		bool got = false;
++
++		citrus7_reset(south, 8);
++		for (inner = 0; inner < 3 && !boot; inner++) {
++			uint8_t id2[2] = {0, 0};
++
++			if (!citrus7_write(se, 0x55, NULL, 0)) {
++				continue;
++			}
++			touch_wait(8);
++			if (!citrus7_read(se, 0x90, id2, 2, false)) {
++				continue;
++			}
++			last[0] = id2[0];
++			last[1] = id2[1];
++			got = true;
++			if (id2[0] == 0x87 && (id2[1] == 0x19 || id2[1] == 0xa9 ||
++			    id2[1] == 0xb9)) {
++				id[0] = id2[0];
++				id[1] = id2[1];
++				boot = true;
++			}
++		}
++		printf("CITRUS TOUCH: mode7 enter-boot try=%u id=%02x%02x ok=%d\n",
++		    attempt, last[0], last[1], got);
++	}
++	if (!boot) {
++		printf("CITRUS TOUCH: mode7 boot ROM never returned an FT8719 id;"
++		    " no download\n");
++		if (citrus7_wait_idle(se, true, &status)) {
++			printf("CITRUS TOUCH: mode7 app-idle status=%#x\n", status);
++		} else {
++			printf("CITRUS TOUCH: mode7 status=%#x (neither mode idle)\n",
++			    status);
++		}
++		goto out;
++	}
++	printf("CITRUS TOUCH: mode7 boot ROM id=%02x%02x; downloading %u bytes\n",
++	    id[0], id[1], citrus_ft8719_fw_len);
++	if (!citrus7_download(se)) {
++		goto out;
++	}
++	printf("CITRUS TOUCH: mode7 pram written; starting application\n");
++	if (!citrus7_write(se, CITRUS7_ROM_START, NULL, 0)) {
++		goto out;
++	}
++	touch_wait(50);
++	if (citrus7_wait_idle(se, true, &status)) {
++		printf("CITRUS TOUCH: mode7 application idle status=%#x\n", status);
++	} else {
++		printf("CITRUS TOUCH: mode7 application not idle status=%#x\n", status);
++	}
++	{
++		uint8_t chip = 0, fwver = 0;
++		bool a = citrus7_read(se, 0xa3, &chip, 1, true); /* chip id */
++		bool b = a && citrus7_read(se, 0xa6, &fwver, 1, true);
++
++		printf("CITRUS TOUCH: mode7 app chip=%#x ok=%d fw=%#x ok=%d\n",
++		    chip, a, fwver, b);
++	}
++	printf("CITRUS TOUCH: mode7 irq93=%#x\n",
++	    touch_rd(west, CITRUS_GPIO_IO(CITRUS_PIN_IRQ)));
++out:
++	touch_wr(se, SE_M_IRQ_CLR, 0xffffffffu);
++	touch_wr(se, SE_TX_WM, 0);
++}
++
++/*
++ * Mode 8: discriminate where the 0x08/0xEEEE boot-ID answer comes from.
++ *
++ * touchprobe15 proved the status byte changes from 0x00 (fresh reset) to 0x08
++ * as soon as a 0x55 start command is sent, so CS/clock/MOSI are not obviously
++ * dead. Mode 8 runs four handshake variants and then repeats the same
++ * handshake by bit-banging GPIO6/7/71/80, with no GENI involvement:
++ *   A  probe path  : 0x55 + data 0xAA, 12 ms, read 0x90 (1-byte command)
++ *   A4             : same, but 0x90 00 00 00 (non-incell command length)
++ *   B  upgrade path: 0x55 alone, 8 ms, read 0x90
++ *   C  float test  : reset held low, status + 0x90 while the IC is off
++ *   D  no start    : reset released, read 0x90 without any start command
++ *   BB bit-bang    : A repeated on plain GPIO, 500 kHz, manual CS
++ * If C still reads 0x08 the value is an artefact, not the chip. If BB returns
++ * 0x8719 the GENI setup is wrong; if BB also returns 0x08 the IC is not
++ * executing the handshake (CS/MOSI/power or a different boot protocol).
++ */
++#define CITRUS8_BB_MOSI CITRUS_PIN_MOSI
++#define CITRUS8_BB_MISO CITRUS_PIN_MISO
++#define CITRUS8_BB_CLK  CITRUS_PIN_CLK
++#define CITRUS8_BB_CS   CITRUS_PIN_CS0
++
++/* Clear whatever ABL or a failed submission left active in the sequencer. */
++static void
++citrus_touch_se_recover(vm_offset_t se)
++{
++	unsigned i;
++
++	if (!(touch_rd(se, 0x40) & 1u)) {
++		return;
++	}
++	touch_wr(se, SE_M_CMD_CTRL, 4u); /* cancel */
++	for (i = 0; i < 200 && !(touch_rd(se, SE_M_IRQ) & (1u << 4)); i++) {
++		delay(100);
++	}
++	touch_wr(se, SE_M_CMD_CTRL, 2u); /* abort */
++	for (i = 0; i < 200 && !(touch_rd(se, SE_M_IRQ) & (1u << 5)); i++) {
++		delay(100);
++	}
++	touch_wr(se, SE_M_IRQ_CLR, 0xffffffffu);
++	touch_wr(se, SE_TX_WM, 1);
++	printf("CITRUS TOUCH: mode8 recover status=%#x irq=%#x\n",
++	    touch_rd(se, 0x40), touch_rd(se, SE_M_IRQ));
++}
++
++/* One status package, raw, no idle wait: prints both reply bytes. */
++static void
++citrus8_status(vm_offset_t se, const char *tag)
++{
++	static const uint8_t tx[2] = {CITRUS7_STATUS, 0x00};
++	uint8_t rx[2] = {0, 0};
++
++	if (citrus_fts_xfer(se, tx, rx, sizeof(tx))) {
++		printf("CITRUS TOUCH: mode8 %s status=%02x %02x\n", tag, rx[0], rx[1]);
++	} else {
++		printf("CITRUS TOUCH: mode8 %s status: transfer failed\n", tag);
++	}
++}
++
++/* Read package, raw, prints every received byte. */
++static void
++citrus8_read(vm_offset_t se, const char *tag, uint8_t cmd, unsigned cmdlen,
++    unsigned dlen, bool fw_running)
++{
++	uint8_t tx[CITRUS_FTS_MAX] = {0}, rx[CITRUS_FTS_MAX] = {0};
++	unsigned n = 0, i;
++
++	if (cmdlen == 0 || cmdlen > 4 || dlen == 0 || dlen > 8) {
++		printf("CITRUS TOUCH: mode8 %s: bad lengths\n", tag);
++		return;
++	}
++	tx[n++] = CITRUS7_CMD;
++	tx[n++] = (uint8_t)(CITRUS7_READ | (cmdlen + (fw_running ? 2u : 0u)));
++	for (i = 0; i < cmdlen; i++) {
++		tx[n++] = (i == 0) ? cmd : 0;
++	}
++	if (fw_running) {
++		tx[n++] = (uint8_t)(dlen >> 8);
++		tx[n++] = (uint8_t)(dlen & 0xffu);
++	}
++	if (!citrus_fts_xfer(se, tx, rx, n)) {
++		printf("CITRUS TOUCH: mode8 %s: command phase failed\n", tag);
++		return;
++	}
++	touch_wait(1);
++	memset(tx, 0, sizeof(tx));
++	memset(rx, 0, sizeof(rx));
++	n = dlen + 3u;
++	tx[0] = CITRUS7_DATA;
++	if (!citrus_fts_xfer(se, tx, rx, n)) {
++		printf("CITRUS TOUCH: mode8 %s: data phase failed\n", tag);
++		return;
++	}
++	printf("CITRUS TOUCH: mode8 %s:", tag);
++	for (i = 0; i < dlen + 3u; i++) {
++		printf(" %02x", rx[i]);
++	}
++	printf("\n");
++}
++
++/* Bit-bang: plain GPIO, mode 0, manual CS. */
++static void
++citrus8_bb_set(vm_offset_t west, unsigned pin, bool out, bool high)
++{
++	citrus_gpio(west, pin, 0, 3, 3, out, high);
++}
++
++static uint8_t
++citrus8_bb_byte(vm_offset_t west, unsigned mosi, unsigned miso,
++    uint8_t value, bool cpha1)
++{
++	uint8_t rx = 0;
++	int bit;
++
++	for (bit = 7; bit >= 0; bit--) {
++		if (!cpha1) {
++			citrus8_bb_set(west, mosi, true, (value >> bit) & 1u);
++			delay(1);
++			citrus8_bb_set(west, CITRUS8_BB_CLK, true, true);
++			delay(1);
++			rx = (uint8_t)((rx << 1) |
++			    (touch_rd(west, CITRUS_GPIO_IO(miso)) & 1u));
++			citrus8_bb_set(west, CITRUS8_BB_CLK, true, false);
++			delay(1);
++		} else {
++			citrus8_bb_set(west, CITRUS8_BB_CLK, true, true);
++			delay(1);
++			citrus8_bb_set(west, mosi, true, (value >> bit) & 1u);
++			delay(1);
++			citrus8_bb_set(west, CITRUS8_BB_CLK, true, false);
++			delay(1);
++			rx = (uint8_t)((rx << 1) |
++			    (touch_rd(west, CITRUS_GPIO_IO(miso)) & 1u));
++		}
++	}
++	return rx;
++}
++
++static void
++citrus8_bb_xfer(vm_offset_t west, unsigned mosi, unsigned miso, const char *tag,
++    const uint8_t *tx, unsigned n, uint8_t *rx, bool cpha1)
++{
++	unsigned i;
++
++	citrus8_bb_set(west, CITRUS8_BB_CS, true, false); /* select */
++	delay(2);
++	for (i = 0; i < n; i++) {
++		rx[i] = citrus8_bb_byte(west, mosi, miso, tx[i], cpha1);
++		if (i == 0 && n > 1) {
++			delay(30);
++		}
++	}
++	citrus8_bb_set(west, CITRUS8_BB_CS, true, true); /* deselect */
++	delay(150);
++	printf("CITRUS TOUCH: mode8 %s bb:", tag);
++	for (i = 0; i < n; i++) {
++		printf(" %02x", rx[i]);
++	}
++	printf("\n");
++}
++
++/* Pull test: a pad driven by the IC ignores a weak pull, a floating pad
++ * follows it. This finds the IC's MISO output without driving any pad. */
++static void
++citrus8_levels(vm_offset_t west, const char *tag)
++{
++	static const unsigned pins[] = {CITRUS_PIN_MOSI, CITRUS_PIN_MISO,
++	    CITRUS_PIN_CLK, CITRUS_PIN_CS0, CITRUS_PIN_IRQ};
++	static const unsigned pulls[] = {0u, 1u, 3u}; /* none, down, up */
++	unsigned p, k, v[3];
++
++	printf("CITRUS TOUCH: mode8 levels %s\n", tag);
++	for (p = 0; p < sizeof(pins) / sizeof(pins[0]); p++) {
++		for (k = 0; k < 3; k++) {
++			citrus_gpio(west, pins[p], 0, pulls[k], 3, false, false);
++			delay(50);
++			v[k] = touch_rd(west, CITRUS_GPIO_IO(pins[p])) & 1u;
++		}
++		printf("   gpio%u none=%u down=%u up=%u%s\n", pins[p], v[0], v[1],
++		    v[2], (v[1] == v[2]) ? " DRIVEN" : "");
++	}
++}
++
++static void
++citrus_touch_bitbang_probe(void)
++{
++	vm_offset_t west, south;
++	static const uint8_t start[2] = {CITRUS7_STATUS, 0x00};
++	static const uint8_t boot_cmd[3] = {CITRUS7_CMD, 0x01, 0x55};
++	static const uint8_t boot_data[2] = {CITRUS7_DATA, 0xaa};
++	static const uint8_t rd_cmd[3] = {CITRUS7_CMD, 0xa1, 0x90};
++	static const uint8_t rd_data[5] = {CITRUS7_DATA, 0, 0, 0, 0};
++	unsigned mosi = CITRUS_PIN_MOSI, miso = CITRUS_PIN_MISO;
++	unsigned p, v[3];
++	uint8_t rx[8];
++
++	west = ml_io_map(CITRUS_WEST_PA, 0x80000);
++	south = ml_io_map(CITRUS_SOUTH_PA, 0x80000);
++	if (!west || !south) {
++		printf("CITRUS TOUCH: mode8 bit-bang mapping failed\n");
++		return;
++	}
++	/* The IC's MISO is the pad that ignores the pull. If the data pins are
++	 * the other way round, follow the hardware instead of the assumption. */
++	for (p = 0; p < 2; p++) {
++		unsigned pin = p == 0 ? CITRUS_PIN_MOSI : CITRUS_PIN_MISO;
++		citrus_gpio(west, pin, 0, 1, 3, false, false);
++		delay(50);
++		v[1] = touch_rd(west, CITRUS_GPIO_IO(pin)) & 1u;
++		citrus_gpio(west, pin, 0, 3, 3, false, false);
++		delay(50);
++		v[2] = touch_rd(west, CITRUS_GPIO_IO(pin)) & 1u;
++		if (v[1] == v[2] && pin == CITRUS_PIN_MOSI) {
++			miso = CITRUS_PIN_MOSI;
++			mosi = CITRUS_PIN_MISO;
++		}
++	}
++	printf("CITRUS TOUCH: mode8 bit-bang roles mosi=%u miso=%u\n", mosi, miso);
++
++	citrus8_bb_set(west, mosi, true, false);
++	citrus8_bb_set(west, CITRUS8_BB_CLK, true, false);
++	citrus8_bb_set(west, CITRUS8_BB_CS, true, true); /* deselected */
++	citrus8_bb_set(west, miso, false, false);
++	citrus7_reset(south, 20);
++	printf("CITRUS TOUCH: mode8 bit-bang start irq93=%#x\n",
++	    touch_rd(west, CITRUS_GPIO_IO(CITRUS_PIN_IRQ)) & 1u);
++	citrus8_bb_xfer(west, mosi, miso, "status c0", start, 2, rx, false);
++	citrus8_bb_xfer(west, mosi, miso, "status c1", start, 2, rx, true);
++	citrus8_bb_xfer(west, mosi, miso, "start55", boot_cmd, 3, rx, false);
++	delay(30);
++	citrus8_bb_xfer(west, mosi, miso, "dataAA", boot_data, 2, rx, false);
++	touch_wait(12);
++	citrus8_bb_xfer(west, mosi, miso, "read90", rd_cmd, 3, rx, false);
++	citrus8_bb_xfer(west, mosi, miso, "read90d", rd_data, 5, rx, false);
++	printf("CITRUS TOUCH: mode8 bit-bang done irq93=%#x\n",
++	    touch_rd(west, CITRUS_GPIO_IO(CITRUS_PIN_IRQ)) & 1u);
++}
++
++static void
++citrus_touch_handshake_variants(void)
++{
++	vm_offset_t west, south, se;
++
++	west = ml_io_map(CITRUS_WEST_PA, 0x80000);
++	south = ml_io_map(CITRUS_SOUTH_PA, 0x80000);
++	se = ml_io_map(0x04a88000u, 0x4000);
++	if (!west || !south || !se) {
++		printf("CITRUS TOUCH: mode8 mapping failed\n");
++		return;
++	}
++	/* All four SPI pads and the IRQ pad as plain inputs first: what does the
++	 * IC drive while it is out of reset and while it is held in reset? */
++	citrus_gpio(west, CITRUS_PIN_MOSI, 0, 0, 3, false, false);
++	citrus_gpio(west, CITRUS_PIN_MISO, 0, 0, 3, false, false);
++	citrus_gpio(west, CITRUS_PIN_CLK,  0, 0, 3, false, false);
++	citrus_gpio(west, CITRUS_PIN_CS0,  0, 0, 3, false, false);
++	citrus_gpio(west, CITRUS_PIN_IRQ,  0, 0, 8, false, false);
++	citrus_gpio(south, CITRUS_PIN_RESET, 0, 3, 8, true, true);
++	touch_wait(200);
++	citrus8_levels(west, "out-of-reset");
++	citrus_gpio(south, CITRUS_PIN_RESET, 0, 3, 8, true, false);
++	touch_wait(50);
++	citrus8_levels(west, "held-in-reset");
++	citrus_gpio(south, CITRUS_PIN_RESET, 0, 3, 8, true, true);
++	touch_wait(200);
++
++	/* Now the GENI path again, with the SE properly initialised. */
++	citrus_gpio(west, CITRUS_PIN_MOSI, 1, 1, 3, false, false);
++	citrus_gpio(west, CITRUS_PIN_MISO, 1, 1, 3, false, false);
++	citrus_gpio(west, CITRUS_PIN_CLK,  1, 1, 3, false, false);
++	citrus_gpio(west, CITRUS_PIN_CS0,  1, 3, 3, false, false);
++	citrus_gpio(west, CITRUS_PIN_IRQ,  0, 3, 8, false, false);
++	citrus7_se_init(se);
++	citrus_touch_se_recover(se);
++	citrus8_status(se, "geni+reset");
++	citrus8_read(se, "geni read90", 0x90, 1, 2, false);
++	citrus8_status(se, "geni again");
++	touch_wr(se, SE_M_IRQ_CLR, 0xffffffffu);
++	touch_wr(se, SE_TX_WM, 0);
++}
++
++/*
++ * Mode 9: bit-bang bring-up. touchprobe17 proved the transport and the pin
++ * roles: the FT8719's MISO is GPIO6 and its MOSI is GPIO7 (the board crosses
++ * the QUP2 data pair relative to our earlier assumption), CLK is GPIO71, CS0
++ * is GPIO80, reset is GPIO103. A 300 kHz bit-bang handshake returned
++ * 87 19 3c bc (FT8719 boot id plus a valid CRC16/0xbc3c) where GENI returned
++ * 08 08 08 08. So mode 9 uses plain GPIO for the whole vendor boot path:
++ * 0x55+0xAA -> 0x90 id -> PRAM download (0xAE packets) -> 0x08 start app ->
++ * application chip/firmware id.
++ */
++#define CITRUS9_MOSI 7u
++#define CITRUS9_MISO 6u
++#define CITRUS9_CHUNK 48u
++
++/* Fast bit-bang byte: the pads are already muxed to GPIO and set as outputs,
++ * so only the output latch (IO bit 1) changes per bit. citrus_gpio() would
++ * rewrite the configuration and take a dsb per bit; at ~300 kHz that made a
++ * 90-byte report read cost milliseconds and starved the rest of the kernel. */
++static uint8_t
++citrus9_bb_byte(vm_offset_t west, unsigned mosi, unsigned miso, uint8_t value)
++{
++	uint8_t rx = 0;
++	int bit;
++
++	for (bit = 7; bit >= 0; bit--) {
++		touch_wr(west, CITRUS_GPIO_IO(mosi),
++		    (value >> bit) & 1u ? 2u : 0u);
++		touch_wr(west, CITRUS_GPIO_IO(CITRUS8_BB_CLK), 2u);
++		rx = (uint8_t)((rx << 1) |
++		    (touch_rd(west, CITRUS_GPIO_IO(miso)) & 1u));
++		touch_wr(west, CITRUS_GPIO_IO(CITRUS8_BB_CLK), 0u);
++	}
++	return rx;
++}
++
++/* One package, quiet: CS low, first byte, 30 us, rest, CS high. */
++static bool
++citrus9_pkg(vm_offset_t west, const uint8_t *tx, unsigned n, uint8_t *rx)
++{
++	unsigned i;
++
++	if (n == 0 || n > CITRUS_FTS_MAX) {
++		return false;
++	}
++	citrus8_bb_set(west, CITRUS8_BB_CS, true, false);
++	delay(2);
++	for (i = 0; i < n; i++) {
++		rx[i] = citrus9_bb_byte(west, CITRUS9_MOSI, CITRUS9_MISO, tx[i]);
++		if (i == 0 && n > 1) {
++			delay(30);
++		}
++	}
++	citrus8_bb_set(west, CITRUS8_BB_CS, true, true);
++	delay(150);
++	return true;
++}
++
++/* Vendor fts_wait_idle() over bit-bang. */
++static bool
++citrus9_idle(vm_offset_t west, bool fw_running, uint8_t *out)
++{
++	uint8_t tx[2] = {CITRUS7_STATUS, 0x00};
++	uint8_t rx[2] = {0, 0};
++	unsigned i;
++
++	for (i = 0; i < 50; i++) {
++		if (!citrus9_pkg(west, tx, 2, rx)) {
++			return false;
++		}
++		if ((rx[1] & 0x81u) == (fw_running ? 0x01u : 0x00u)) {
++			if (out) {
++				*out = rx[1];
++			}
++			return true;
++		}
++		delay(150);
++	}
++	return false;
++}
++
++/*
++ * Vendor fts_write(): while the IC is in boot ROM, 0xAE/0x85/0xF2 carry six
++ * command bytes and 0xCC carries seven, i.e. the address/length parameters
++ * travel in the COMMAND package, and only the remaining bytes go in the data
++ * package. 0xAE with one command byte (what modes 7/9 v1 sent) is malformed:
++ * the ROM sees an address and length of zero.
++ */
++static bool
++citrus9_write(vm_offset_t west, uint8_t cmd, const uint8_t *data,
++    unsigned dlen, bool fw_running)
++{
++	uint8_t tx[CITRUS_FTS_MAX], rx[CITRUS_FTS_MAX];
++	unsigned cmdlen = 1, param, payload, n = 0;
++
++	if (!fw_running) {
++		if (cmd == 0xae || cmd == 0x85 || cmd == 0xf2) {
++			cmdlen = 6;
++		} else if (cmd == 0xcc) {
++			cmdlen = 7;
++		}
++	}
++	param = cmdlen - 1u;
++	if (dlen < param || dlen > CITRUS_FTS_MAX - 8u) {
++		return false;
++	}
++	payload = dlen - param;
++	if (!citrus9_idle(west, fw_running, NULL)) {
++		return false;
++	}
++	tx[n++] = CITRUS7_CMD;
++	tx[n++] = (uint8_t)(0x00u | cmdlen);
++	tx[n++] = cmd;
++	for (unsigned i = 0; i < param; i++) {
++		tx[n++] = data[i];
++	}
++	if (!citrus9_pkg(west, tx, n, rx)) {
++		return false;
++	}
++	if (!payload) {
++		return true;
++	}
++	if (!citrus9_idle(west, fw_running, NULL)) {
++		return false;
++	}
++	memset(tx, 0, sizeof(tx));
++	n = 0;
++	tx[n++] = CITRUS7_DATA;
++	memcpy(tx + n, data + param, payload);
++	n += payload;
++	return citrus9_pkg(west, tx, n, rx);
++}
++
++static bool
++citrus9_read(vm_offset_t west, uint8_t cmd, uint8_t *data, unsigned dlen,
++    bool fw_running)
++{
++	uint8_t tx[CITRUS_FTS_MAX], rx[CITRUS_FTS_MAX];
++	uint16_t crc = 0, want;
++	unsigned n = 0;
++
++	if (dlen == 0 || dlen > 16u) {
++		return false;
++	}
++	if (!citrus9_idle(west, fw_running, NULL)) {
++		printf("CITRUS TOUCH: mode9 read %02x: never idle\n", cmd);
++		return false;
++	}
++	tx[n++] = CITRUS7_CMD;
++	tx[n++] = (uint8_t)(CITRUS7_READ | (1u + (fw_running ? 2u : 0u)));
++	tx[n++] = cmd;
++	if (fw_running) {
++		tx[n++] = (uint8_t)(dlen >> 8);
++		tx[n++] = (uint8_t)(dlen & 0xffu);
++	}
++	if (!citrus9_pkg(west, tx, n, rx)) {
++		return false;
++	}
++	if (!citrus9_idle(west, fw_running, NULL)) {
++		printf("CITRUS TOUCH: mode9 read %02x: busy\n", cmd);
++		return false;
++	}
++	memset(tx, 0, sizeof(tx));
++	memset(rx, 0, sizeof(rx));
++	n = dlen + 3u;
++	tx[0] = CITRUS7_DATA;
++	if (!citrus9_pkg(west, tx, n, rx)) {
++		return false;
++	}
++	memcpy(data, rx + 1, dlen);
++	citrus_fts_crc(rx + 1, dlen, &crc);
++	want = (uint16_t)rx[dlen + 1] | ((uint16_t)rx[dlen + 2] << 8);
++	if (crc != want) {
++		printf("CITRUS TOUCH: mode9 read %02x crc=%#x/%#x raw=%02x %02x %02x %02x %02x\n",
++		    cmd, crc, want, rx[0], rx[1], rx[2], rx[3], rx[4]);
++		return false;
++	}
++	return true;
++}
++
++/* Status package, raw, no idle gate. */
++static void
++citrus9_status_raw(vm_offset_t west, const char *tag)
++{
++	uint8_t tx[2] = {CITRUS7_STATUS, 0x00};
++	uint8_t rx[2] = {0, 0};
++
++	if (citrus9_pkg(west, tx, 2, rx)) {
++		printf("CITRUS TOUCH: mode9 %s status=%02x %02x\n", tag, rx[0],
++		    rx[1]);
++	} else {
++		printf("CITRUS TOUCH: mode9 %s status: failed\n", tag);
++	}
++}
++
++/* Read package, raw: no idle gate, no CRC check, prints every byte. */
++static void
++citrus9_read_raw(vm_offset_t west, const char *tag, uint8_t cmd, unsigned cmdlen,
++    unsigned dlen, bool fw_running)
++{
++	uint8_t tx[16] = {0}, rx[16] = {0};
++	unsigned n = 0, i;
++
++	if (cmdlen == 0 || cmdlen > 4 || dlen == 0 || dlen > 8) {
++		return;
++	}
++	tx[n++] = CITRUS7_CMD;
++	tx[n++] = (uint8_t)(CITRUS7_READ | (cmdlen + (fw_running ? 2u : 0u)));
++	for (i = 0; i < cmdlen; i++) {
++		tx[n++] = (i == 0) ? cmd : 0;
++	}
++	if (fw_running) {
++		tx[n++] = (uint8_t)(dlen >> 8);
++		tx[n++] = (uint8_t)(dlen & 0xffu);
++	}
++	if (!citrus9_pkg(west, tx, n, rx)) {
++		return;
++	}
++	memset(tx, 0, sizeof(tx));
++	memset(rx, 0, sizeof(rx));
++	n = dlen + 3u;
++	tx[0] = CITRUS7_DATA;
++	if (!citrus9_pkg(west, tx, n, rx)) {
++		return;
++	}
++	printf("CITRUS TOUCH: mode9 %s raw:", tag);
++	for (i = 0; i < n; i++) {
++		printf(" %02x", rx[i]);
+ 	}
++	printf("\n");
++}
++
++/* Vendor fts_ecc_cal_host(): 16-bit-word CRC with poly 0x8408. */
++static uint16_t
++citrus9_ecc_host(const uint8_t *data, unsigned len)
++{
++	uint16_t ecc = 0;
++	unsigned i;
++	int j;
++
++	for (i = 0; i + 1u < len; i += 2) {
++		ecc ^= (uint16_t)(((uint16_t)data[i] << 8) | data[i + 1]);
++		for (j = 0; j < 16; j++) {
++			ecc = (ecc & 1u) ? (uint16_t)((ecc >> 1) ^ 0x8408u)
++					 : (uint16_t)(ecc >> 1);
++		}
++	}
++	return ecc;
++}
++
++/* Vendor fts_ecc_cal_tp(): 0xCC range, poll 0xCE == eccok, read 0xCD. */
++static bool
++citrus9_ecc_tp(vm_offset_t west, uint32_t addr, uint32_t len, uint16_t *out)
++{
++	uint8_t arg[6], v = 0xff, val[2] = {0, 0};
++	unsigned i;
++
++	arg[0] = (uint8_t)(addr >> 16);
++	arg[1] = (uint8_t)(addr >> 8);
++	arg[2] = (uint8_t)addr;
++	arg[3] = (uint8_t)(len >> 16);
++	arg[4] = (uint8_t)(len >> 8);
++	arg[5] = (uint8_t)len;
++	if (!citrus9_write(west, 0xcc, arg, sizeof(arg), false)) {
++		printf("CITRUS TOUCH: mode9 ecc command failed\n");
++		return false;
++	}
++	delay(2000);
++	for (i = 0; i < 100; i++) {
++		if (!citrus9_read(west, 0xce, &v, 1, false)) {
++			printf("CITRUS TOUCH: mode9 ecc finish read failed\n");
++			return false;
++		}
++		if (v == 0x00) {
++			break;
++		}
++		touch_wait(1);
++	}
++	if (i >= 100) {
++		printf("CITRUS TOUCH: mode9 ecc finish timeout value=%#x\n", v);
++		return false;
++	}
++	if (!citrus9_read(west, 0xcd, val, 2, false)) {
++		printf("CITRUS TOUCH: mode9 ecc value read failed\n");
++		return false;
++	}
++	*out = (uint16_t)(((uint16_t)val[0] << 8) | val[1]);
++	return true;
++}
++
++static bool
++citrus9_download(vm_offset_t west)
++{
++	uint32_t addr = 0;
++	unsigned packets = 0;
++
++	while (addr < citrus_ft8719_fw_len) {
++		uint8_t pkt[5u + CITRUS9_CHUNK];
++		unsigned n = citrus_ft8719_fw_len - addr;
++
++		if (n > CITRUS9_CHUNK) {
++			n = CITRUS9_CHUNK;
++		}
++		pkt[0] = (uint8_t)(addr >> 16);
++		pkt[1] = (uint8_t)(addr >> 8);
++		pkt[2] = (uint8_t)addr;
++		pkt[3] = (uint8_t)(n >> 8);
++		pkt[4] = (uint8_t)(n & 0xffu);
++		memcpy(pkt + 5, citrus_ft8719_fw + addr, n);
++		if (!citrus9_write(west, CITRUS7_ROM_WRITE, pkt, n + 5u, false)) {
++			printf("CITRUS TOUCH: mode9 fw write failed at %#x\n", addr);
++			return false;
++		}
++		addr += n;
++		if ((++packets & 0x7fu) == 0) {
++			printf("CITRUS TOUCH: mode9 fw %u/%u\n", addr,
++			    citrus_ft8719_fw_len);
++			touch_wait(0);
++		}
++	}
++	return true;
++}
++
++static bool
++citrus_touch_bitbang_bringup(void)
++{
++	vm_offset_t west, south;
++	uint8_t status = 0xff, id[2] = {0, 0};
++	uint8_t chip = 0, fwver = 0;
++	bool ok;
++
++	west = ml_io_map(CITRUS_WEST_PA, 0x80000);
++	south = ml_io_map(CITRUS_SOUTH_PA, 0x80000);
++	if (!west || !south) {
++		printf("CITRUS TOUCH: mode9 mapping failed\n");
++		return false;
++	}
++	citrus8_bb_set(west, CITRUS9_MOSI, true, false);
++	citrus8_bb_set(west, CITRUS8_BB_CLK, true, false);
++	citrus8_bb_set(west, CITRUS8_BB_CS, true, true);
++	citrus8_bb_set(west, CITRUS9_MISO, false, false);
++	citrus7_reset(south, 20);
++	printf("CITRUS TOUCH: mode9 start mosi=7 miso=6 cs=80 clk=71 irq93=%#x\n",
++	    touch_rd(west, CITRUS_GPIO_IO(CITRUS_PIN_IRQ)) & 1u);
++	if (!citrus9_idle(west, false, &status)) {
++		printf("CITRUS TOUCH: mode9 chip never idle (status=%#x)\n", status);
++		return false;
++	}
++	printf("CITRUS TOUCH: mode9 boot status=%#x\n", status);
++	{
++		static const uint8_t start = 0xaa;
++		if (!citrus9_write(west, 0x55, &start, 1, false)) {
++			printf("CITRUS TOUCH: mode9 boot start failed\n");
++			return false;
++		}
++		touch_wait(12);
++		if (!citrus9_read(west, 0x90, id, 2, false)) {
++			printf("CITRUS TOUCH: mode9 boot id read failed\n");
++			return false;
++		}
++		printf("CITRUS TOUCH: mode9 boot id=%02x%02x\n", id[0], id[1]);
++	}
++	if (id[0] != 0x87) {
++		printf("CITRUS TOUCH: mode9 not an FT8719; stopping\n");
++		return false;
++	}
++	printf("CITRUS TOUCH: mode9 downloading %u bytes\n", citrus_ft8719_fw_len);
++	if (!citrus9_download(west)) {
++		return false;
++	}
++	printf("CITRUS TOUCH: mode9 pram done\n");
++	{
++		uint16_t host = citrus9_ecc_host(citrus_ft8719_fw,
++		    citrus_ft8719_fw_len);
++		uint16_t tp = 0;
++		bool e = citrus9_ecc_tp(west, 0, citrus_ft8719_fw_len, &tp);
++
++		printf("CITRUS TOUCH: mode9 ecc host=%#x tp=%#x ok=%d match=%d\n",
++		    host, tp, e, e && host == tp);
++	}
++	touch_wait(20);
++	citrus9_status_raw(west, "pre-start");
++	printf("CITRUS TOUCH: mode9 starting app\n");
++	if (!citrus9_write(west, CITRUS7_ROM_START, NULL, 0, false)) {
++		printf("CITRUS TOUCH: mode9 start app command failed\n");
++		return false;
++	}
++	touch_wait(10);
++	citrus9_status_raw(west, "start+10ms");
++	touch_wait(40);
++	citrus9_status_raw(west, "start+50ms");
++	touch_wait(200);
++	citrus9_status_raw(west, "start+250ms");
++	citrus9_read_raw(west, "chip a3 (app)", 0xa3, 1, 1, true);
++	citrus9_read_raw(west, "id 90 (boot)", 0x90, 1, 2, false);
++	citrus9_status_raw(west, "post");
++	ok = citrus9_idle(west, true, &status);
++	printf("CITRUS TOUCH: mode9 app idle=%d status=%#x\n", ok, status);
++	if (ok) {
++		ok = citrus9_read(west, 0xa3, &chip, 1, true);
++		printf("CITRUS TOUCH: mode9 app chip ok=%d id=%#x\n", ok, chip);
++		ok = ok && citrus9_read(west, 0xa6, &fwver, 1, true);
++		printf("CITRUS TOUCH: mode9 app fw ok=%d ver=%#x\n", ok, fwver);
++	}
++	printf("CITRUS TOUCH: mode9 done irq93=%#x\n",
++	    touch_rd(west, CITRUS_GPIO_IO(CITRUS_PIN_IRQ)) & 1u);
++	return ok;
++}
++
++/* Data-phase-only report read: the vendor passes cmd == NULL here
++ * (fts_read_touchdata(): buf[0]=0x01, then fts_read(NULL, 0, buf+1, n-1)).
++ * The IC streams the report; the last two bytes are the CRC16. */
++static bool
++citrus10_report(vm_offset_t west, uint8_t *out, unsigned n)
++{
++	static uint8_t tx[96], rx[96];
++	uint16_t crc = 0, want;
++	unsigned i, total = 1u + n + 2u;
++
++	if (n == 0 || total > sizeof(tx)) {
++		return false;
++	}
++	memset(tx, 0, total);
++	tx[0] = CITRUS7_DATA;
++	citrus8_bb_set(west, CITRUS8_BB_CS, true, false);
++	delay(2);
++	for (i = 0; i < total; i++) {
++		rx[i] = citrus9_bb_byte(west, CITRUS9_MOSI, CITRUS9_MISO, tx[i]);
++		if (i == 0 && total > 1) {
++			delay(30);
++		}
++	}
++	citrus8_bb_set(west, CITRUS8_BB_CS, true, true);
++	delay(150);
++	memcpy(out, rx + 1, n + 2);
++	citrus_fts_crc(out, n, &crc);
++	want = (uint16_t)out[n] | ((uint16_t)out[n + 1] << 8);
++	return crc == want;
++}
++
++/*
++ * Mode 10: after the application is running, poll INT (GPIO93, active low) and
++ * read one report per assertion, then publish the contacts to iOS through
++ * sweet_hid_touch() (native panel coordinates, 1080x2340; SweetHID clamps and
++ * maps them to the presented display). Report layout from focaltech_core.h
++ * with our rep[k] == vendor buf[k+1]: header rep[0] (0x9x), point count low
++ * nibble of rep[1], then 6-byte points: X_H/event, X_L, Y_H/id, Y_L, press,
++ * area.
++ */
++#define CITRUS10_REPORT_LEN 63u /* FTS_TOUCH_DATA_LEN */
++
++static void
++citrus_touch_report_loop(void)
++{
++	vm_offset_t west;
++	static uint8_t rep[80];
++	bool down[10] = {false};
++	int lx[10] = {0}, ly[10] = {0};
++	unsigned cycle, i, reports = 0, shown = 0;
++
++	west = ml_io_map(CITRUS_WEST_PA, 0x80000);
++	if (!west) {
++		printf("CITRUS TOUCH: mode10 mapping failed\n");
++		return;
++	}
++	printf("CITRUS TOUCH: mode10 reporting; touch the screen any time\n");
++	for (cycle = 0; ; cycle++) {
++		bool irq_low = (touch_rd(west, CITRUS_GPIO_IO(CITRUS_PIN_IRQ)) &
++		    1u) == 0;
++
++		/* The IC's INT can be a short pulse, so also sample the report
++		 * register every ~8 ms; a frame without the 0x9x header is
++		 * ignored and never injected. */
++		if (irq_low || (cycle % 100u) == 0u) {
++			bool crcok = citrus10_report(west, rep,
++			    CITRUS10_REPORT_LEN);
++			bool seen[10] = {false};
++			unsigned points = rep[1] & 0x0fu;
++
++			reports++;
++			if (shown < 4) {
++				printf("CITRUS TOUCH: mode10 raw crc=%d %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
++				    crcok, rep[0], rep[1], rep[2], rep[3], rep[4],
++				    rep[5], rep[6], rep[7], rep[8]);
++				shown++;
++			}
++			if ((rep[0] & 0xf0u) == 0x90u && points <= 10u) {
++				for (i = 0; i < points; i++) {
++					unsigned b = i * 6u;
++					unsigned ev = rep[2 + b] >> 6;
++					unsigned id = rep[4 + b] >> 4;
++					int x = ((rep[2 + b] & 0x0fu) << 8) |
++					    rep[3 + b];
++					int y = ((rep[4 + b] & 0x0fu) << 8) |
++					    rep[5 + b];
++
++					if (id >= 10u) {
++						continue;
++					}
++					if (ev == 0u || ev == 2u) {
++						seen[id] = true;
++						lx[id] = x;
++						ly[id] = y;
++						if (!down[id]) {
++							down[id] = true;
++							printf("CITRUS TOUCH: mode10 down id=%u %d,%d\n",
++							    id, x, y);
++						}
++						sweet_hid_touch((int)id, 1, x, y);
++					} else if (down[id]) {
++						down[id] = false;
++						printf("CITRUS TOUCH: mode10 up id=%u %d,%d\n",
++						    id, lx[id], ly[id]);
++						sweet_hid_touch((int)id, 0, lx[id],
++						    ly[id]);
++					}
++				}
++				for (i = 0; i < 10; i++) {
++					if (down[i] && !seen[i]) {
++						down[i] = false;
++						printf("CITRUS TOUCH: mode10 up id=%u %d,%d (absent)\n",
++						    i, lx[i], ly[i]);
++						sweet_hid_touch((int)i, 0, lx[i],
++						    ly[i]);
++					}
++				}
++			} else if (shown < 12) {
++				printf("CITRUS TOUCH: mode10 idle frame hdr=%02x n=%u crc=%d\n",
++				    rep[0], points, crcok);
++				shown++;
++			}
++		}
++		if ((cycle % 30000u) == 29999u) {
++			printf("CITRUS TOUCH: mode10 alive irq=%u frames=%u\n",
++			    irq_low ? 0u : 1u, reports);
++		}
++		touch_wait(2);
++	}
++	printf("CITRUS TOUCH: mode10 loop done frames=%u\n", reports);
++}
++
++static void
++citrus_touch_probe_thread(void *arg __unused, wait_result_t result __unused)
++{
++	static const uint32_t offsets[] = {0x1f004, 0x1f008, 0x1f00c, 0x1f014, 0x1f3a4};
++	static const char *names[] = {"m-ahb", "s-ahb", "core", "core2x", "se2"};
++	vm_offset_t gcc, se;
++	bool halted = false;
++	printf("CITRUS TOUCH: probe mode=%d starting in %u s (1/2: inventory; 3: +clock; 4/6: +pins/reset/FTS SPI; 5: +pins/reset only; 7: boot-ROM firmware; 8: handshake variants + bit-bang; 9: bit-bang bring-up; 10: +reports/HID)\n",
++	    citrus_touch_probe_mode, citrus_touch_probe_delay_s);
++	touch_wait(citrus_touch_probe_delay_s * 1000u);
++	gcc = ml_io_map(0x01400000u, 0x80000);
++	if (!gcc) {
++		printf("CITRUS TOUCH: GCC mapping failed\n");
++		goto out;
++	}
++	printf("CITRUS TOUCH: GCC vote=%#x se2_rcg=%#x cfg=%#x\n",
++	    touch_rd(gcc, 0x7900c), touch_rd(gcc, 0x1f3a8), touch_rd(gcc, 0x1f3ac));
++	for (unsigned i = 0; i < sizeof(offsets) / sizeof(offsets[0]); i++) {
++		uint32_t value = touch_rd(gcc, offsets[i]);
++		printf("CITRUS TOUCH: clock %s off=%#x value=%#x halted=%u\n",
++		    names[i], offsets[i], value, (value >> 31) & 1u);
++		if (value & (1u << 31)) {
++			halted = true;
++		}
++	}
++	if ((citrus_touch_probe_mode == 3 || citrus_touch_probe_mode == 4 ||
++	    citrus_touch_probe_mode == 6 || citrus_touch_probe_mode == 7 ||
++	    citrus_touch_probe_mode == 8 || citrus_touch_probe_mode == 9 ||
++	    citrus_touch_probe_mode == 10) && halted) {
++		/*
++		 * Mode 3 is the first write: only the gcc_qupv3_wrap0_s2_clk
++		 * vote bit (0x7900c bit 12; gcc-bengal.c names it
++		 * gcc_qupv3_wrap0_s2_clk, halt_reg 0x1f3a4, BRANCH_HALT_VOTED).
++		 * The wrapper m-ahb/s-ahb/core/core2x branches are already
++		 * running, so this is the last gate. Poll the halt bit and stop
++		 * on timeout; never touch SE2 unless it clears.
++		 */
++		uint32_t before = touch_rd(gcc, TOUCH_GCC_VOTE);
++		if (!(before & (1u << 12))) {
++			touch_wr(gcc, TOUCH_GCC_VOTE, before | (1u << 12));
++			__asm__ volatile("dsb sy" ::: "memory");
++		}
++		printf("CITRUS TOUCH: SE2 vote %#x -> %#x\n",
++		    before, touch_rd(gcc, TOUCH_GCC_VOTE));
++		if (!touch_wait_clear(gcc, TOUCH_RCG - 4u, 1u << 31)) {
++			printf("CITRUS TOUCH: SE2 still halted cbcr=%#x; no SE2 access\n",
++			    touch_rd(gcc, TOUCH_RCG - 4u));
++			goto out;
++		}
++		/*
++		 * clk-rcg2.c: CMD_RCGR bit31 is CMD_ROOT_OFF (1 = clock off),
++		 * bit1 is CMD_ROOT_EN, bit0 is CMD_UPDATE. Enabling the branch
++		 * already clears ROOT_OFF; the previous "ROOT_EN = bit31" write
++		 * was inverted and would have disabled the serial clock.
++		 */
++		uint32_t rcg = touch_rd(gcc, TOUCH_RCG);
++		if (rcg & (1u << 31)) {
++			printf("CITRUS TOUCH: RCG still off after vote; setting ROOT_EN\n");
++			touch_wr(gcc, TOUCH_RCG, rcg | (1u << 1));
++			__asm__ volatile("dsb sy" ::: "memory");
++			for (unsigned i = 0; i < 1000; i++) {
++				if (!(touch_rd(gcc, TOUCH_RCG) & (1u << 31))) {
++					break;
++				}
++				delay(1);
++			}
++		}
++		printf("CITRUS TOUCH: SE2 running cbcr=%#x rcg=%#x root_off=%u cfg=%#x\n",
++		    touch_rd(gcc, TOUCH_RCG - 4u), rcg,
++		    (touch_rd(gcc, TOUCH_RCG) >> 31) & 1u,
++		    touch_rd(gcc, TOUCH_RCG + 4u));
++		halted = false;
++	}
++	if (citrus_touch_probe_mode == 1 ||
++	    (halted && citrus_touch_probe_mode != 5)) {
++		printf("CITRUS TOUCH: SE2 untouched (%s); no clock/pin/power writes\n",
++		    halted ? "a required clock is halted" : "GCC-only mode");
++		goto out;
++	}
++	if (citrus_touch_probe_mode == 4 || citrus_touch_probe_mode == 5 ||
++	    citrus_touch_probe_mode == 6) {
++		/*
++		 * First writes beyond GCC: pinmux + reset always; the GENI SPI
++		 * transfer only in modes 4/6. Mode 5 isolates pinmux/reset and
++		 * never touches SE2.
++		 */
++		citrus_touch_spi_probe(gcc, citrus_touch_probe_mode != 5);
++		if (citrus_touch_probe_mode == 5) {
++			goto out;
++		}
++	}
++	if (citrus_touch_probe_mode == 7) {
++		/* Vendor boot-ROM handshake, PRAM firmware download, app id. */
++		citrus_touch_vendor_bringup();
++		goto out;
++	}
++	if (citrus_touch_probe_mode == 8) {
++		/* Handshake variants + GPIO bit-bang, no firmware write. */
++		citrus_touch_handshake_variants();
++		citrus_touch_bitbang_probe();
++		goto out;
++	}
++	if (citrus_touch_probe_mode == 9) {
++		/* Bit-bang boot-ROM handshake, PRAM download, application id. */
++		(void)citrus_touch_bitbang_bringup();
++		goto out;
++	}
++	if (citrus_touch_probe_mode == 10) {
++		/* Bring the application up, then read reports and publish HID. */
++		if (citrus_touch_bitbang_bringup()) {
++			citrus_touch_report_loop();
++		} else {
++			printf("CITRUS TOUCH: mode10 bring-up failed\n");
++		}
++		goto out;
++	}
++	/* A clock snapshot is a prerequisite, not a proof against every bus
++	 * fault. Mode2 is a separate explicit diagnostic; default mode0 does
++	 * not map or access this controller at all. Never consume its RX FIFO. */
++	printf("CITRUS TOUCH: entering SE2 read-only inventory pa=0x04a88000\n");
++	se = ml_io_map(0x04a88000u, 0x4000);
++	if (!se) {
++		printf("CITRUS TOUCH: SE2 mapping failed\n");
++		goto out;
++	}
++	uint32_t fw = touch_rd(se, 0x68);
++	uint32_t protocol = (fw >> 8) & 0xffu; /* geni_se_protocol: SPI=1 */
++	printf("CITRUS TOUCH: SE2 fw=%#x protocol=%u sfw=%#x status=%#x hwtx=%#x hwrx=%#x\n",
++	    fw, protocol, touch_rd(se, 0x6c), touch_rd(se, 0x40),
++	    touch_rd(se, 0xe24), touch_rd(se, 0xe28));
++	printf("CITRUS TOUCH: SPI firmware %s; no transaction attempted\n",
++	    protocol == 1 ? "present" : "not established");
++out:
++	printf("CITRUS TOUCH: probe finished; touchscreen input remains disabled\n");
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+@@ -745,6 +2611,30 @@
+ 		return;
+ 	}
+ 	st.started = true;
++	(void)PE_parse_boot_argn("citrustouchprobe", &citrus_touch_probe_mode,
++	    sizeof(citrus_touch_probe_mode));
++	if (citrus_touch_probe_mode != 0) {
++		/* Select this path before any legacy Topaz setup, even if someone
++		 * also supplied sweettouch=1. Invalid probe modes do no hardware IO. */
++		if (citrus_touch_probe_mode < 1 || citrus_touch_probe_mode > 10) {
++			printf("CITRUS TOUCH: invalid probe mode; no hardware access\n");
++			return;
++		}
++		citrus_touch_probe_delay_s = 120;
++		(void)PE_parse_boot_argn("citrustouchdelay", &citrus_touch_probe_delay_s,
++		    sizeof(citrus_touch_probe_delay_s));
++		if (citrus_touch_probe_delay_s > 600) {
++			printf("CITRUS TOUCH: probe delay out of range; no hardware access\n");
++			return;
++		}
++		kern_return_t kr = kernel_thread_start(citrus_touch_probe_thread, NULL, &thread);
++		if (kr == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		} else {
++			printf("CITRUS TOUCH: probe thread failed %d\n", kr);
++		}
++		return;
++	}
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+ 	st.irq_hint = 1; /* topaz: read on IRQ GPIO80 low, while touching, else every 100 ms */
+ 	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
-@@ -995,6 +995,8 @@
+@@ -994,17 +994,54 @@
+  * SWEET process sampler (bsd/dev/sweet_sample.c): user pc/lr/sp and a frame
   * pointer backtrace of every thread of a task, from the saved user state.
   */
++#include <arm/pmap/pmap.h>
++extern pmap_paddr_t pmap_vtophys(pmap_t pmap, addr64_t va);
++
++/* This port runs one CPU. A bounded page-table walk/copy with interrupts
++ * masked keeps translations stable without taking VM locks or paging in data.
++ * Missing/non-RAM pages simply truncate this observational backtrace. */
++static bool
++sweet_sample_read_resident(vm_map_t map, uint64_t src, void *dst, size_t len)
++{
++	bool ok = true;
++	boolean_t istate = ml_set_interrupts_enabled(FALSE);
++	while (len != 0) {
++		pmap_paddr_t pa = pmap_vtophys(vm_map_pmap(map), src);
++		if (pa == 0 || !pmap_valid_address(pa)) {
++			ok = false;
++			break;
++		}
++		size_t n = MIN(len, PAGE_SIZE - (pa & PAGE_MASK));
++		bcopy((const void *)phystokv(pa), dst, n);
++		src += n;
++		dst = (char *)dst + n;
++		len -= n;
++	}
++	ml_set_interrupts_enabled(istate);
++	return ok;
++}
++
  void sweet_sample_task(const char *name, int pid, task_t task);
 +/* Set by the stall watchdog: fewer threads/frames so a panic dump fits a screen. */
 +int sweet_sample_compact;
  
  void
  sweet_sample_task(const char *name, int pid, task_t task)
-@@ -1002,6 +1004,8 @@
- 	vm_map_t map = get_task_map(task);
+ {
+-	vm_map_t map = get_task_map(task);
++	thread_t threads[64], thread;
++	unsigned count = 0;
  	uint64_t slide = 0;
- 	int tn = 0;
-+	int max_threads = sweet_sample_compact ? 4 : 1000;
+-	int tn = 0;
+-	thread_t thread;
+-	vm_shared_region_t sr = vm_shared_region_get(task);
++	int max_threads = sweet_sample_compact ? 4 : 64;
 +	int max_frames = sweet_sample_compact ? 6 : 16;
- 	thread_t thread;
- 	vm_shared_region_t sr = vm_shared_region_get(task);
++	bool truncated = false;
  
-@@ -1021,10 +1025,13 @@
- 		if (ss == NULL || !is_saved_state64(ss)) {
- 			continue;
- 		}
-+		if (tn >= max_threads) {
++	/* Keep target task/map/thread lifetimes stable while we sample; never
++	 * hold the task lock while copying a user frame or printing. */
++	task_reference(task);
++	vm_map_t map = get_task_map(task);
++	vm_map_reference(map);
++	printf("SMP enter %s[%d]\n", name, pid);
++	vm_shared_region_t sr = vm_shared_region_get(task);
+ 	if (sr != NULL) {
+ 		slide = sr->sr_slide;
+ 		vm_shared_region_deallocate(sr);
+@@ -1013,31 +1050,38 @@
+ 
+ 	task_lock(task);
+ 	queue_iterate(&task->threads, thread, thread_t, task_threads) {
+-		arm_saved_state_t *ss = find_user_regs(thread);
++		if (count >= (unsigned)max_threads) {
++			truncated = true;
 +			break;
 +		}
++		thread_reference(thread);
++		threads[count++] = thread;
++	}
++	task_unlock(task);
++
++	for (unsigned tn = 0; tn < count; tn++) {
++		arm_saved_state_t *ss = find_user_regs(threads[tn]);
+ 		char line[400];
+ 		int n;
+ 		uint64_t fp;
+-
+-		if (ss == NULL || !is_saved_state64(ss)) {
+-			continue;
+-		}
++		if (ss == NULL || !is_saved_state64(ss)) continue;
  		fp = get_saved_state_fp(ss);
- 		n = snprintf(line, sizeof(line), "SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx bt", name, tn++,
+-		n = snprintf(line, sizeof(line), "SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx bt", name, tn++,
++		n = snprintf(line, sizeof(line), "SMP %s t%u pc 0x%llx lr 0x%llx sp 0x%llx bt", name, tn,
  		    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss));
 -		for (int i = 0; i < 16 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
++		/* No task/thread locks or faulting reads: omit nonresident frames. */
 +		for (int i = 0; i < max_frames && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
  			uint64_t frame[2];
- 			if (vm_map_read_user(map, fp, frame, sizeof(frame)) != KERN_SUCCESS) {
- 				break;
+-			if (vm_map_read_user(map, fp, frame, sizeof(frame)) != KERN_SUCCESS) {
+-				break;
+-			}
++			if (!sweet_sample_read_resident(map, fp, frame, sizeof(frame))) break;
+ 			n += snprintf(line + n, sizeof(line) - n, " 0x%llx", frame[1]);
+-			if (frame[0] <= fp) {
+-				break;
+-			}
++			if (frame[0] <= fp) break;
+ 			fp = frame[0];
+ 		}
+ 		printf("%s\n", line);
+ 	}
+-	task_unlock(task);
++	for (unsigned tn = 0; tn < count; tn++) thread_deallocate(threads[tn]);
++	printf("SMP done %s[%d] threads %u%s\n", name, pid, count, truncated ? " truncated" : "");
++	vm_map_deallocate(map);
++	task_deallocate(task);
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
 --- a/osfmk/arm/rtclock.c
 +++ b/osfmk/arm/rtclock.c
 @@ -367,6 +367,16 @@
@@ -2128,26 +4963,27 @@
  }
 +
 +#define SWEET_PTIMER_INTID 18
-+extern void sweet_ptimer_tick(uintptr_t pc);
++extern void sweet_ptimer_tick(uintptr_t pc, int user_mode);
 +extern void sweet_ptimer_rearm(void);
  
  void
  sleh_irq(arm_saved_state_t *state)
-@@ -1951,6 +1955,14 @@
- 		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
+@@ -1952,6 +1956,15 @@
  		rtclock_intr(TRUE);
  		INTERRUPT_MASKED_DEBUG_END();
-+		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+ 		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
 +	} else if (intid == SWEET_PTIMER_INTID) {
 +		/* Independent 1 Hz physical-timer tick (sweet_ptimer_enable()).
 +		 * Handled before the generic path so it also runs when everything
 +		 * else has stopped. */
 +		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
-+		sweet_ptimer_tick((uintptr_t)get_saved_state_pc(state));
++		sweet_ptimer_tick((uintptr_t)get_saved_state_pc(state),
++		    PSR64_IS_USER(get_saved_state_cpsr(state)));
 +		sweet_ptimer_rearm();
- 		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
  	} else if (intid < 16) {
  		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);
+ 		/* Ack before handling so an IPI raised meanwhile is not lost */
 --- a/osfmk/console/video_console.c
 +++ b/osfmk/console/video_console.c
 @@ -3429,6 +3429,38 @@
@@ -2202,7 +5038,46 @@
  	if (sweet_log_filter > 0 && !panic_active()) {
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
-@@ -175,7 +175,10 @@
+@@ -73,6 +73,38 @@
+ 	panic("%s: cannot find GICR base for core %u", __func__, ml_get_cpu_number(phys_id));
+ }
+ 
++#if defined(SWEET)
++/*
++ * Cross-core redistributor read for the SMP observer (osfmk/arm64/cpu.c).
++ * `phys_id` is MPIDR Aff1:Aff0 as published in the ADT (0x100 for Gold core 0).
++ * Only the named core's redistributor frame is touched and nothing core-local
++ * is read, so this is safe from another CPU while that CPU is stuck. Returns 0
++ * when the redistributor is not mapped or the affinity has no frame; a zero
++ * register value reads the same, so callers only test individual bits.
++ */
++uint64_t
++sweet_gic_redist_read(uint32_t phys_id, uint32_t offset)
++{
++	if (gicr_base == 0 || gicr_size == 0 || offset >= gicr_size) {
++		return 0;
++	}
++	for (vm_offset_t frame = 0; frame < gicr_size; frame += GICR_PE_SIZE) {
++		vm_offset_t pe = gicr_base + frame;
++		uint64_t typer = _gic_read64(pe + GICR_TYPER);
++		uint32_t aff = (uint32_t)(typer >> GICR_TYPER_AFFINITY_VALUE_SHIFT) &
++		    (MPIDR_AFF1_MASK | MPIDR_AFF0_MASK);
++
++		if (aff == (phys_id & (MPIDR_AFF1_MASK | MPIDR_AFF0_MASK))) {
++			return _gic_read32(pe + offset);
++		}
++		if (typer & GICR_TYPER_LAST) {
++			break;
++		}
++	}
++	return 0;
++}
++#endif /* SWEET */
++
+ void
+ pe_init_fiq()
+ {
+@@ -175,7 +207,10 @@
  	for (unsigned int i = 0; i < 32; i += 4) {
  		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0);
  	}
@@ -2244,10 +5119,11 @@
  	if (fb->fPowerOff) {
  		/*
  		 * topaz: fade in cached memory and flip whole frames to the MDP.
-@@ -756,6 +770,36 @@
+@@ -755,7 +769,37 @@
+ 	AppleCLCD *fb = sweet_cons_fb;
  	if (fb != NULL && fb->fVig0 != NULL && fb->fScanPhys != fb->fConsPhys) {
  		fb->scanFrom(fb->fConsPhys, fb->fRowBytes);
- 	}
++	}
 +}
 +
 +/*
@@ -2272,7 +5148,7 @@
 +	AppleCLCD *fb = sweet_cons_fb;
 +	if (fb == NULL || fb->fCons == NULL || fb->fVig0 == NULL) {
 +		return 0;
-+	}
+ 	}
 +	*va = (uintptr_t)fb->fCons->getBytesNoCopy();
 +	*stride = fb->fRowBytes;
 +	*height = fb->fHeight;
@@ -2281,31 +5157,106 @@
  }
  
  void
-@@ -846,6 +890,20 @@
- 		if ((pa & 0xf) == 0 && pa + (uint64_t)fHeight * s->bytesPerRow < (1ull << 32)) {
+@@ -842,10 +886,60 @@
+ 			ox = (uint32_t)fOffX;
+ 			oy = (uint32_t)fOffY;
+ 		}
++		uint64_t srcOff = (uint64_t)s->offset + (uint64_t)oy * s->bytesPerRow + (uint64_t)ox * 4;
++		/*
++		 * The surface descriptor's geometry is not its allocation length.
++		 * Refuse the direct scanout unless the whole window that flipFrom()
++		 * and the MDP will read lies inside allocSize; otherwise the copy
++		 * path below (which reads the swap record's own buffers) is used.
++		 * allocSize == 0 means the driver did not learn the length: keep the
++		 * old behaviour rather than reject a valid surface.
++		 */
++		bool windowInAlloc = true;
++		if (s->allocSize != 0) {
++			windowInAlloc = srcOff <= s->allocSize &&
++			    (uint64_t)fHeight * s->bytesPerRow <= (uint64_t)s->allocSize - srcOff;
++		}
+ 		uint64_t pa = s->scanoutPhys + s->offset + (uint64_t)oy * s->bytesPerRow + (uint64_t)ox * 4;
+-		if ((pa & 0xf) == 0 && pa + (uint64_t)fHeight * s->bytesPerRow < (1ull << 32)) {
++		if (windowInAlloc && s->bytesPerRow >= (uint64_t)fWidth * 4 &&
++		    (pa & 0xf) == 0 &&
++		    pa + (uint64_t)fHeight * s->bytesPerRow < (1ull << 32)) {
  			uintptr_t va = s->kernelAddress();
  			if (va != 0) {
 +				static uint32_t pix_logs;
 +				if (pix_logs < 8) {
 +					pix_logs++;
 +					const uint32_t *q = (const uint32_t *)(va + s->offset);
-+					uint32_t total = s->width * s->height, nz = 0, tested = 0;
++					/* Never read past the allocation (see
++					 * sweet_surface_word_limit): the geometry is not a
++					 * length. */
++					uint64_t avail = s->allocSize > s->offset ?
++					    (uint64_t)(s->allocSize - s->offset) : 0;
++					uint64_t want = (uint64_t)s->width * s->height;
++					uint32_t total = (uint32_t)(avail != 0 ? MIN(want, avail / 4) : want);
++					uint32_t nz = 0, tested = 0;
 +					for (uint32_t k = 0; k < total; k += 97) {
 +						nz += q[k] != 0;
 +						tested++;
 +					}
-+					const uint32_t *mid = q + (s->height / 2) * (s->bytesPerRow / 4) + s->width / 2;
++					/* mid/top/bottom are also pointer reads: bound each one. */
++					uint64_t midOff = (uint64_t)(s->height / 2) * s->bytesPerRow +
++					    (uint64_t)(s->width / 2) * 4;
++					uint64_t botOff = (uint64_t)(s->height - 1) * s->bytesPerRow;
++					uint32_t topv = 0, midv = 0, botv = 0;
++					if (avail >= 4) {
++						topv = q[0];
++					}
++					if (midOff + 4 <= avail) {
++						midv = *(const uint32_t *)((const uint8_t *)q + midOff);
++					}
++					if (botOff + 4 <= avail) {
++						botv = *(const uint32_t *)((const uint8_t *)q + botOff);
++					}
 +					IOLog("SWEET FB: present %ux%u bpr %u off %u nz %u/%u mid %08x top %08x bottom %08x\n",
-+					    s->width, s->height, s->bytesPerRow, s->offset, nz, tested, mid[0],
-+					    q[0], q[(s->height - 1) * (s->bytesPerRow / 4)]);
++					    s->width, s->height, s->bytesPerRow, s->offset, nz, tested, midv,
++					    topv, botv);
 +				}
  				/*
  				 * Copy into our back buffer and flip: CoreAnimation may start the
  				 * next frame in this surface at once, so scanning it directly let
-@@ -877,6 +935,21 @@
+@@ -855,7 +949,7 @@
+ 					flipFrom((const uint8_t *)(va + s->offset + (uint64_t)oy * s->bytesPerRow + (uint64_t)ox * 4),
+ 					    s->bytesPerRow);
+ 				} else {
+-					sweet_dcache_clean((vm_offset_t)(va + s->offset + (uint64_t)oy * s->bytesPerRow), (unsigned)((uint64_t)fHeight * s->bytesPerRow));
++					sweet_dcache_clean((vm_offset_t)(va + srcOff), (unsigned)((uint64_t)fHeight * s->bytesPerRow));
+ 					scanFrom(pa, s->bytesPerRow);
+ 				}
+ 				ok = true;
+@@ -877,6 +971,46 @@
  	return ok;
  }
  
++/*
++ * Number of 32-bit words that may safely be read from kernelAddress().
++ *
++ * width*height is NOT the buffer size: a 2-bytes-per-pixel surface (e.g. the
++ * 312x202 LA08 surface SpringBoard creates) has width*height*bpe bytes, so a
++ * scan of width*height *uint32_t* runs to twice the end of its allocation and
++ * takes a kernel data abort inside present(). Use the real allocation length
++ * (set by the create ioctl from the descriptor, or rounded row*height for the
++ * physical panel surface) and fall back to the row geometry.
++ */
++static uint32_t
++sweet_surface_word_limit(SweetSurface *s)
++{
++	uint64_t words = (uint64_t)s->allocSize / sizeof(uint32_t);
++
++	if (words == 0) {
++		words = (uint64_t)s->bytesPerRow * s->height / sizeof(uint32_t);
++	}
++	uint64_t pixels = (uint64_t)s->width * s->height;
++	if (words > pixels) {
++		words = pixels;
++	}
++	return (uint32_t)MIN(words, 0xffffffffull);
++}
++
 +static uint32_t
 +sweet_surface_rgb_nz(SweetSurface *s)
 +{
@@ -2314,7 +5265,7 @@
 +		return 0;
 +	}
 +	const uint32_t *q = (const uint32_t *)va;
-+	uint32_t tot = s->width * s->height, nz = 0;
++	uint32_t tot = sweet_surface_word_limit(s), nz = 0;
 +	for (uint32_t k = 0; k < tot; k += 97) {
 +		nz += (q[k] & 0x00ffffffu) != 0;
 +	}
@@ -2324,11 +5275,10 @@
  void
  AppleCLCD::present(const uint8_t *rec)
  {
-@@ -891,7 +964,106 @@
- 	if (console_only > 0 && fConsShown) {
+@@ -892,6 +1026,105 @@
  		(void)mask;
  		return;
-+	}
+ 	}
 +	/*
 +	 * TEST: the swap record can reference an empty 1125x2436 surface while the
 +	 * composed frame sits in a 1080x2340 surface. If the referenced surface is
@@ -2374,7 +5324,7 @@
 +				return;
 +			}
 +		}
- 	}
++	}
 +	/* A swap with no enabled layer carries no frame: keep what is on screen. */
 +	{
 +		static uint32_t surf_logs;
@@ -2386,9 +5336,9 @@
 +					continue;
 +				}
 +				uintptr_t sv = ss->kernelAddress();
-+				uint32_t tot = ss->width * ss->height, nz = 0, tested = 0;
++				uint32_t tot = sweet_surface_word_limit(ss), nz = 0, tested = 0;
 +				uint32_t px0 = 0, px1 = 0;
-+				if (sv != 0) {
++				if (sv != 0 && tot > 0) {
 +					const uint32_t *q = (const uint32_t *)sv;
 +					px0 = q[0];
 +					px1 = q[tot / 2];
@@ -2431,3 +5381,562 @@
  	fConsShown = false;
  	if (directPresent(rec)) {
  		if (!fConsolePaused) {
+@@ -946,7 +1179,11 @@
+ 			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
+ 			    get32(a, 12), dx, dy, w, h);
+ 		}
+-		if (s == NULL || s == fSurface) {
++		/* The default surface is also a render target. Once scanout uses
++		 * fFlip, it must be copied just like the other layers: skipping it
++		 * still flips a stale buffer (often the boot console) onto the panel.
++		 * Only skip the self-copy when we draw into fPixels itself. */
++		if (s == NULL || (s == fSurface && fFlip[0] == NULL)) {
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -11,10 +11,10 @@
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+ 
+-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
++static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x5c000000;
+ #define EARLY_FB early_fb
+ #define EARLY_WIDTH 1080u
+-#define EARLY_HEIGHT 2400u
++#define EARLY_HEIGHT 2340u
+ #define EARLY_STRIDE (4320u / 4)
+ #define EARLY_SCALE 2u
+ #define EARLY_CELL_W (8u * EARLY_SCALE)
+@@ -109,20 +109,57 @@
+ 	sweet_early_putc('\n');
+ }
+ 
++extern int sweet_panic_store(const char *text, unsigned int len);
++
++static char *sweet_panic_buf;
++static int sweet_panic_len, sweet_panic_max;
++
++static void
++sweet_panic_putc(char c)
++{
++	if (sweet_panic_len < sweet_panic_max) {
++		sweet_panic_buf[sweet_panic_len++] = c;
++	}
++}
++
+ void
+ sweet_early_panic(const char *fmt, va_list *args)
+ {
+-	if (early_disabled || early_panicking) {
++	if (early_panicking) {
+ 		return;
+ 	}
+ 	early_panicking = 1;
+-	sweet_early_string("\nSWEET EARLY PANIC: ");
+-	va_list copy;
+-	va_copy(copy, *args);
+-	_doprnt(fmt, &copy, sweet_early_putc, 16);
+-	va_end(copy);
+-	sweet_early_putc('\n');
+-	__asm__ volatile("dsb sy" ::: "memory");
++	if (!early_disabled) {
++		sweet_early_string("\nSWEET EARLY PANIC: ");
++		va_list copy;
++		va_copy(copy, *args);
++		_doprnt(fmt, &copy, sweet_early_putc, 16);
++		va_end(copy);
++		sweet_early_putc('\n');
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++	/*
++	 * Persist the panic through the polled UFS slot-1 writer. This is the only
++	 * channel that survives a reset: the USB console thread and the UFS log
++	 * thread are both stopped by the time panic runs.
++	 */
++	char buf[1000];
++	static const char header[] = "SWEETPAN1 panic: ";
++	int n = 0;
++	while (header[n] != '\0' && n < (int)sizeof(buf) - 1) {
++		buf[n] = header[n];
++		n++;
++	}
++	sweet_panic_buf = buf;
++	sweet_panic_len = n;
++	sweet_panic_max = (int)sizeof(buf) - 1;
++	va_list copy2;
++	va_copy(copy2, *args);
++	_doprnt(fmt, &copy2, sweet_panic_putc, 16);
++	va_end(copy2);
++	n = sweet_panic_len;
++	buf[n] = '\0';
++	(void)sweet_panic_store(buf, (unsigned int)n);
+ }
+ 
+ void
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -46,6 +46,7 @@
+ #include <arm/misc_protos.h>
+ #include <arm/machine_cpu.h>
+ #include <arm/rtclock.h>
++#include <arm/sweet_idle_stats.h>
+ #include <arm64/proc_reg.h>
+ #include <mach/processor_info.h>
+ #include <vm/pmap.h>
+@@ -151,6 +152,53 @@
+ static uint32_t idle_proximate_io_wfe_masked = 0;
+ #endif
+ 
++/*
++ * Sweet/Citrus idle-WFE mode.  The proximate-timer shortcut below waits for
++ * the next timer interrupt while IRQs are masked.  On this port the platform
++ * never fills in ml_processor_info_t.powergate_latency, so cpu_idle_latency
++ * is zero and the shortcut is entered only when rtcPop is already in the
++ * past: it is waiting for an interrupt that is at best about to become
++ * visible and at worst has already been serviced.  There is no deadline on
++ * that wait.
++ *
++ *   0 - original Apple behaviour (masked WFE loop)
++ *   1 - wait with WFI, which is required to wake on a masked pending IRQ
++ *   2 - default: if the deadline is already past, skip the wait and let the
++ *       normal idle path retire the interrupt; keep WFE for future deadlines
++ *
++ * The original mode is retained for controlled A/B boots
++ * (sweetidle=0).  See research/CITRUS-IDLE.md.
++ */
++static uint32_t sweet_idle_mode = 2;
++static sweet_idle_stats_t sweet_idle_stats;
++
++/*
++ * WFI wake workaround.  The port can sleep in WFI with DAIF masked and never
++ * wake for the virtual-timer interrupt; wfi=0 avoids it by keeping the CPU
++ * spinning (hot).  Unmasking IRQ/FIQ across the WFI lets the timer exception
++ * itself wake the core, which is the normal ARM idle pattern.
++ * 0 = old masked WFI (default), 1 = unmask around WFI.
++ */
++static uint32_t sweet_wfi_unmask = 0;
++
++void
++sweet_idle_stats_snapshot(sweet_idle_stats_t *out)
++{
++	sweet_idle_stats_t stats = sweet_idle_stats;
++	cpu_data_t *cdp = getCpuDatap();
++
++	/*
++	 * wfe_count is per-CPU and only incremented after a WFE retires.  The
++	 * boot CPU is the one running cpu_idle today (cpus=1), so reading the
++	 * caller's CPU is accurate for the current diagnostic configuration.
++	 */
++	stats.wfe_iters = cdp->wfe_count;
++	stats.wfe_recommendation = ml_cluster_wfe_timeout(0);
++	stats.idle_latency = cdp->cpu_idle_latency;
++	stats.mode = sweet_idle_mode;
++	*out = stats;
++}
++
+ #if __ARM_GLOBAL_SLEEP_BIT__
+ volatile boolean_t arm64_stall_sleep = TRUE;
+ #endif
+@@ -478,6 +526,21 @@
+ }
+ 
+ /*
++ * WFI wait used by the proximate-timer shortcut in the fixed modes.  Unlike
++ * WFE, WFI is required to wake on a pending physical interrupt even while
++ * PSTATE.I/F are set; the interrupt itself stays pending until the idle path
++ * returns with interrupts enabled.
++ */
++static void
++sweet_wfi_until_interrupt(void)
++{
++	while (!cpu_interrupt_is_pending()) {
++		sweet_idle_stats.wfi_iters++;
++		__builtin_arm_wfi();
++	}
++}
++
++/*
+  *	Routine:	cpu_idle
+  *	Function:
+  */
+@@ -526,14 +589,51 @@
+ 	}
+ 
+ 	if (__improbable(cpu_proximate_timer())) {
++		uint64_t now = mach_absolute_time();
++		bool expired = (cpu_data_ptr->rtcPop <= now);
++
++		/* Snapshot the exact entry state for the next diagnostic pull. */
++		if (sweet_idle_stats.prox_entries++ == 0) {
++			sweet_idle_stats.first_now = now;
++		}
++		if (expired) {
++			sweet_idle_stats.prox_expired++;
++		}
++		sweet_idle_stats.last_now = now;
++		sweet_idle_stats.last_rtcpop = cpu_data_ptr->rtcPop;
++		sweet_idle_stats.last_isr = __builtin_arm_rsr64("ISR_EL1");
++		sweet_idle_stats.last_cntv_ctl = __builtin_arm_rsr64("CNTV_CTL_EL0");
++		sweet_idle_stats.last_cntv_tval = __builtin_arm_rsr64("CNTV_TVAL_EL0");
++		sweet_idle_stats.last_daif = __builtin_arm_rsr("DAIF");
++		{
++			uint64_t cntkctl;
++			__asm__ volatile ("mrs %0, CNTKCTL_EL1" : "=r"(cntkctl));
++			sweet_idle_stats.last_cntkctl = cntkctl;
++		}
++		sweet_idle_stats.last_expired = expired ? 1 : 0;
++
+ 		if (idle_proximate_timer_wfe == 1) {
+-			/* Poll issuing WFEs until the expected
+-			 * timer FIQ arrives.
+-			 */
+-			KDBG(CPUPM_IDLE_TIMER_WFE | DBG_FUNC_START, ipending, cpu_data_ptr->wfe_count, ~0ULL);
+-			ipending = wfe_to_deadline_or_interrupt(cid, ~0ULL, cpu_data_ptr, false);
+-			KDBG(CPUPM_IDLE_TIMER_WFE | DBG_FUNC_END, ipending, cpu_data_ptr->wfe_count, ~0ULL);
+-			assert(ipending == true);
++			if (sweet_idle_mode == 2 && expired) {
++				/*
++				 * The deadline is already in the past.  The
++				 * expected interrupt may already have been
++				 * serviced, so a masked WFE here can wait
++				 * forever.  The normal idle path masks/unmasks
++				 * around the context switch and re-syncs the
++				 * timer; let it do that.
++				 */
++				sweet_idle_stats.skipped++;
++			} else if (sweet_idle_mode == 1) {
++				sweet_wfi_until_interrupt();
++			} else {
++				/* Poll issuing WFEs until the expected
++				 * timer FIQ arrives.
++				 */
++				KDBG(CPUPM_IDLE_TIMER_WFE | DBG_FUNC_START, ipending, cpu_data_ptr->wfe_count, ~0ULL);
++				ipending = wfe_to_deadline_or_interrupt(cid, ~0ULL, cpu_data_ptr, false);
++				KDBG(CPUPM_IDLE_TIMER_WFE | DBG_FUNC_END, ipending, cpu_data_ptr->wfe_count, ~0ULL);
++				assert(ipending == true);
++			}
+ 		}
+ 		Idle_load_context();
+ 	}
+@@ -588,7 +688,20 @@
+ #if HAS_RETENTION_STATE
+ 		arm64_retention_wfi();
+ #else
+-		__builtin_arm_wfi();
++		if (__improbable(sweet_wfi_unmask != 0)) {
++			/*
++			 * This port can sleep forever in a masked WFI even
++			 * though the virtual timer is armed.  Take the timer
++			 * exception normally so its wake-up is guaranteed,
++			 * then restore the idle-entry mask.
++			 */
++			__builtin_arm_wsr("DAIFClr", (DAIFSC_IRQF | DAIFSC_FIQF));
++			__builtin_arm_wfi();
++			__builtin_arm_wsr("DAIFSet", (DAIFSC_IRQF | DAIFSC_FIQF));
++			__builtin_arm_isb(ISB_SY);
++		} else {
++			__builtin_arm_wfi();
++		}
+ #endif
+ 
+ #if defined(APPLETYPHOON)
+@@ -1183,7 +1296,28 @@
+ 			extern uint32_t idle_proximate_io_wfe_unmasked;
+ 			idle_proximate_io_wfe_unmasked = ((wfe_mode & 4) == 4);
+ 		}
++		uint32_t idle_mode = sweet_idle_mode;
++		if (PE_parse_boot_argn("sweetidle", &idle_mode, sizeof(idle_mode)) &&
++		    idle_mode <= 2) {
++			sweet_idle_mode = idle_mode;
++		}
+ #endif
++		{
++			uint32_t wfi_unmask = sweet_wfi_unmask;
++			if (PE_parse_boot_argn("wfi_unmask", &wfi_unmask, sizeof(wfi_unmask))) {
++				sweet_wfi_unmask = wfi_unmask ? 1 : 0;
++			}
++		}
++		sweet_idle_stats.mode = sweet_idle_mode;
++		{
++			uint64_t cntkctl;
++			__asm__ volatile ("mrs %0, CNTKCTL_EL1" : "=r"(cntkctl));
++			printf("SWEET IDLE: mode=%u wfi_unmask=%u timer_wfe=%u io_masked=%u "
++			    "io_unmasked=%u cntkctl=0x%llx cntv_ctl=0x%llx\n",
++			    sweet_idle_mode, sweet_wfi_unmask, idle_proximate_timer_wfe,
++			    idle_proximate_io_wfe_masked, idle_proximate_io_wfe_unmasked,
++			    cntkctl, __builtin_arm_rsr64("CNTV_CTL_EL0"));
++		}
+ 
+ 		// bits 7..0 give the wfi type
+ 		switch (wfi & 0xff) {
+@@ -1294,3 +1428,226 @@
+ 	}
+ }
+ #endif
++
++#if defined(SWEET)
++/*
++ * SMP observer (research/CITRUS-CROSS-PROJECT.md section 6, step 2).
++ *
++ * With cpus=2 a second Gold core exists that no single-core stall can take
++ * away. This thread pins itself to CPU1 and, once a second, reports CPU0's
++ * state as seen *from the outside*:
++ *
++ *   - cpu_stat.timer_cnt on CPU0: does the architected timer still deliver?
++ *   - cpu_stat.ipi_cnt plus a SIGPnop round trip: does CPU0 still take SGIs?
++ *     cpu_signal_handler() bumps ipi_cnt before it looks at any service bit,
++ *     so a delta is a positive handshake with the target core, and
++ *     cpu_signal() itself fails with SIGPdisabled when CPU0 is not listening.
++ *   - GICv3 redistributor of CPU0 (pending/active/enable/waker): a PPI that is
++ *     pending but not active means CPU0 is not acking interrupts at all, while
++ *     an active bit means CPU0 is stuck inside that handler.
++ *   - cpu_active_thread of CPU0, with its name: what CPU0 is running.
++ *
++ * The 1 Hz line goes through sweet_log_append(), the lock-free console ring,
++ * so it needs no console lock, no UFS lock and no scheduler service on CPU0.
++ * When CPU0's timer stops for SWEET_OBS_STALL_NS the same data is additionally
++ * persisted into one fixed UFS diag block (slot-1 polled writer, which refuses
++ * while a normal UFS request is in flight) so the capture survives a reset.
++ */
++#define SWEET_OBS_CPU            1
++#define SWEET_OBS_STALL_NS       (2ULL * NSEC_PER_SEC)
++
++extern void sweet_log_append(const char *c, int size);
++extern int sweet_obs_persist(const void *data, int len);
++extern void thread_get_thread_name(thread_t th, char *name);
++extern uint64_t sweet_gic_redist_read(uint32_t phys_id, uint32_t offset);
++
++/* GICv3 redistributor frame offsets (RD_base) the observer reports. */
++#define SWEET_GICR_WAKER        0x0014u
++#define SWEET_GICR_ISENABLER0   0x10100u
++#define SWEET_GICR_ISPENDR0     0x10200u
++#define SWEET_GICR_ISACTIVER0   0x10300u
++
++struct sweet_obs_record {
++	uint8_t  magic[8];       /* "SWEETOBS" */
++	uint64_t seq;
++	uint64_t uptime_s;
++	uint64_t stall_s;
++	uint64_t timer0;         /* timer interrupts taken by the observed CPU */
++	uint64_t timer1;         /* timer interrupts taken by the observer CPU */
++	uint64_t ipi0;           /* IPIs taken by the observed CPU */
++	uint64_t ipi_delta;      /* change since the previous sample */
++	int32_t  ipi_rc;         /* cpu_signal() result (0 success, 14 failure) */
++	uint32_t sig0;           /* cpu_signal mask of the observed CPU */
++	uint64_t pend0, active0, enable0, waker0;
++	uint64_t thr0;           /* cpu_active_thread of the observed CPU */
++	uint64_t stack0;
++	uint32_t obs_cpu;
++	uint32_t wat_mpidr;
++	char     name[64];       /* observed CPU's active thread name */
++};
++
++static void
++sweet_obs_thread(void *arg __unused, wait_result_t result __unused)
++{
++	cpu_data_t *wat = cpu_datap(0);
++	cpu_data_t *self = getCpuDatap();
++	uint32_t wat_mpidr = (uint32_t)ml_get_topology_info()->cpus[0].phys_id;
++	uint64_t last_timer = 0, last_ipi = 0, last_ns = 0, stall_ns = 0, seq = 0;
++	uint64_t last_persist_ns = 0, last_line_ns = 0;
++
++	/* Processors are published during IOKit matching and this thread starts
++	 * after the root device, so CPU1 usually exists already. Wait briefly
++	 * rather than give up silently if the order ever changes. */
++	processor_t obs = NULL;
++	for (int i = 0; i < 60 && obs == NULL; i++) {
++		obs = cpu_to_processor(SWEET_OBS_CPU);
++		if (obs == NULL) {
++			assert_wait_timeout((event_t)&sweet_obs_thread, THREAD_UNINT,
++			    1, NSEC_PER_SEC);
++			thread_block(THREAD_CONTINUE_NULL);
++		}
++	}
++
++	/* thread_bind() takes effect when the thread is next made runnable, so
++	 * check the CPU after blocking once. */
++	if (obs != NULL && cpu_number() != SWEET_OBS_CPU) {
++		thread_bind(obs);
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++
++	if (cpu_number() != SWEET_OBS_CPU) {
++		static const char msg[] =
++		    "SWEET OBS: could not run on CPU 1; observer disabled\n";
++		sweet_log_append(msg, (int)sizeof(msg) - 1);
++		return;
++	}
++
++	for (;;) {
++		/* thread_bind() did not hold in the smp2/smp3 boots (C= alternated
++		 * between 0 and 1), so re-assert the binding every iteration: the
++		 * observer is only useful if a CPU0 wedge cannot take it down. */
++		if (cpu_number() != SWEET_OBS_CPU) {
++			if (obs != NULL) {
++				thread_bind(obs);
++			}
++			static const char rebind[] =
++			    "SWEET OBS: re-binding observer to CPU 1\n";
++			static bool rebind_logged;
++			if (!rebind_logged) {
++				rebind_logged = true;
++				sweet_log_append(rebind, (int)sizeof(rebind) - 1);
++			}
++		}
++		assert_wait_timeout((event_t)&sweet_obs_thread, THREAD_UNINT,
++		    1, NSEC_PER_SEC);
++		thread_block(THREAD_CONTINUE_NULL);
++
++		uint64_t now = mach_absolute_time();
++		uint64_t now_ns = 0;
++		absolutetime_to_nanoseconds(now, &now_ns);
++
++		uint64_t timer0 = os_atomic_load(&wat->cpu_stat.timer_cnt, relaxed);
++		uint64_t timer1 = os_atomic_load(&self->cpu_stat.timer_cnt, relaxed);
++		uint64_t ipi0 = os_atomic_load(&wat->cpu_stat.ipi_cnt, relaxed);
++		uint32_t sig0 = os_atomic_load(&wat->cpu_signal, relaxed);
++		int32_t rc = (int32_t)cpu_signal(wat, SIGPnop, NULL, NULL);
++
++		uint64_t pend0 = sweet_gic_redist_read(wat_mpidr, SWEET_GICR_ISPENDR0);
++		uint64_t active0 = sweet_gic_redist_read(wat_mpidr, SWEET_GICR_ISACTIVER0);
++		uint64_t enable0 = sweet_gic_redist_read(wat_mpidr, SWEET_GICR_ISENABLER0);
++		uint64_t waker0 = sweet_gic_redist_read(wat_mpidr, SWEET_GICR_WAKER);
++		thread_t thr = __atomic_load_n(&wat->cpu_active_thread, __ATOMIC_RELAXED);
++		uint64_t stack0 = wat->cpu_active_stack;
++
++		char name[64];
++		name[0] = '\0';
++
++		/* Stall accounting uses wall time, not sample counts: a delayed
++		 * wakeup must not look like a stalled core. */
++		uint64_t elapsed = last_ns ? now_ns - last_ns : 0;
++		if (timer0 != last_timer) {
++			stall_ns = 0;
++		} else if (last_ns) {
++			stall_ns += elapsed;
++		}
++		bool stalled = stall_ns >= SWEET_OBS_STALL_NS;
++		uint64_t stall_s = stall_ns / NSEC_PER_SEC;
++
++		/* Name only while stalled: then CPU0 is not switching threads, so
++		 * the pointer is stable. Reading it every second would race a
++		 * thread that is being torn down. */
++		if (stalled && thr != NULL) {
++			thread_get_thread_name(thr, name);
++			name[sizeof(name) - 1] = '\0';
++		}
++
++		/* 1 Hz while stalled, 5 s otherwise, so a long good run cannot
++		 * flood the ring. */
++		if (stalled || last_line_ns == 0 || now_ns - last_line_ns >= 5000000000ULL) {
++			char line[288];
++			int n = snprintf(line, sizeof(line),
++			    "SWEET OBS%s T=%llu C=%u TMR0=%llu TMR1=%llu IPI0=%llu "
++			    "RC=%d SIG0=0x%x PEND0=0x%llx ACT0=0x%llx EN0=0x%llx "
++			    "WAK0=0x%llx THR0=0x%llx/%llx %s\n",
++			    stalled ? " STALL" : "", now_ns / NSEC_PER_SEC,
++			    (unsigned int)cpu_number(), timer0, timer1, ipi0, rc, sig0,
++			    pend0, active0, enable0, waker0,
++			    (uint64_t)(uintptr_t)thr, stack0, name);
++			if (n > 0) {
++				sweet_log_append(line, MIN(n, (int)sizeof(line) - 1));
++			}
++			last_line_ns = now_ns;
++		}
++
++		if (stalled && (last_persist_ns == 0 ||
++		    now_ns - last_persist_ns >= 2ULL * NSEC_PER_SEC)) {
++			struct sweet_obs_record rec;
++			memset(&rec, 0, sizeof(rec));
++			memcpy(rec.magic, "SWEETOBS", 8);
++			rec.seq = ++seq;
++			rec.uptime_s = now_ns / NSEC_PER_SEC;
++			rec.stall_s = stall_s;
++			rec.timer0 = timer0;
++			rec.timer1 = timer1;
++			rec.ipi0 = ipi0;
++			rec.ipi_delta = elapsed ? ipi0 - last_ipi : 0;
++			rec.ipi_rc = rc;
++			rec.sig0 = sig0;
++			rec.pend0 = pend0;
++			rec.active0 = active0;
++			rec.enable0 = enable0;
++			rec.waker0 = waker0;
++			rec.thr0 = (uint64_t)(uintptr_t)thr;
++			rec.stack0 = stack0;
++			rec.obs_cpu = (uint32_t)cpu_number();
++			rec.wat_mpidr = wat_mpidr;
++			memcpy(rec.name, name, sizeof(rec.name));
++			(void)sweet_obs_persist(&rec, (int)sizeof(rec));
++			last_persist_ns = now_ns;
++		}
++
++		last_ipi = ipi0;
++		last_timer = timer0;
++		last_ns = now_ns;
++	}
++}
++
++/* Called from thread context once the root device is attached (sweet_ufs.c).
++ * Does nothing unless a second CPU is running, so cpus=1 stays unchanged. */
++void
++sweet_obs_start(void)
++{
++	thread_t thread;
++	kern_return_t kr;
++
++	if (ml_get_cpu_count() <= SWEET_OBS_CPU) {
++		return;
++	}
++	if (kernel_thread_start(&sweet_obs_thread, NULL, &thread) != KERN_SUCCESS) {
++		static const char msg[] = "SWEET OBS: cannot create observer thread\n";
++		sweet_log_append(msg, (int)sizeof(msg) - 1);
++		return;
++	}
++	thread_deallocate(thread);
++}
++#endif /* SWEET */
+--- a/osfmk/arm/sweet_idle_stats.h
++++ b/osfmk/arm/sweet_idle_stats.h
+@@ -0,0 +1,39 @@
++/*
++ * Diagnostic counters for the Citrus/Sweet idle path.
++ *
++ * cpu_idle() has a "proximate timer" shortcut that waits for the next timer
++ * interrupt with WFE while IRQs are masked.  On this port the platform never
++ * populates cpu_idle_latency (it is zero), so that shortcut is only entered
++ * when the software deadline is already in the past.  These counters let the
++ * 1 Hz sampler and the 5 s timer-interrupt liveness line show whether the
++ * shortcut is being taken, how it was entered, and whether it ever returned.
++ *
++ * The struct is filled with a plain copy; the reader is a diagnostic thread
++ * and may observe a torn update.  Do not use it for policy decisions.
++ */
++#ifndef _ARM_SWEET_IDLE_STATS_H_
++#define _ARM_SWEET_IDLE_STATS_H_
++
++typedef struct sweet_idle_stats {
++	uint64_t prox_entries;       /* cpu_proximate_timer() returned true */
++	uint64_t prox_expired;       /* rtcPop was already in the past */
++	uint64_t wfe_iters;          /* completed WFEs in the idle WFE loop */
++	uint64_t wfi_iters;          /* WFIs issued by the fixed wait */
++	uint64_t skipped;            /* expired waits bypassed (mode 2) */
++	uint64_t first_now;          /* first proxy entry, for rate context */
++	uint64_t last_now;           /* state captured at the latest entry */
++	uint64_t last_rtcpop;
++	uint64_t last_isr;
++	uint64_t last_cntv_ctl;
++	uint64_t last_cntv_tval;
++	uint64_t last_cntkctl;
++	uint64_t last_daif;
++	uint64_t wfe_recommendation; /* ml_cluster_wfe_timeout(cluster 0) */
++	uint64_t idle_latency;       /* cpu_idle_latency (0 on this port) */
++	uint32_t last_expired;
++	uint32_t mode;               /* 0 = old WFE, 1 = WFI, 2 = skip expired */
++} sweet_idle_stats_t;
++
++extern void sweet_idle_stats_snapshot(sweet_idle_stats_t *out);
++
++#endif /* _ARM_SWEET_IDLE_STATS_H_ */

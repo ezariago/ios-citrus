@@ -1,0 +1,23 @@
+{
+  "captured_utc": "2026-10-26T21:57:06.063481+00:00",
+  "adb_serial": null,
+  "independently_verified": true,
+  "method": "adb exec-out cat, separate on-device sha256sum",
+  "files": {
+    "a610_zap.mdt": {
+      "remote": "/vendor/firmware/a610_zap.mdt",
+      "sha256": "6577effdc2a6ed5980a0de608bb1b5801f2abe28b64124aa50244e7782bd7c9c",
+      "bytes": 6860
+    },
+    "a610_zap.b02": {
+      "remote": "/vendor/firmware/a610_zap.b02",
+      "sha256": "84c657996f3ec60a90d0c7223faad9b0700074fe00dc55596e0d3ba69b914d33",
+      "bytes": 2096
+    },
+    "a630_sqe.fw": {
+      "remote": "/vendor/firmware/a630_sqe.fw",
+      "sha256": "a0e1b583f620fabe32729ce367959d1960638663244d7d0cfc21b9a5215a018b",
+      "bytes": 32304
+    }
+  }
+}

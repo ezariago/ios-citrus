@@ -1,0 +1,247 @@
+{
+  "status": "observed wiring and source-derived register inventory; not hardware-verified XNU touch support",
+  "live_tree": "device-dumps/20261025-141423-923416/live-tree.json",
+  "nodes": {
+    "/soc/spi@4a88000": {
+      "compatible": [
+        "qcom,spi-geni"
+      ],
+      "#address-cells": [
+        "0x1"
+      ],
+      "#size-cells": [
+        "0x0"
+      ],
+      "reg": [
+        "0x4a88000",
+        "0x4000"
+      ],
+      "reg-names": [
+        "se_phys"
+      ],
+      "clock-names": [
+        "se-clk",
+        "m-ahb",
+        "s-ahb"
+      ],
+      "clocks": [
+        "0x17",
+        "0x60",
+        "0x17",
+        "0x68",
+        "0x17",
+        "0x69"
+      ],
+      "pinctrl-names": [
+        "default",
+        "sleep"
+      ],
+      "pinctrl-0": [
+        "0x15c",
+        "0x15d"
+      ],
+      "pinctrl-1": [
+        "0x15e",
+        "0x15f"
+      ],
+      "interrupts": [
+        "0x0",
+        "0x149",
+        "0x4"
+      ],
+      "spi-max-frequency": [
+        "0x2faf080"
+      ],
+      "qcom,wrapper-core": [
+        "0x145"
+      ],
+      "dmas": [
+        "0x14b",
+        "0x0",
+        "0x2",
+        "0x1",
+        "0x40",
+        "0x0",
+        "0x14b",
+        "0x1",
+        "0x2",
+        "0x1",
+        "0x40",
+        "0x0"
+      ],
+      "dma-names": [
+        "tx",
+        "rx"
+      ],
+      "status": [
+        "ok"
+      ],
+      "phandle": [
+        "0x32d"
+      ]
+    },
+    "/soc/spi@4a88000/focaltech@0": {
+      "compatible": [
+        "focaltech,fts"
+      ],
+      "panel": [
+        "0x413",
+        "0x417"
+      ],
+      "reg": [
+        "0x0"
+      ],
+      "spi-max-frequency": [
+        "0x5b8d80"
+      ],
+      "interrupt-parent": [
+        "0x11"
+      ],
+      "interrupts": [
+        "0x5d",
+        "0x2"
+      ],
+      "focaltech,reset-gpio": [
+        "0x11",
+        "0x67",
+        "0x1"
+      ],
+      "focaltech,irq-gpio": [
+        "0x11",
+        "0x5d",
+        "0x2"
+      ],
+      "focaltech,max-touch-number": [
+        "0xa"
+      ],
+      "focaltech,display-coords": [
+        "0x0",
+        "0x0",
+        "0x438",
+        "0x924"
+      ],
+      "pinctrl-names": [
+        "pmx_ts_active",
+        "pmx_ts_suspend",
+        "pmx_ts_release"
+      ],
+      "pinctrl-0": [
+        "0x306",
+        "0x308"
+      ],
+      "pinctrl-1": [
+        "0x307",
+        "0x309"
+      ],
+      "pinctrl-2": [
+        "0x30a"
+      ],
+      "touch_vddio-supply": [
+        "0x12"
+      ],
+      "touch_lab-supply": [
+        "0x232"
+      ],
+      "touch_ibb-supply": [
+        "0x233"
+      ]
+    },
+    "/soc/qcom,qupv3_0_geni_se@4ac0000": {
+      "compatible": [
+        "qcom,qupv3-geni-se"
+      ],
+      "reg": [
+        "0x4ac0000",
+        "0x2000"
+      ],
+      "qcom,msm-bus,num-paths": [
+        "0x2"
+      ],
+      "qcom,msm-bus,vectors-bus-ids": [
+        "0xb0",
+        "0x337",
+        "0x97",
+        "0x200"
+      ],
+      "qcom,vote-for-bw": true,
+      "iommus": [
+        "0x18",
+        "0xe3",
+        "0x0"
+      ],
+      "qcom,iommu-dma-addr-pool": [
+        "0x40000000",
+        "0xc0000000"
+      ],
+      "qcom,iommu-dma": [
+        "fastmap"
+      ],
+      "phandle": [
+        "0x145"
+      ]
+    },
+    "/soc/qcom,gcc@1400000": {
+      "compatible": [
+        "qcom,bengal-gcc",
+        "syscon"
+      ],
+      "reg": [
+        "0x1400000",
+        "0x1f0000"
+      ],
+      "reg-names": [
+        "cc_base"
+      ],
+      "vdd_cx-supply": [
+        "0x21"
+      ],
+      "vdd_cx_ao-supply": [
+        "0x62"
+      ],
+      "vdd_mx-supply": [
+        "0x1a"
+      ],
+      "#clock-cells": [
+        "0x1"
+      ],
+      "#reset-cells": [
+        "0x1"
+      ],
+      "phandle": [
+        "0x17"
+      ]
+    }
+  },
+  "spi_pin_group": [
+    6,
+    7,
+    71
+  ],
+  "spi_cs0_gpio": 80,
+  "gpio_mux_function": 1,
+  "irq_gpio": 93,
+  "reset_gpio": 103,
+  "tlmm_config_pa": {
+    "6": "0x00506000",
+    "7": "0x00507000",
+    "71": "0x00547000",
+    "80": "0x00550000",
+    "93": "0x0055d000",
+    "103": "0x00967000"
+  },
+  "clock_branch_offsets": {
+    "m_ahb": "0x1f004",
+    "s_ahb": "0x1f008",
+    "core": "0x1f00c",
+    "core2x": "0x1f014",
+    "se2": "0x1f3a4"
+  },
+  "gcc_vote_register": "0x7900c",
+  "gcc_vote_mask": "0x13c0",
+  "se2_rcg": "0x1f3a8",
+  "caveats": [
+    "FocalTech pinctrl references resolve to GPIO80/71, despite explicit IRQ93/reset103 properties. Do not apply those groups blindly.",
+    "SPI data/clock group signal roles need verification.",
+    "SPI framing/CRC/firmware requirements are not established by the fetched I2C driver."
+  ]
+}

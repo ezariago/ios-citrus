@@ -1,0 +1,74 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -55,6 +55,8 @@
+ /* Opt-in experiment: serializes present + hold transitions, not FIFO ordering. */
+ static IOLock *sweet_fb_serial_lock;
+ static uint32_t sweet_fb_serial_mode, sweet_fb_serial_deferred;
++/* Experimental: let held non-pool screen surfaces scan out without a copy. */
++static uint32_t sweet_fb_scan_all, sweet_fb_scan_cached;
+ static uint32_t sweet_touch_lat;
+ static int sweet_fb_scaler_log;
+ static int sweet_fb_noscale;	/* fbnoscale=1: fetch the small buffer with no scaler (A/B) */                 /* fbdump=1: log the scaler programming */
+@@ -674,11 +676,23 @@
+ 	uint32_t lock = 0;
+ 	fVLock = PE_parse_boot_argn("sweetfb_lock", &lock, sizeof(lock)) && lock != 0 && fIntf1 != NULL && fVTotal > 100;
+ 	fPanelUS = 8333;
++	(void)PE_parse_boot_argn("fbscanall", &sweet_fb_scan_all, sizeof(sweet_fb_scan_all));
++	if (sweet_fb_scan_all && sweet_fb_nohold()) {
++		IOLog("SWEET FB: fbscanall disabled: surface holds are off\n");
++		sweet_fb_scan_all = 0;
++	}
+ 	uint32_t serial_present = 0;
+ 	if (PE_parse_boot_argn("fbserial", &serial_present, sizeof(serial_present)) && serial_present != 0) {
+ 		sweet_fb_serial_lock = IOLockAlloc();
+ 		sweet_fb_serial_mode = sweet_fb_serial_lock ? serial_present : 0;
+ 		IOLog("SWEET FB: experimental present serialization mode %u\n", sweet_fb_serial_mode);
++	}
++	if (sweet_fb_scan_all && sweet_fb_serial_mode != 2) {
++		IOLog("SWEET FB: fbscanall disabled: requires fbserial=2\n");
++		sweet_fb_scan_all = 0;
++	}
++	if (sweet_fb_scan_all) {
++		IOLog("SWEET FB: experimental held non-pool scanout enabled\n");
+ 	}
+ 	IOLog("SWEET FB: vsync %s the panel (%u lines a frame)\n", fVLock ? "follows" : "does not follow", fVTotal);
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+@@ -1114,7 +1128,10 @@
+ 			layer = layer < 0 ? (int)i : -2;
+ 		}
+ 	}
+-	return layer >= 0 && held[layer] != NULL && held[layer]->gpuPool && !fPowerOff && !fConsShown;
++	return layer >= 0 && held[layer] != NULL &&
++	    (held[layer]->gpuPool || (sweet_fb_scan_all && held[layer]->scanoutPhys != 0 &&
++	    held[layer]->bytesPerElement == 4 && held[layer]->width >= fWidth && held[layer]->height >= fHeight)) &&
++	    !fPowerOff && !fConsShown;
+ }
+ 
+ void
+@@ -1289,7 +1306,9 @@
+ 			    __atomic_exchange_n(&fb_scan_samples, 0, __ATOMIC_RELAXED),
+ 			    __atomic_exchange_n(&fb_scan_regressions, 0, __ATOMIC_RELAXED));
+ 			if (sweet_fb_serial_mode == 2) {
+-				IOLog("SWEET FB: timer present deferrals %u\n", __atomic_exchange_n(&sweet_fb_serial_deferred, 0, __ATOMIC_RELAXED));
++				IOLog("SWEET FB: timer present deferrals %u, cached direct scans %u\n",
++				    __atomic_exchange_n(&sweet_fb_serial_deferred, 0, __ATOMIC_RELAXED),
++				    __atomic_exchange_n(&sweet_fb_scan_cached, 0, __ATOMIC_RELAXED));
+ 			}
+ 			IOLog("SWEET FB: direct flush-clear intervals (8.33 ms buckets, %u samples): %u %u %u %u %u %u %u %u\n",
+ 			    fb_obs_clear_samples, fb_obs_clear_iv[0], fb_obs_clear_iv[1], fb_obs_clear_iv[2], fb_obs_clear_iv[3],
+@@ -1804,8 +1823,13 @@
+ 						__atomic_fetch_add(&fb_scan_regressions, 1, __ATOMIC_RELAXED);
+ 					}
+ 				}
+-				if (s->gpuPool) {
+-					/* GPU pool memory (write-combined): the MDP scans the surface itself, no copy */
++				if (s->gpuPool || (sweet_fb_scan_all && !fPowerOff && !fConsShown)) {
++					/* Experiment: held cached surfaces need cache maintenance before MDP fetch.
++					 * IOSurface in-use cooperation and GPU/CPU coherency must be tested. */
++					if (!s->gpuPool) {
++						sweet_dcache_clean((vm_offset_t)(va + srcOff), (unsigned)((uint64_t)fHeight * s->bytesPerRow));
++						__atomic_fetch_add(&sweet_fb_scan_cached, 1, __ATOMIC_RELAXED);
++					}
+ 					scanFrom(pa, s->bytesPerRow);
+ 					fb_observed_scan = 1;
+ 					fb_observed_ready = timing_ready;

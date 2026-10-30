@@ -1,0 +1,164 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -699,6 +699,9 @@
+ 	return true;
+ }
+ 
++/* Best-effort observation only; do not serialize the two presentation paths. */
++static uint32_t fb_present_active, fb_present_overlap, fb_scan_last_seq, fb_scan_regressions, fb_scan_samples;
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -813,7 +816,11 @@
+ 		fb->flipBack();
+ 	}
+ 	if (rec != NULL) {
++		if (__atomic_fetch_add(&fb_present_active, 1, __ATOMIC_RELAXED) != 0) {
++			__atomic_fetch_add(&fb_present_overlap, 1, __ATOMIC_RELAXED);
++		}
+ 		fb->present(rec);
++		__atomic_fetch_sub(&fb_present_active, 1, __ATOMIC_RELAXED);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 		IOLockLock(fb->fLock);
+ 		memcpy(fb->fRetireHold, fb->fShowHold, sizeof(taken));
+@@ -1121,8 +1128,16 @@
+ static uint64_t fb_iv_last, fb_iv_min, fb_iv_max;
+ static uint32_t fb_latch_max_us, fb_latch_slow, fb_latch_late;   /* the wait for the MDP to latch a frame */
+ /* A frame that arrives late is the thing the user feels; say what the presenter was doing then. */
+-static uint32_t fb_present_us, fb_present_latch_us, fb_hitch_said;
++static uint32_t fb_present_us, fb_present_latch_us;
++static uint32_t fb_hitch_count, fb_hitch_queue, fb_hitch_busy, fb_hitch_wait_max_us;
+ static uint32_t fb_scan_us, fb_wait_us;     /* present(): the pixel census and the wait for the GPU */
++/* Presenter-only observations; a surface/fence pair is not a pixel-content hash. */
++static uint32_t fb_observed_scan, fb_observed_ready, fb_observed_fence, fb_observed_sid;
++static uint32_t fb_obs_frames, fb_obs_scans, fb_obs_latched, fb_obs_zero_fence, fb_obs_unready;
++static uint32_t fb_obs_same_pair, fb_obs_last_sid, fb_obs_last_fence;
++static bool fb_obs_last_valid;
++static uint64_t fb_obs_last_clear;
++static uint32_t fb_obs_clear_iv[FB_IV_BUCKETS], fb_obs_clear_samples;
+ 
+ void
+ AppleCLCD::frameShown(void)
+@@ -1139,11 +1154,14 @@
+ 		if (ns > fb_iv_max) {
+ 			fb_iv_max = ns;
+ 		}
+-		if (ns >= 25000000ull && fb_hitch_said < 16) {
+-			fb_hitch_said++;
+-			IOLog("SWEET FB: hitch %llu us: queue %u, MDP busy %u, previous present %u us (census %u, GPU wait %u) / latch %u us, %llu swaps\n",
+-			    ns / 1000, fQWaiting, (fCtl0[0x18 / 4] & 0x20001) != 0, fb_present_us, fb_scan_us,
+-			    fb_wait_us, fb_present_latch_us, sweet_fb_swap_count);
++		/* Exclude long gaps, which are often idle; aggregate without per-hitch logging. */
++		if (ns >= 25000000ull && ns < 250000000ull) {
++			fb_hitch_count++;
++			fb_hitch_queue += fQWaiting != 0;
++			fb_hitch_busy += (fCtl0[0x18 / 4] & 0x20001) != 0;
++			if (fb_wait_us > fb_hitch_wait_max_us) {
++				fb_hitch_wait_max_us = fb_wait_us;
++			}
+ 		}
+ 		fb_iv_frames++;
+ 	}
+@@ -1153,8 +1171,10 @@
+ 		    "latch max %u us, %u over 8 ms, %u expired\n",
+ 		    fb_iv[0], fb_iv[1], fb_iv[2], fb_iv[3], fb_iv[4], fb_iv[5], fb_iv[6], fb_iv[7],
+ 		    fb_iv_min / 1000, fb_iv_max / 1000, fb_latch_max_us, fb_latch_slow, fb_latch_late);
++		IOLog("SWEET FB: intervals 25-250 ms: %u, queue nonempty %u, MDP busy %u, previous GPU wait max %u us\n",
++		    fb_hitch_count, fb_hitch_queue, fb_hitch_busy, fb_hitch_wait_max_us);
+ 		fb_latch_max_us = fb_latch_slow = fb_latch_late = 0;
+-		fb_hitch_said = 0;
++		fb_hitch_count = fb_hitch_queue = fb_hitch_busy = fb_hitch_wait_max_us = 0;
+ 		bzero(fb_iv, sizeof(fb_iv));
+ 		fb_iv_frames = 0;
+ 		fb_iv_min = fb_iv_max = 0;
+@@ -1177,7 +1197,12 @@
+ 		sweet_hold_set(dropped, false);
+ 		uint64_t waited = mach_absolute_time(), wns = 0;  /* (present waits for the GPU too) */
+ 		fTimingReady = 0;
++		fb_observed_scan = fb_observed_ready = fb_observed_fence = fb_observed_sid = 0;
++		if (__atomic_fetch_add(&fb_present_active, 1, __ATOMIC_RELAXED) != 0) {
++			__atomic_fetch_add(&fb_present_overlap, 1, __ATOMIC_RELAXED);
++		}
+ 		present(rec);
++		__atomic_fetch_sub(&fb_present_active, 1, __ATOMIC_RELAXED);
+ 		uint64_t shown_us = sweet_touch_lat ? sweet_time_us() : 0;
+ 		uint64_t latch_from = mach_absolute_time(), latch_ns = 0;
+ 		for (int t = 0; t < 250 && (fCtl0[0x18 / 4] & 0x20001) != 0; t++) {
+@@ -1197,6 +1222,44 @@
+ 				fb_latch_late++;                /* the 25 ms poll expired without a latch */
+ 			}
+ 			fb_present_latch_us = us;
++		}
++		/* These counts distinguish requests, direct scan programming and flush-bit
++		 * completion. They do not prove distinct pixels or panel illumination. */
++		fb_obs_frames++;
++		if (fb_observed_scan) {
++			fb_obs_scans++;
++			if ((fCtl0[0x18 / 4] & 0x20001) == 0) {
++				uint64_t clear = mach_absolute_time(), ns = 0;
++				fb_obs_latched++;
++				if (fb_obs_last_clear != 0) {
++					absolutetime_to_nanoseconds(clear - fb_obs_last_clear, &ns);
++					unsigned bucket = (unsigned)(ns / 8333333ull);
++					fb_obs_clear_iv[bucket < FB_IV_BUCKETS ? bucket : FB_IV_BUCKETS - 1]++;
++					fb_obs_clear_samples++;
++				}
++				fb_obs_last_clear = clear;
++			}
++			fb_obs_zero_fence += fb_observed_fence == 0;
++			fb_obs_unready += !fb_observed_ready;
++			fb_obs_same_pair += fb_obs_last_valid && fb_obs_last_sid == fb_observed_sid &&
++			    fb_obs_last_fence == fb_observed_fence;
++			fb_obs_last_valid = true;
++			fb_obs_last_sid = fb_observed_sid;
++			fb_obs_last_fence = fb_observed_fence;
++		}
++		if (fb_obs_frames == 256) {
++			IOLog("SWEET FB: direct attempts %u, scans %u, flush clear %u, zero fence %u, wait failed %u, same surface/fence %u\n",
++			    fb_obs_frames, fb_obs_scans, fb_obs_latched, fb_obs_zero_fence, fb_obs_unready, fb_obs_same_pair);
++			IOLog("SWEET FB: present overlap %u, scan-id samples %u, observed regressions %u (field 0x50; not display order)\n",
++			    __atomic_exchange_n(&fb_present_overlap, 0, __ATOMIC_RELAXED),
++			    __atomic_exchange_n(&fb_scan_samples, 0, __ATOMIC_RELAXED),
++			    __atomic_exchange_n(&fb_scan_regressions, 0, __ATOMIC_RELAXED));
++			IOLog("SWEET FB: direct flush-clear intervals (8.33 ms buckets, %u samples): %u %u %u %u %u %u %u %u\n",
++			    fb_obs_clear_samples, fb_obs_clear_iv[0], fb_obs_clear_iv[1], fb_obs_clear_iv[2], fb_obs_clear_iv[3],
++			    fb_obs_clear_iv[4], fb_obs_clear_iv[5], fb_obs_clear_iv[6], fb_obs_clear_iv[7]);
++			bzero(fb_obs_clear_iv, sizeof(fb_obs_clear_iv));
++			fb_obs_clear_samples = 0;
++			fb_obs_frames = fb_obs_scans = fb_obs_latched = fb_obs_zero_fence = fb_obs_unready = fb_obs_same_pair = 0;
+ 		}
+ 		if (sweet_touch_lat && fTimingReady) {
+ 			if ((fCtl0[0x18 / 4] & 0x20001) == 0) {
+@@ -1652,6 +1715,7 @@
+ 	sweet_fb_trace("dp-surf", s->width, s->gpuPool ? 1 : 0);
+ 	bool ok = false;
+ 	uint64_t wait_from = mach_absolute_time(), wait_ns = 0;
++	uint32_t observed_fence = s->drawn;
+ 	bool timing_ready = topaz_surface_drawn(s, 100);
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - wait_from, &wait_ns);
+ 	fb_wait_us = (uint32_t)(wait_ns / 1000);
+@@ -1690,9 +1754,23 @@
+ 				 * next frame in this surface at once, so scanning it directly let
+ 				 * the panel show frames half drawn. Cached to cached, a few ms.
+ 				 */
++				/* Record ordering of observed record field 0x50 just before either scan path.
++				 * Its semantics and concurrent scheduling must be validated before drawing conclusions. */
++				uint32_t seq = get32(rec, 0x50);
++				if (seq != 0) {
++					uint32_t prev = __atomic_exchange_n(&fb_scan_last_seq, seq, __ATOMIC_RELAXED);
++					__atomic_fetch_add(&fb_scan_samples, 1, __ATOMIC_RELAXED);
++					if (prev != 0 && (int32_t)(seq - prev) < 0) {
++						__atomic_fetch_add(&fb_scan_regressions, 1, __ATOMIC_RELAXED);
++					}
++				}
+ 				if (s->gpuPool) {
+ 					/* GPU pool memory (write-combined): the MDP scans the surface itself, no copy */
+ 					scanFrom(pa, s->bytesPerRow);
++					fb_observed_scan = 1;
++					fb_observed_ready = timing_ready;
++					fb_observed_sid = get32(rec, 0x54 + 4 * layer);
++					fb_observed_fence = observed_fence;
+ 				} else if (fFlip[0] != NULL) {
+ 					flipFrom((const uint8_t *)(va + s->offset + (uint64_t)oy * s->bytesPerRow + (uint64_t)ox * 4),
+ 					    s->bytesPerRow);

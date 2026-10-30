@@ -53,6 +53,22 @@ static void clear(uintptr_t dst, uint64_t size)
 static uint32_t read32(uintptr_t p) { return *(volatile uint32_t *)p; }
 static void write32(uintptr_t p, uint32_t v) { *(volatile uint32_t *)p = v; }
 
+static uintptr_t find_redistributor(uint32_t affinity)
+{
+    for (uintptr_t offset = 0; offset < 0x100000; offset += 0x20000) {
+        uint64_t typer = *(volatile uint64_t *)(0x0f300008 + offset);
+        if ((uint32_t)(typer >> 32) == affinity) return 0x0f300000 + offset;
+        if (typer & 16) break;
+    }
+    return 0;
+}
+
+/*
+ * Both clusters use the same GICv3 distributor. Every core XNU may start must
+ * have its redistributor awake with SGIs/PPIs in Group 1 and enabled before the
+ * kernel sends its first self-SGI; the boot CPU cannot rely on another core to
+ * do this for it.
+ */
 static int prepare_gic(void)
 {
     uint64_t sre;
@@ -61,27 +77,29 @@ static int prepare_gic(void)
     __asm__ volatile("msr icc_sre_el1, %0; isb" : : "r"(sre));
     write32(0x0f200000, read32(0x0f200000) | 0x13);
     for (unsigned i = 0; i < 1000000 && (read32(0x0f200000) >> 31); ++i) {}
-    uintptr_t redistributor = 0;
-    for (uintptr_t offset = 0; offset < 0x100000; offset += 0x20000) {
-        uint64_t typer = *(volatile uint64_t *)(0x0f300008 + offset);
-        if ((typer >> 32) == 0x100) { redistributor = 0x0f300000 + offset; break; }
-        if (typer & 16) break;
+
+    static const uint32_t affinities[] = {0, 1, 2, 3, 0x100, 0x101, 0x102, 0x103};
+    unsigned prepared = 0;
+    for (unsigned n = 0; n < sizeof(affinities) / sizeof(affinities[0]); ++n) {
+        uintptr_t r = find_redistributor(affinities[n]);
+        if (!r) continue;
+        write32(r + 0x14, read32(r + 0x14) & ~2U);
+        for (unsigned i = 0; i < 1000000 && (read32(r + 0x14) & 4); ++i) {}
+        if (read32(r + 0x14) & 4) return 0;
+        write32(r + 0x10080, 0xffffffff);
+        for (unsigned i = 0; i < 32; ++i)
+            *(volatile uint8_t *)(r + 0x10400 + i) = 0xa0;
+        write32(r + 0x10100, (1U << 19) | (1U << 18) | (1U << 1));
+        ++prepared;
     }
-    if (!redistributor) return 0;
-    write32(redistributor + 0x14, read32(redistributor + 0x14) & ~2U);
-    for (unsigned i = 0; i < 1000000 && (read32(redistributor + 0x14) & 4); ++i) {}
-    if (read32(redistributor + 0x14) & 4) return 0;
-    write32(redistributor + 0x10080, 0xffffffff);
-    for (unsigned i = 0; i < 32; ++i)
-        *(volatile uint8_t *)(redistributor + 0x10400 + i) = 0xa0;
-    write32(redistributor + 0x10100, (1U << 19) | (1U << 18) | (1U << 1));
+    if (prepared < 2) return 0;
     uint64_t ctlr;
     __asm__ volatile("mrs %0, icc_ctlr_el1" : "=r"(ctlr));
     ctlr &= ~2UL;
     __asm__ volatile("msr icc_ctlr_el1, %0; msr icc_pmr_el1, %1;"
                      "msr icc_bpr1_el1, xzr; msr icc_igrpen1_el1, %2; isb"
                      : : "r"(ctlr), "r"(0xf0UL), "r"(1UL) : "memory");
-    line("GICR", redistributor);
+    line("GICR PREPARED", prepared);
     return 1;
 }
 

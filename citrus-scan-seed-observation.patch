@@ -1,0 +1,48 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -58,8 +58,14 @@
+ /* Experimental: let held non-pool screen surfaces scan out without a copy. */
+ static uint32_t sweet_fb_scan_all, sweet_fb_scan_cached;
+ /* Best-effort: changed fence means GPU named the surface, not necessarily wrote it. */
+-static uint32_t fb_cached_shown_sid, fb_cached_shown_fence;
+-static uint32_t fb_cached_recheck, fb_cached_fence_changed;
++static uint32_t fb_cached_shown_sid, fb_cached_shown_fence, fb_cached_shown_seed;
++static uint32_t fb_cached_recheck, fb_cached_fence_changed, fb_cached_seed_changed;
++/* Shared IOSurface seed: write-unlock increments it; raw writes are invisible. */
++static uint32_t
++fb_surface_seed(SweetSurface *s)
++{
++	return __atomic_load_n((uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + 0xc), __ATOMIC_RELAXED);
++}
+ static uint32_t sweet_touch_lat;
+ static int sweet_fb_scaler_log;
+ static int sweet_fb_noscale;	/* fbnoscale=1: fetch the small buffer with no scaler (A/B) */                 /* fbdump=1: log the scaler programming */
+@@ -1250,6 +1256,7 @@
+ 				if (previous != NULL && previous->id == fb_cached_shown_sid) {
+ 					fb_cached_recheck++;
+ 					fb_cached_fence_changed += previous->drawn != fb_cached_shown_fence;
++					fb_cached_seed_changed += fb_surface_seed(previous) != fb_cached_shown_seed;
+ 					break;
+ 				}
+ 			}
+@@ -1320,9 +1327,9 @@
+ 			    __atomic_exchange_n(&fb_scan_samples, 0, __ATOMIC_RELAXED),
+ 			    __atomic_exchange_n(&fb_scan_regressions, 0, __ATOMIC_RELAXED));
+ 			if (sweet_fb_scan_all) {
+-				IOLog("SWEET FB: cached shown surface fence rechecks %u changed %u (GPU named, not necessarily wrote)\n",
+-				    fb_cached_recheck, fb_cached_fence_changed);
+-				fb_cached_recheck = fb_cached_fence_changed = 0;
++				IOLog("SWEET FB: cached shown rechecks %u, GPU fence changed %u, CPU write-unlock seed changed %u\n",
++				    fb_cached_recheck, fb_cached_fence_changed, fb_cached_seed_changed);
++				fb_cached_recheck = fb_cached_fence_changed = fb_cached_seed_changed = 0;
+ 			}
+ 			if (sweet_fb_serial_mode == 2) {
+ 				IOLog("SWEET FB: timer present deferrals %u, cached direct scans %u\n",
+@@ -1355,6 +1362,7 @@
+ 				if (current != NULL && !current->gpuPool && current->id == fb_observed_sid) {
+ 					fb_cached_shown_sid = current->id;
+ 					fb_cached_shown_fence = current->drawn;
++					fb_cached_shown_seed = fb_surface_seed(current);
+ 					break;
+ 				}
+ 			}

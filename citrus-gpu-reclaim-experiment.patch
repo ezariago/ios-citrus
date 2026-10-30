@@ -1,0 +1,97 @@
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -480,6 +480,14 @@
+ extern "C" void topaz_gpu_pool_free(uint64_t address, uint64_t size);
+ void topaz_gpu_pool_free(uint64_t address, uint64_t size) { gpu_pool_give_back(address, size); }
+ 
++/* The arena ranges become immutable before RedwoodGPU publishes clients. */
++extern "C" bool topaz_gpu_pool_owns(uint64_t address);
++bool topaz_gpu_pool_owns(uint64_t address)
++{
++    return (gpu_pool_md != NULL && address >= gpu_pool_pa && address - gpu_pool_pa < gpu_pool_total) ||
++        (gpu_pool_md2 != NULL && address >= gpu_pool_pa2 && address - gpu_pool_pa2 < gpu_pool_size2);
++}
++
+ /* boot-arg gpu_identity (default 1): the SMMU passes addresses through (TopazGpuW G1), GPU VA = PA */
+ static uint32_t gpu_identity = 1;
+ static uint32_t citrus_smmu_39 = 0;
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -54,6 +54,7 @@
+ bool redwood_gpu_ready(void);
+ bool redwood_gpu_identity(void);
+ uint64_t topaz_gpu_pool_alloc(uint64_t size, void ** va);
++bool topaz_gpu_pool_owns(uint64_t address);
+ bool citrus_gpu_pool_sample(uint64_t now_ns, bool failed, uint64_t *free_bytes,
+     uint64_t *largest, unsigned *blocks, uint64_t *attempts, uint64_t *failures);
+ IOMemoryDescriptor * topaz_gpu_pool_md(uint64_t pa, uint64_t size);
+@@ -453,6 +454,7 @@
+ #define GPU_KEPT_SECONDS        60              /* a buffer not asked for again in so long is let go */
+ #define GPU_KEEP_FROM           (256u << 10)    /* bytes: smaller ones are not worth it */
+ static TUNABLE(uint32_t, gGPUKeep, "gpu_keep", 1);      /* boot-arg gpu_keep=0 (a test): none kept; gpu_keep=2: kept ones cleared when given again */
++static TUNABLE(uint32_t, gGPUReclaim, "gpureclaim", 0); /* opt-in: reclaim this client's completed pool cache on pool miss */
+ 
+ class RedwoodGPUUserClient : public IOUserClient
+ {
+@@ -477,6 +479,7 @@
+ 	bool keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags);
+ 	void dropKept(struct gpu_kept * k);
+ 	void reap(void);
++	uint64_t reclaimPool(uint64_t size, void **va); /* only completed per-client pool cache */
+ 	IOReturn gemNew(struct msm_gem_new * request);
+ 	IOReturn surfaceBuffer(struct redwood_surface * request);
+ 	IOReturn gemInfo(struct msm_gem_info * request);
+@@ -739,6 +742,41 @@
+ 	k->memory->release();
+ 	k->memory = NULL;
+ 	fKeptBytes -= k->size;
++}
++
++/* Only the allocating client's completed pool-backed cache is eligible. Never
++ * reclaim fLeft (which may still be busy), active handles, other clients, or
++ * low-memory allocations. Holding gGPULock serializes cache reuse/destruction;
++ * dropKept already uses the same lock order (gGPULock -> pool lock). */
++uint64_t
++RedwoodGPUUserClient::reclaimPool(uint64_t size, void **va)
++{
++	uint64_t pa = 0, released = 0;
++	uint32_t n = 0;
++	IOLockLock(gGPULock);
++	for (;;) {
++		struct gpu_kept *oldest = NULL;
++		for (uint32_t i = 0; i < GPU_KEPT; i++) {
++			struct gpu_kept *k = &fKept[i];
++			if (k->memory != NULL && topaz_gpu_pool_owns(k->address) &&
++			    (oldest == NULL || k->since < oldest->since)) { oldest = k; }
++		}
++		if (oldest == NULL) { break; }
++		released += oldest->size;
++		dropKept(oldest);
++		n++;
++		pa = topaz_gpu_pool_alloc(size, va);
++		if (pa != 0) { break; }
++	}
++	IOLockUnlock(gGPULock);
++	/* Sparse diagnostic: do not print on every allocation failure. */
++	static uint32_t calls;
++	uint32_t count = __atomic_add_fetch(&calls, 1, __ATOMIC_RELAXED);
++	if (count == 1 || (count & 63) == 0) {
++		IOLog("CitrusGPU reclaim: attempts=%u dropped=%u bytes=%llu result=%s\n",
++		    count, n, released, pa ? "pool" : "miss");
++	}
++	return pa;
+ }
+ 
+ /* With the lock held, the GPU done with the buffer: kept if it is worth it (those kept longest make way). */
+@@ -839,7 +877,10 @@
+ 		void *va = NULL;
+ 		uint64_t pool_started = mach_absolute_time(), pa = 0, pool_done;
+ 		uint64_t low_started, low_done;
+-		if (pool_first) { pa = topaz_gpu_pool_alloc(size, &va); }
++		if (pool_first) {
++			pa = topaz_gpu_pool_alloc(size, &va);
++			if (pa == 0 && gGPUReclaim) { pa = reclaimPool(size, &va); }
++		}
+ 		pool_done = mach_absolute_time();
+ 		low_started = low_done = pool_done;
+ 		if (pool_first) {

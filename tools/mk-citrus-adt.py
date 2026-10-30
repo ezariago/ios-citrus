@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a one-Gold-core ADT for a driver-free Citrus XNU boot."""
+"""Generate a Citrus ADT: 1-4 Gold cores, optional UFS and display nodes."""
 import pathlib
 import struct
 import sys
@@ -27,17 +27,27 @@ parser.add_argument('--ufs', action='store_true', help='Include UFS node; use uf
 parser.add_argument('--display', action='store_true', help='Include native-sized iOS display service')
 parser.add_argument('--ram-mib', type=int, default=1024,
                     help='Kernel-managed RAM from 0x80000000 (1024 default; 1792 verified '
-                         'free below the 0xf3c00000 reservation)')
+                         'free below the 0xf3c00000 reservation, ending at 0xf0000000). '
+                         'Not a tuning knob: shim/xnu-loader.c whitelists 1024/1792, and 4 GiB '
+                         'is impossible — RAM from 0x80000000 is 3 GiB (ends at 0x140000000).')
+parser.add_argument('--cpus', type=int, default=1,
+                    help='Number of Gold (A73) CPU nodes to publish, 1-4. ml_parse_cpu_topology '
+                         'selects this many only if the cmdline also says cpus=N; the remaining '
+                         'cores are started by PSCI (SweetCPU.cpp). SMP is NOT hardware-tested '
+                         'on citrus: 1 is the only proven value.')
 args = parser.parse_args()
 # 0x80000000..0xf3c00000 is System RAM with no reservation; stay below it.
 if not 256 <= args.ram_mib <= 1792 or args.ram_mib % 16:
     parser.error('--ram-mib must be a multiple of 16 between 256 and 1792')
+if not 1 <= args.cpus <= 4:
+    parser.error('--cpus must be 1-4: mkadt.py emits only the four Gold A73 nodes '
+                 '(MPIDR 0x100-0x103) on the phone path')
 mkadt.MEM_SIZE = args.ram_mib << 20
 tree = mkadt.build(native=True)
 tree.children = [node for node in tree.children if args.ufs or node.name != 'sweet-ufs']
 for node in tree.children:
     if node.name == 'cpus':
-        node.children = node.children[:1]
+        node.children = node.children[:args.cpus]
         cpu = node.children[0]
         cpu.props = [(name, flags, struct.pack('<I', 2000000000) if name == 'clock-frequency' else value)
                      for name, flags, value in cpu.props]
@@ -60,5 +70,5 @@ for node in tree.children:
 destination = args.output
 destination.parent.mkdir(parents=True, exist_ok=True)
 destination.write_bytes(adt.serialize(tree))
-print(f'Wrote {destination}: one Gold core, {args.ram_mib} MiB at 0x80000000, '
+print(f'Wrote {destination}: {args.cpus} Gold core(s), {args.ram_mib} MiB at 0x80000000, '
       f'UFS={args.ufs}, display={args.display}, WLAN=False')

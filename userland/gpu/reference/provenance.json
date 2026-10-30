@@ -1,0 +1,11 @@
+{
+  "repository": "https://github.com/oosexgang/hackios-xnu-kernel",
+  "commit": "88513176b1e96ecf0b764cd62c6f4e6ac71345e3",
+  "license": "MIT (userland and tools)",
+  "files": {
+    "LICENSE.HakiOS": "861a70c4175cbd49dc10be7ddb060300728175d353d4fd3b8263823bc28f61a0",
+    "mkeagl.py": "c12e554fd53e0ba95c64cec75ce87e64f37ec64013539a2f271956ad1db4f66d",
+    "eagl_slots-ios16.5.txt": "da86f4a9fe193f53236128eaf8b56ca5e00060518e8f674f9b852e9886804cbf"
+  },
+  "dispatch_target": "iOS 16.5 (20F66), MUST validate against 16.7.16 before loading into backboardd"
+}

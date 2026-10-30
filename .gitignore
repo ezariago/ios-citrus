@@ -3,3 +3,4 @@ out/
 device-dumps/
 __pycache__/
 *.pyc
+.DS_Store

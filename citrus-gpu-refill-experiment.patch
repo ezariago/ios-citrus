@@ -1,0 +1,107 @@
+--- a/eagl.c
++++ b/eagl.c
+@@ -348,6 +348,7 @@
+  * Boot-arg glblit=0: the surface's memory, as before.
+  */
+ static int blit_targets = 1;
++static int gpu_refill = 0;              /* experimental boot-arg glgpurefill=1 */
+ /*
+  * A frame that is handed to the display must have been drawn. The display's driver waits for
+  * the GPU itself before it puts a surface on the panel, on a thread of its own, and says so in
+@@ -754,6 +755,69 @@
+ 	return true;
+ }
+ 
++/*
++ * Experimental initial fill of a mirrored, non-inverted BGRA target. The source
++ * is the already imported IOSurface texture; never use this for wrapped or
++ * planar images. Keep the IOSurface read lock held through glFinish so the GPU
++ * cannot outlive the read operation. An unsupported framebuffer falls back to
++ * the CPU upload. All bindings and the scissor enable are restored.
++ */
++static bool
++surface_gpu_refill(struct image *image)
++{
++	GLint read = 0, draw = 0, unpack = 0;
++	GLuint fb[2] = { 0, 0 };
++	GLboolean scissor;
++	bool ok = false;
++	GLenum error;
++
++	if (!gpu_refill || image->mirror == 0 || image->invert || image->alpha_first ||
++	    image->plane != 0 || image->to != GL_TEXTURE_2D || image->format != GL_BGRA ||
++	    image->type != GL_UNSIGNED_BYTE || IOSurfaceGetPlaneCount(image->surface) != 0) {
++		return false;
++	}
++	/* Limit this experiment to the expensive screen-sized initial attachments. */
++	if (image->width < 1000 || image->height < 2000) {
++		return false;
++	}
++	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
++	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
++	glGetIntegerv(0x88ef, &unpack);             /* GL_PIXEL_UNPACK_BUFFER_BINDING */
++	scissor = glIsEnabled(GL_SCISSOR_TEST);
++	while (glGetError() != 0) { }
++	glBindBuffer(0x88ec, 0);                    /* GL_PIXEL_UNPACK_BUFFER */
++	glTexImage2D(GL_TEXTURE_2D, 0, (GLint)internal_format(image->internal, image->format),
++	    image->width, image->height, 0, image->format, image->type, NULL);
++	glBindBuffer(0x88ec, (GLuint)unpack);
++	glGenFramebuffers(2, fb);
++	glBindFramebuffer(GL_READ_FRAMEBUFFER, fb[0]);
++	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->mirror, 0);
++	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb[1]);
++	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
++	if (fb[0] != 0 && fb[1] != 0 &&
++	    glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == 0x8cd5 &&  /* GL_FRAMEBUFFER_COMPLETE */
++	    glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == 0x8cd5 && glGetError() == 0) {
++		glDisable(GL_SCISSOR_TEST);
++		glBlitFramebuffer(0, 0, image->width, image->height, 0, 0, image->width, image->height,
++		    GL_COLOR_BUFFER_BIT, GL_NEAREST);
++		glFinish();
++		ok = glGetError() == 0;
++	}
++	error = glGetError();
++	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
++	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
++	if (scissor) {
++		glEnable(GL_SCISSOR_TEST);
++	} else {
++		glDisable(GL_SCISSOR_TEST);
++	}
++	glDeleteFramebuffers(2, fb);
++	if (!ok || error != 0) {
++		return false;
++	}
++	return true;
++}
++
+ /* Fill a texture, which is bound, from its IOSurface, unless it is the surface. */
+ static void
+ surface_to_texture(struct eagl *e, struct image *image)
+@@ -771,6 +835,18 @@
+ 	}
+ 	if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != 0) {
+ 		say("redwood-gl: an IOSurface cannot be locked\n");
++		return;
++	}
++	if (surface_gpu_refill(image)) {
++		static bool said_gpu_refill;
++		if (!said_gpu_refill) {
++			said_gpu_refill = true;
++			say("redwood-gl: experimental GPU IOSurface refill active\n");
++		}
++		IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
++		image->seed = IOSurfaceGetSeed(surface);
++		e->uploads++;
++		e->upload_bytes += row * (size_t)image->height;
+ 		return;
+ 	}
+ 	base = planar ? IOSurfaceGetBaseAddressOfPlane(surface, image->plane) : IOSurfaceGetBaseAddress(surface);
+@@ -3882,6 +3958,7 @@
+ 		}
+ 		share_surfaces = strstr(arguments, "glcopy=1") == NULL;
+ 		blit_targets = strstr(arguments, "glblit=0") == NULL;
++		gpu_refill = strstr(arguments, "glgpurefill=1") != NULL;
+ 		sync_frames = strstr(arguments, "glsync=0") == NULL;
+ 		one_submit = strstr(arguments, "glonesubmit=0") == NULL;
+ 		if (strstr(arguments, "glwait=0") != NULL || (strstr(arguments, "glwait=1") == NULL && display_waits())) {

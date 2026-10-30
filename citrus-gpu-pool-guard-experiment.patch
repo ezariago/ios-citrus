@@ -1,0 +1,74 @@
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -253,6 +253,8 @@
+ static IOLock                   *gpu_pool_lock;
+ static bool                      gpu_pool_tried;
+ static uint32_t                  gpu_pool_requested_mb = 64;
++/* Experimental best-fit policy with one 10 MiB free block protected. */
++static uint32_t                  gpu_pool_guard;
+ 
+ static bool
+ gpu_pool_reserve(void)
+@@ -324,6 +326,32 @@
+     return gpu_pool_md != NULL;
+ }
+ 
++/* Caller holds gpu_pool_lock. Return gpu_pool_count on a miss. */
++static unsigned
++gpu_pool_choose(uint64_t rounded)
++{
++    if (!gpu_pool_guard) {
++        for (unsigned i = 0; i < gpu_pool_count; i++) {
++            if (!gpu_pool_blocks[i].used && gpu_pool_blocks[i].size >= rounded) { return i; }
++        }
++        return gpu_pool_count;
++    }
++    const uint64_t big = 10ull << 20, small = 8ull << 20;
++    unsigned available_big = 0, best = gpu_pool_count;
++    for (unsigned i = 0; i < gpu_pool_count; i++) {
++        if (!gpu_pool_blocks[i].used && gpu_pool_blocks[i].size >= big) { available_big++; }
++    }
++    for (unsigned i = 0; i < gpu_pool_count; i++) {
++        const struct gpu_pool_block *b = &gpu_pool_blocks[i];
++        if (b->used || b->size < rounded) { continue; }
++        /* At a full block table allocation consumes the whole block. */
++        uint64_t remain = gpu_pool_count < GPU_POOL_MAX_BLOCKS ? b->size - rounded : 0;
++        if (rounded < small && available_big == 1 && b->size >= big && remain < big) { continue; }
++        if (best == gpu_pool_count || b->size < gpu_pool_blocks[best].size) { best = i; }
++    }
++    return best;
++}
++
+ static uint64_t
+ gpu_pool_alloc(uint64_t size, void **va)
+ {
+@@ -334,9 +362,10 @@
+     if (size == 0) { return 0; }
+     if (!gpu_pool_reserve()) { return 0; }
+     IOLockLock(gpu_pool_lock);
+-    for (unsigned i = 0; i < gpu_pool_count; i++) {
++    unsigned chosen = gpu_pool_choose(rounded);
++    if (chosen < gpu_pool_count) {
++        unsigned i = chosen;
+         struct gpu_pool_block *b = &gpu_pool_blocks[i];
+-        if (b->used || b->size < rounded) { continue; }
+         if (b->size - rounded >= 0x4000 && gpu_pool_count < GPU_POOL_MAX_BLOCKS) {
+             memmove(&gpu_pool_blocks[i + 2], &gpu_pool_blocks[i + 1],
+                 (gpu_pool_count - i - 1) * sizeof(gpu_pool_blocks[0]));
+@@ -350,7 +379,6 @@
+         b->used = true;
+         address = b->base;
+         if (va != NULL) { *va = b->arena == 0 ? gpu_pool_va + (address - gpu_pool_pa) : gpu_pool_va2 + (address - gpu_pool_pa2); }
+-        break;
+     }
+     IOLockUnlock(gpu_pool_lock);
+     return address;
+@@ -1877,6 +1905,8 @@
+         core_mhz == 950 ? "PLL0 1900/2" : core_mhz == 600 ? "GPLL0/1" : "GPLL0/2");
+ 
+ 	if (on != 0) {
++        (void)PE_parse_boot_argn("gpuguard", &gpu_pool_guard, sizeof(gpu_pool_guard));
++        IOLog("CitrusGPU: pool guard %u (best-fit, one 10 MiB block)\n", gpu_pool_guard);
+         uint32_t requested_mb = 64;
+         if (PE_parse_boot_argn("gpupoolmb", &requested_mb, sizeof(requested_mb))) {
+             if (requested_mb == 64 || requested_mb == 128) {

@@ -200,6 +200,18 @@ void shim_main(uintptr_t dtb)
         line("FB FORMAT", pipe_format);
         show_memory(dtb);
     }
+#if defined(CITRUS_BOOT_SILVER)
+    /*
+     * 4 KiB experiment: ABL leaves us on Silver core 0.  A 4 KiB kernel does
+     * not need the Gold cluster's 16K granule, so boot XNU here directly and
+     * let PSCI bring up all seven remaining cores.  This avoids the parked
+     * Silver 0 that limits the Gold-boot path to seven CPUs.
+     */
+    if ((RSR(mpidr_el1) & 0xffffff) == 0) {
+        int result = try_xnu();
+        if (result) line("XNU ERROR", (uint64_t)(int64_t)result);
+    }
+#else
     if ((RSR(mpidr_el1) & 0xffffff) != 0x100) {
         line("GOLD TARGET", 0x100);
         uint64_t result = smc(0xc4000003, 0x100, (uintptr_t)gold_entry, dtb);
@@ -211,6 +223,7 @@ void shim_main(uintptr_t dtb)
         int result = try_xnu();
         if (result) line("XNU ERROR", (uint64_t)(int64_t)result);
     }
+#endif
     line("RESET IN SEC", 60);
     /* Return to the bootloader after an observation window for restoration. */
     while (RSR(cntpct_el0) - start < frequency * 60) __asm__ volatile("yield");

@@ -53,11 +53,16 @@ def compile_object(component, target):
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
-    targets = [('osfmk', 'sweet_early.o'), ('osfmk', 'start.o'),
+    # The touch probe embeds the vendor FT8719 boot image; regenerate it from
+    # devices/citrus-ft8719-fw.bin so a stale header can never be linked.
+    subprocess.run(['python3', str(ROOT / 'tools/embed-touch-fw.py')], check=True)
+    targets = [('pexpert', 'pe_fiq.o'),
+               ('osfmk', 'sweet_early.o'), ('osfmk', 'start.o'),
                ('osfmk', 'arm_vm_init.o'), ('iokit', 'SweetBattery.cpo'),
                ('osfmk', 'serial_console.o'), ('iokit', 'SweetFramebuffer.cpo'),
                ('osfmk', 'exception.o'), ('osfmk', 'rtclock.o'), ('osfmk', 'video_console.o'), ('bsd', 'sweet_sample.o'),
-               ('bsd', 'sweet_ufs.o'), ('bsd', 'sweet_usb.o')]
+               ('osfmk', 'cpu.o'),
+               ('bsd', 'sweet_ufs.o'), ('bsd', 'sweet_usb.o'), ('bsd', 'sweet_touch.o')]
     for component, target in targets:
         compile_object(component, target)
     link = ART / 'xnu-kernel/kernel.development.sweet.link'

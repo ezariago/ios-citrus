@@ -1,0 +1,424 @@
+{
+  "hardware_tested": false,
+  "capture": "device-dumps/20261025-141423-923416/live-tree.json",
+  "capture_sha256": "05f688eda4a677c16865d1734f0a7b426a8d5baa7f3596317ff13539ab176dd7",
+  "chip_id": "0x6010000",
+  "zap_base": "0x55a15000",
+  "zap_size": "0x2000",
+  "managed_ram": [
+    "0x80000000",
+    "0xf0000000"
+  ],
+  "cpu_page_size": 16384,
+  "clock_policy": "GPLL0 / 2, 300 MHz bring-up; no PLL or RPM voltage programming",
+  "static_checks": [
+    {
+      "resource": "GPU",
+      "node": "/soc/qcom,kgsl-3d0@5900000",
+      "dt_base": "0x5900000",
+      "dt_size": "0x90000",
+      "driver_base": "0x5900000",
+      "driver_size": "0x40000"
+    },
+    {
+      "resource": "GPUCC",
+      "node": "/soc/qcom,gpucc@5990000",
+      "dt_base": "0x5990000",
+      "dt_size": "0x9000",
+      "driver_base": "0x5990000",
+      "driver_size": "0x9000"
+    },
+    {
+      "resource": "SMMU",
+      "node": "/soc/kgsl-smmu@0x59a0000",
+      "dt_base": "0x59a0000",
+      "dt_size": "0x10000",
+      "driver_base": "0x59a0000",
+      "driver_size": "0x10000"
+    },
+    {
+      "resource": "GCC",
+      "node": "/soc/qcom,gcc@1400000",
+      "dt_base": "0x1400000",
+      "dt_size": "0x1f0000",
+      "driver_base": "0x1400000",
+      "driver_size": "0x80000"
+    }
+  ],
+  "nodes": {
+    "/soc/qcom,kgsl-3d0@5900000": {
+      "label": [
+        "kgsl-3d0"
+      ],
+      "compatible": [
+        "qcom,kgsl-3d0",
+        "qcom,kgsl-3d"
+      ],
+      "status": [
+        "ok"
+      ],
+      "reg": [
+        "0x5900000",
+        "0x90000",
+        "0x5961000",
+        "0x800"
+      ],
+      "reg-names": [
+        "kgsl_3d0_reg_memory",
+        "cx_dbgc"
+      ],
+      "interrupts": [
+        "0x0",
+        "0xb1",
+        "0x4"
+      ],
+      "interrupt-names": [
+        "kgsl_3d0_irq"
+      ],
+      "qcom,id": [
+        "0x0"
+      ],
+      "qcom,chipid": [
+        "0x6010000"
+      ],
+      "qcom,initial-pwrlevel": [
+        "0x6"
+      ],
+      "qcom,idle-timeout": [
+        "0x3a"
+      ],
+      "qcom,ubwc-mode": [
+        "0x1"
+      ],
+      "qcom,min-access-length": [
+        "0x40"
+      ],
+      "qcom,highest-bank-bit": [
+        "0xe"
+      ],
+      "qcom,snapshot-size": [
+        "0x100000"
+      ],
+      "qcom,gpu-qdss-stm": [
+        "0xe1c0000",
+        "0x40000"
+      ],
+      "#cooling-cells": [
+        "0x2"
+      ],
+      "clocks": [
+        "0x64",
+        "0xd",
+        "0x64",
+        "0xa",
+        "0x17",
+        "0x96",
+        "0x64",
+        "0x4",
+        "0x17",
+        "0x4c",
+        "0x64",
+        "0x7",
+        "0x64",
+        "0x10"
+      ],
+      "clock-names": [
+        "core_clk",
+        "rbbmtimer_clk",
+        "iface_clk",
+        "ahb_clk",
+        "mem_clk",
+        "gmu_clk",
+        "smmu_vote"
+      ],
+      "qcom,gpubw-dev": [
+        "0x164"
+      ],
+      "qcom,bus-control": true,
+      "qcom,msm-bus,name": [
+        "grp3d"
+      ],
+      "qcom,msm-bus,num-cases": [
+        "0xc"
+      ],
+      "qcom,msm-bus,num-paths": [
+        "0x1"
+      ],
+      "qcom,msm-bus,vectors-KBps": [
+        "0x1a",
+        "0x200",
+        "0x0",
+        "0x0",
+        "0x1a",
+        "0x200",
+        "0x0",
+        "0xc3500",
+        "0x1a",
+        "0x200",
+        "0x0",
+        "0x186a00",
+        "0x1a",
+        "0x200",
+        "0x0",
+        "0x249f00",
+        "0x1a",
+        "0x200",
+        "0x0",
+        "0x370dc0",
+        "0x1a",
+        "0x200",
+        "0x0",
+        "0x42c5c0",
+        "0x1a",
+        "0x200",
+        "0x0",
+        "0x532140",
+        "0x1a",
+        "0x200",
+        "0x0",
+        "0x5dc000",
+        "0x1a",
+        "0x200",
+        "0x0",
+        "0x7c2540",
+        "0x1a",
+        "0x200",
+        "0x0",
+        "0xa52940",
+        "0x1a",
+        "0x200",
+        "0x0",
+        "0xbdd1c0",
+        "0x1a",
+        "0x200",
+        "0x0",
+        "0xdc3700"
+      ],
+      "regulator-names": [
+        "vddcx",
+        "vdd"
+      ],
+      "vddcx-supply": [
+        "0x13d"
+      ],
+      "vdd-supply": [
+        "0x165"
+      ],
+      "qcom,pm-qos-active-latency": [
+        "0x1a6"
+      ],
+      "qcom,pm-qos-wakeup-latency": [
+        "0x1a6"
+      ],
+      "qcom,enable-ca-jump": true,
+      "qcom,ca-busy-penalty": [
+        "0x2ee0"
+      ],
+      "qcom,ca-target-pwrlevel": [
+        "0x5"
+      ],
+      "nvmem-cells": [
+        "0x166",
+        "0x167"
+      ],
+      "nvmem-cell-names": [
+        "speed_bin",
+        "gaming_bin"
+      ],
+      "phandle": [
+        "0x32"
+      ]
+    },
+    "/soc/qcom,gpucc@5990000": {
+      "compatible": [
+        "qcom,bengal-gpucc",
+        "syscon"
+      ],
+      "reg": [
+        "0x5990000",
+        "0x9000"
+      ],
+      "reg-names": [
+        "cc_base"
+      ],
+      "vdd_cx-supply": [
+        "0x21"
+      ],
+      "vdd_mx-supply": [
+        "0x1a"
+      ],
+      "qcom,gpu_cc_gx_gfx3d_clk_src-opp-handle": [
+        "0x32"
+      ],
+      "#clock-cells": [
+        "0x1"
+      ],
+      "#reset-cells": [
+        "0x1"
+      ],
+      "phandle": [
+        "0x64"
+      ]
+    },
+    "/soc/kgsl-smmu@0x59a0000": {
+      "status": [
+        "okay"
+      ],
+      "compatible": [
+        "qcom,qsmmu-v500"
+      ],
+      "reg": [
+        "0x59a0000",
+        "0x10000",
+        "0x59c2000",
+        "0x20"
+      ],
+      "reg-names": [
+        "base",
+        "tcu-base"
+      ],
+      "#iommu-cells": [
+        "0x2"
+      ],
+      "qcom,dynamic": true,
+      "qcom,skip-init": true,
+      "qcom,testbus-version": [
+        "0x1"
+      ],
+      "qcom,no-dynamic-asid": true,
+      "qcom,use-3-lvl-tables": true,
+      "#global-interrupts": [
+        "0x1"
+      ],
+      "qcom,regulator-names": [
+        "vdd"
+      ],
+      "vdd-supply": [
+        "0x13d"
+      ],
+      "clocks": [
+        "0x17",
+        "0x4c",
+        "0x17",
+        "0x4d",
+        "0x64",
+        "0x4",
+        "0x64",
+        "0x10"
+      ],
+      "clock-names": [
+        "gcc_gpu_memnoc_gfx",
+        "gcc_gpu_snoc_dvm_gfx",
+        "gpu_cc_ahb",
+        "gpu_cc_hlos1_vote_gpu_smmu_clk"
+      ],
+      "#size-cells": [
+        "0x1"
+      ],
+      "#address-cells": [
+        "0x1"
+      ],
+      "ranges": true,
+      "interrupts": [
+        "0x0",
+        "0xa3",
+        "0x4",
+        "0x0",
+        "0xa7",
+        "0x4",
+        "0x0",
+        "0xa8",
+        "0x4",
+        "0x0",
+        "0xa9",
+        "0x4",
+        "0x0",
+        "0xaa",
+        "0x4",
+        "0x0",
+        "0xab",
+        "0x4",
+        "0x0",
+        "0xac",
+        "0x4",
+        "0x0",
+        "0xad",
+        "0x4",
+        "0x0",
+        "0xae",
+        "0x4"
+      ],
+      "qcom,actlr": [
+        "0x0",
+        "0x3ff",
+        "0x30b"
+      ],
+      "phandle": [
+        "0x141"
+      ]
+    },
+    "/soc/qcom,gcc@1400000": {
+      "compatible": [
+        "qcom,bengal-gcc",
+        "syscon"
+      ],
+      "reg": [
+        "0x1400000",
+        "0x1f0000"
+      ],
+      "reg-names": [
+        "cc_base"
+      ],
+      "vdd_cx-supply": [
+        "0x21"
+      ],
+      "vdd_cx_ao-supply": [
+        "0x62"
+      ],
+      "vdd_mx-supply": [
+        "0x1a"
+      ],
+      "#clock-cells": [
+        "0x1"
+      ],
+      "#reset-cells": [
+        "0x1"
+      ],
+      "phandle": [
+        "0x17"
+      ]
+    },
+    "/reserved-memory/gpu_region@55A15000": {
+      "compatible": [
+        "removed-dma-pool"
+      ],
+      "no-map": true,
+      "reg": [
+        "0x0",
+        "0x55a15000",
+        "0x0",
+        "0x2000"
+      ],
+      "phandle": [
+        "0x1e5"
+      ]
+    },
+    "/soc/qcom,kgsl-hyp": {
+      "compatible": [
+        "qcom,pil-tz-generic"
+      ],
+      "qcom,pas-id": [
+        "0xd"
+      ],
+      "qcom,firmware-name": [
+        "a610_zap"
+      ],
+      "qcom,mas-crypto": [
+        "0x1d"
+      ],
+      "phandle": [
+        "0x32f"
+      ]
+    }
+  }
+}

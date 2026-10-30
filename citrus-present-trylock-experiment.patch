@@ -1,0 +1,73 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -54,6 +54,7 @@
+  */
+ /* Opt-in experiment: serializes present + hold transitions, not FIFO ordering. */
+ static IOLock *sweet_fb_serial_lock;
++static uint32_t sweet_fb_serial_mode, sweet_fb_serial_deferred;
+ static uint32_t sweet_touch_lat;
+ static int sweet_fb_scaler_log;
+ static int sweet_fb_noscale;	/* fbnoscale=1: fetch the small buffer with no scaler (A/B) */                 /* fbdump=1: log the scaler programming */
+@@ -676,7 +677,8 @@
+ 	uint32_t serial_present = 0;
+ 	if (PE_parse_boot_argn("fbserial", &serial_present, sizeof(serial_present)) && serial_present != 0) {
+ 		sweet_fb_serial_lock = IOLockAlloc();
+-		IOLog("SWEET FB: experimental present serialization %s\n", sweet_fb_serial_lock ? "enabled" : "allocation failed");
++		sweet_fb_serial_mode = sweet_fb_serial_lock ? serial_present : 0;
++		IOLog("SWEET FB: experimental present serialization mode %u\n", sweet_fb_serial_mode);
+ 	}
+ 	IOLog("SWEET FB: vsync %s the panel (%u lines a frame)\n", fVLock ? "follows" : "does not follow", fVTotal);
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+@@ -801,6 +803,19 @@
+ 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		return;
+ 	}
++	/* Mode 2 never waits on the presenter from the workloop. Try under fLock:
++	 * on failure leave pending and retirement state untouched for the next tick.
++	 * The direct path takes serial then fLock, so this attempt must not block. */
++	bool serial_owned = false;
++	if (sweet_fb_serial_mode == 2) {
++		if (!IOLockTryLock(sweet_fb_serial_lock)) {
++			__atomic_fetch_add(&sweet_fb_serial_deferred, 1, __ATOMIC_RELAXED);
++			IOLockUnlock(fb->fLock);
++			sender->setTimeoutUS(fb->fVLock ? fb->vsyncNext() : SWEET_FB_VSYNC_US);
++			return;
++		}
++		serial_owned = true;
++	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+ 	uint8_t *rec = NULL;
+ 	SweetSurface *taken[4] = {};
+@@ -823,7 +838,7 @@
+ 		fb->flipBack();
+ 	}
+ 	if (rec != NULL) {
+-		if (sweet_fb_serial_lock != NULL) {
++		if (sweet_fb_serial_lock != NULL && !serial_owned) {
+ 			IOLockLock(sweet_fb_serial_lock);
+ 		}
+ 		if (__atomic_fetch_add(&fb_present_active, 1, __ATOMIC_RELAXED) != 0) {
+@@ -836,9 +851,12 @@
+ 		memcpy(fb->fRetireHold, fb->fShowHold, sizeof(taken));
+ 		memcpy(fb->fShowHold, taken, sizeof(taken));
+ 		IOLockUnlock(fb->fLock);
+-		if (sweet_fb_serial_lock != NULL) {
++		if (sweet_fb_serial_lock != NULL && !serial_owned) {
+ 			IOLockUnlock(sweet_fb_serial_lock);
+ 		}
++	}
++	if (serial_owned) {
++		IOLockUnlock(sweet_fb_serial_lock);
+ 	}
+ 	sender->setTimeoutUS(fb->fVLock ? fb->vsyncNext() : SWEET_FB_VSYNC_US);
+ }
+@@ -1270,6 +1288,9 @@
+ 			    __atomic_exchange_n(&fb_present_overlap, 0, __ATOMIC_RELAXED),
+ 			    __atomic_exchange_n(&fb_scan_samples, 0, __ATOMIC_RELAXED),
+ 			    __atomic_exchange_n(&fb_scan_regressions, 0, __ATOMIC_RELAXED));
++			if (sweet_fb_serial_mode == 2) {
++				IOLog("SWEET FB: timer present deferrals %u\n", __atomic_exchange_n(&sweet_fb_serial_deferred, 0, __ATOMIC_RELAXED));
++			}
+ 			IOLog("SWEET FB: direct flush-clear intervals (8.33 ms buckets, %u samples): %u %u %u %u %u %u %u %u\n",
+ 			    fb_obs_clear_samples, fb_obs_clear_iv[0], fb_obs_clear_iv[1], fb_obs_clear_iv[2], fb_obs_clear_iv[3],
+ 			    fb_obs_clear_iv[4], fb_obs_clear_iv[5], fb_obs_clear_iv[6], fb_obs_clear_iv[7]);

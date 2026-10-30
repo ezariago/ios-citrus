@@ -1,0 +1,72 @@
+{
+  "commit": "02ca1a919564a9b176a79cce09c40977f833e9ac",
+  "sources": [
+    {
+      "path": "drivers/clk/qcom/gcc-bengal.c",
+      "url": "https://raw.githubusercontent.com/MiCode/Xiaomi_Kernel_OpenSource/02ca1a919564a9b176a79cce09c40977f833e9ac/drivers/clk/qcom/gcc-bengal.c",
+      "local_path": "out/touch-reference/gcc-bengal.c",
+      "sha256": "7b63352059240513be457c54ba46e60e29561bafa8cdeece2732e521b30dca9d"
+    },
+    {
+      "path": "include/dt-bindings/clock/qcom,gcc-bengal.h",
+      "url": "https://raw.githubusercontent.com/MiCode/Xiaomi_Kernel_OpenSource/02ca1a919564a9b176a79cce09c40977f833e9ac/include/dt-bindings/clock/qcom,gcc-bengal.h",
+      "local_path": "out/touch-reference/qcom,gcc-bengal.h",
+      "sha256": "fe60b27c2727b7c1f2fe5991c35f29c3abceed7a9e71e546f4d006c993c0da54"
+    },
+    {
+      "path": "drivers/pinctrl/qcom/pinctrl-bengal.c",
+      "url": "https://raw.githubusercontent.com/MiCode/Xiaomi_Kernel_OpenSource/02ca1a919564a9b176a79cce09c40977f833e9ac/drivers/pinctrl/qcom/pinctrl-bengal.c",
+      "local_path": "out/touch-reference/pinctrl-bengal.c",
+      "sha256": "386c76a57470d5e93b70120535d73d5c2850700b81af358f9ed6006d8ff4fe60"
+    },
+    {
+      "path": "drivers/spi/spi-geni-qcom.c",
+      "url": "https://raw.githubusercontent.com/MiCode/Xiaomi_Kernel_OpenSource/02ca1a919564a9b176a79cce09c40977f833e9ac/drivers/spi/spi-geni-qcom.c",
+      "local_path": "out/touch-reference/spi-geni-qcom.c",
+      "sha256": "2aa776a9d6f8844610a65751b9545f88e7c7e2e655fac3e650ddccb35de64575"
+    },
+    {
+      "path": "include/linux/qcom-geni-se.h",
+      "url": "https://raw.githubusercontent.com/MiCode/Xiaomi_Kernel_OpenSource/02ca1a919564a9b176a79cce09c40977f833e9ac/include/linux/qcom-geni-se.h",
+      "local_path": "out/touch-reference/qcom-geni-se.h",
+      "sha256": "ff0313eaa597c87be8dc83fc7f9befc89ec0bdf26889f98aa1a5652ce980dff7"
+    },
+    {
+      "path": "drivers/input/touchscreen/focaltech_touch/Makefile",
+      "url": "https://raw.githubusercontent.com/MiCode/Xiaomi_Kernel_OpenSource/02ca1a919564a9b176a79cce09c40977f833e9ac/drivers/input/touchscreen/focaltech_touch/Makefile",
+      "local_path": "out/touch-reference/Makefile",
+      "sha256": "15c6e7db8a951b5eb5878709771799138b390b08bce005f61199702c80bbe3b2"
+    },
+    {
+      "path": "drivers/input/touchscreen/focaltech_touch/focaltech_config.h",
+      "url": "https://raw.githubusercontent.com/MiCode/Xiaomi_Kernel_OpenSource/02ca1a919564a9b176a79cce09c40977f833e9ac/drivers/input/touchscreen/focaltech_touch/focaltech_config.h",
+      "local_path": "out/touch-reference/focaltech_config.h",
+      "sha256": "ba18a47a6ff98a534cda296a6393f71f17bc90bb0266b4fbb95cf05bf171e9f3"
+    },
+    {
+      "path": "drivers/input/touchscreen/focaltech_touch/focaltech_core.h",
+      "url": "https://raw.githubusercontent.com/MiCode/Xiaomi_Kernel_OpenSource/02ca1a919564a9b176a79cce09c40977f833e9ac/drivers/input/touchscreen/focaltech_touch/focaltech_core.h",
+      "local_path": "out/touch-reference/focaltech_core.h",
+      "sha256": "389264e7975431bb76aab611ddf62081166563fa96d9dffd7915e501427b48d5"
+    },
+    {
+      "path": "drivers/input/touchscreen/focaltech_touch/focaltech_core.c",
+      "url": "https://raw.githubusercontent.com/MiCode/Xiaomi_Kernel_OpenSource/02ca1a919564a9b176a79cce09c40977f833e9ac/drivers/input/touchscreen/focaltech_touch/focaltech_core.c",
+      "local_path": "out/touch-reference/focaltech_core.c",
+      "sha256": "80991f5d6d3e0cdad15bb4b6a7329d9c4bd72de565f76dc73a26d537b1ee7ec3"
+    },
+    {
+      "path": "drivers/input/touchscreen/focaltech_touch/focaltech_common.h",
+      "url": "https://raw.githubusercontent.com/MiCode/Xiaomi_Kernel_OpenSource/02ca1a919564a9b176a79cce09c40977f833e9ac/drivers/input/touchscreen/focaltech_touch/focaltech_common.h",
+      "local_path": "out/touch-reference/focaltech_common.h",
+      "sha256": "c6e83b68d36b3427505f669173dba6aa4fc582b16837d565ae50d41de78f98c2"
+    },
+    {
+      "path": "drivers/input/touchscreen/focaltech_touch/focaltech_i2c.c",
+      "url": "https://raw.githubusercontent.com/MiCode/Xiaomi_Kernel_OpenSource/02ca1a919564a9b176a79cce09c40977f833e9ac/drivers/input/touchscreen/focaltech_touch/focaltech_i2c.c",
+      "local_path": "out/touch-reference/focaltech_i2c.c",
+      "sha256": "ce3425dae8e0dcaec71cc379dd89d9c5f8f7745a3d8272c2cbd7bfd7b5800e77"
+    }
+  ],
+  "note": "Sources retained unmodified under ignored out/touch-reference with original licenses. This FTS directory is I2C; it is not the matching Citrus SPI transport."
+}

@@ -1,0 +1,35 @@
+{
+  "kernel": "/tmp/citrus-clk1/kernel.development.sweet.smp7",
+  "sha256": "5d8f03e7d38147f3697741358deb2e666b1ee23dac3d2afb86f7abe31358593d",
+  "bytes": 20123888,
+  "objects": {
+    "serial_console.o": "6b6ed48d2297901d9e9123d776d53902329fb4017dd637f24a07259d4317709b",
+    "sweet_ufs.o": "3eb0f2cea5e46f21404f68c6483f3aa60c88859458ff8ee2bfab0357174bdf0e",
+    "sweet_usb.o": "eafaf1502b75846495988d87467f83e1135349fa0089e318386d5bdcb854c131",
+    "SweetFramebuffer.cpo": "caea3d477f7e0dda33989c4dc4744e9e2c8b33b78c4d94b4b949e1866349cad8",
+    "SweetSurface.cpo": "853b20b8d585518bc84660a27800ad76ef691b872cfcf314e6015438c97fe43e",
+    "kern_cs.o": "32e861839e85e72662af6addafa6b6e7997f3f5d4dbddbf98d644d2417accd18",
+    "kern_proc.o": "f3bb73d3baa3bfae52f91099051c890caaf88969c955c55b6e974729b331d2c4",
+    "kern_resource.o": "31acc696829105dd576a61646122341725038beb739c8f4e14761f7a139f599d",
+    "ubc_subr.o": "b78e7085b92e8e39a53f56c0531e728f3526fb6f9869411d6536dcb48dfb9f3e",
+    "kern_exec.o": "b0d4c797880d77753b03904bc97a1100791e9952fbb26b3fb0bdf3f14be49aeb",
+    "sweet_touch.o": "abe180505bfeaff9d16dd08a84fc712c0b6906e0bf70c955c40305c187168615",
+    "sweet_cpufreq.o": "85be3a1d09e109bbb325926effffc9876952a3d94586683634eebc72bf00ae20",
+    "SweetHID.cpo": "380c5877c935008a19d8a46e651d5aef857ec1976fef41190e03f5abaeb428f1",
+    "TopazAdrenoFw.cpo": "5cc0792515ae3179889ffbaa23e6d6584df9ed23b7ccd68fc1d4c23bcf344e4d",
+    "TopazAdreno.cpo": "3482b34dc6519ebddb92b5c6f9f0edf69bea308901dd112ca2859240e94eea90",
+    "RedwoodGPU.cpo": "cf8136b80aea0fec0defda642b116d96d3687879c0de8f82e83302d289e2bc85"
+  },
+  "archive_sha256": "cf21fff8bb23163c9a26e8146144bef47e4aa07ca5aa3fc30270290efa793183",
+  "checks": {
+    "usb_immediate_string": true
+  },
+  "limits": [
+    "local Xcode 27 ld",
+    "not yet hardware tested"
+  ],
+  "image_sha256": "c1397f9177bb8ed5f07071c41caefcd629fd20446e5cfe56642a2b4357405434",
+  "hardware_booted": true,
+  "test_log": "out/ios16/logs/4k-smp7-scanout-live.txt",
+  "image": "out/citrus-8core/smp7-scanout/citrus-xnu-boot-4k-smp7-scanout.img"
+}

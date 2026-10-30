@@ -1,0 +1,36 @@
+{
+  "kernel": "/tmp/citrus-clk1/kernel.development.sweet.smp7",
+  "sha256": "3ecf00ab3fdeda4664d55672ae3223dff856d37023791fe7c7899a79f16c781a",
+  "bytes": 20124344,
+  "objects": {
+    "serial_console.o": "6b6ed48d2297901d9e9123d776d53902329fb4017dd637f24a07259d4317709b",
+    "sweet_ufs.o": "3eb0f2cea5e46f21404f68c6483f3aa60c88859458ff8ee2bfab0357174bdf0e",
+    "sweet_usb.o": "eafaf1502b75846495988d87467f83e1135349fa0089e318386d5bdcb854c131",
+    "SweetFramebuffer.cpo": "c61e9b1bb0c31553a5d7ad0d181a88ca138e68c1aa1da8964e2c8f16b05bb6f4",
+    "SweetSurface.cpo": "853b20b8d585518bc84660a27800ad76ef691b872cfcf314e6015438c97fe43e",
+    "kern_cs.o": "32e861839e85e72662af6addafa6b6e7997f3f5d4dbddbf98d644d2417accd18",
+    "kern_proc.o": "f3bb73d3baa3bfae52f91099051c890caaf88969c955c55b6e974729b331d2c4",
+    "kern_resource.o": "31acc696829105dd576a61646122341725038beb739c8f4e14761f7a139f599d",
+    "ubc_subr.o": "b78e7085b92e8e39a53f56c0531e728f3526fb6f9869411d6536dcb48dfb9f3e",
+    "kern_exec.o": "b0d4c797880d77753b03904bc97a1100791e9952fbb26b3fb0bdf3f14be49aeb",
+    "sweet_touch.o": "abe180505bfeaff9d16dd08a84fc712c0b6906e0bf70c955c40305c187168615",
+    "sweet_cpufreq.o": "85be3a1d09e109bbb325926effffc9876952a3d94586683634eebc72bf00ae20",
+    "SweetHID.cpo": "380c5877c935008a19d8a46e651d5aef857ec1976fef41190e03f5abaeb428f1",
+    "TopazAdrenoFw.cpo": "5cc0792515ae3179889ffbaa23e6d6584df9ed23b7ccd68fc1d4c23bcf344e4d",
+    "TopazAdreno.cpo": "3482b34dc6519ebddb92b5c6f9f0edf69bea308901dd112ca2859240e94eea90",
+    "RedwoodGPU.cpo": "cf8136b80aea0fec0defda642b116d96d3687879c0de8f82e83302d289e2bc85"
+  },
+  "archive_sha256": "a247b46f952725ffbcad829d14ced8faae7ef71e36c2155d6e5b14a13c774273",
+  "checks": {
+    "usb_immediate_string": true
+  },
+  "limits": [
+    "local Xcode 27 ld",
+    "not yet hardware tested"
+  ],
+  "image_sha256": "d55b2d8e664c55cdc20db406e4351d08be80ac956bd85f6281c6667c8bfc1f70",
+  "hardware_booted": true,
+  "test_log": "out/ios16/logs/4k-smp7-trylock-live.txt",
+  "image": "out/citrus-8core/smp7-trylock/citrus-xnu-boot-4k-smp7-trylock.img",
+  "boot_arg": "fbserial=2"
+}

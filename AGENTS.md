@@ -1,931 +1,1083 @@
 # Citrus XNU port — active handoff
 
-Updated 2026-10-26 08:30 (Asia/Jakarta). **Read this file top to bottom once; the
-first three sections are the whole story.** Everything below "Historical" is old
-context kept only for reference.
+Updated 2026-10-30 11:20 (Asia/Jakarta). **The project is paused since
+2026-10-30.** `RESUME.md` is the one-page restart index and lists what is *not*
+in this repository (16 GiB roots, IPSW, CI build tree, stock partition dumps).
+This is the only handoff file. Keep it under ~30 KB: new results go in the top
+sections, superseded narrative goes to `research/` and is deleted here. Cited
+captures are archived in `research/evidence/`; image/root hashes and provenance
+are copied to `research/artifacts/`. Current readable investigations:
+`research/CITRUS-GPU-IMPLEMENTATION.md`, `CITRUS-HAKIOS-PERFORMANCE.md`,
+`CITRUS-IDLE.md`, `CITRUS-TOUCH.md`, `CITRUS-CPU-CLOCK.md`,
+`CITRUS-CLOCK-SPEED.md` (current clocks), `CITRUS-GPU-CLOCKS.md`,
+`CITRUS-BACKLIGHT.md`, `CITRUS-BUTTONS.md`,
+`CITRUS-CROSS-PROJECT.md`, `XNU-NEXT.md`.
 
-## 0. Where the project stands (one paragraph)
+## 0. FILE & WORKSPACE RULES (read before building anything)
 
-XNU boots from the 16 GiB HFSX iOS root on UFS, launchd and the daemons run,
-backboardd + SpringBoard composite on the MDF, and on a good boot the phone shows
-**the real iOS lock screen with a live updating clock** (confirmed 2026-10-26
-06:26). The kernel console streams **live over USB** (`/dev/cu.usbmodem*`,
-`tools/usb-log.py`). The first `ufs_scsi()` reliability fix was built and tried at
-08:22 today: it booted through SpringBoard and PosterBoard, but the panel **stayed
-on the Apple logo** and no lock screen appeared. That boot logged **no UFS
-timeouts, stale tags or short transfers**, so the UFS fix is in place but is not
-yet proven to improve the boot rate. The current failure is now clearly after
-userspace starts, not a dead kernel.
+1. **Replace, don't accumulate.** When a build produces a newer artifact, delete
+   the artifact it supersedes in the same turn. No `...-v1/-v2/-final` chains,
+   no per-boot kernels or payloads left behind.
+2. **Keep only:** the current boot image, the named fallbacks in §3, one
+   manifest per kept image, and logs cited here or in `research/`. Everything
+   else under `out/` is disposable.
+3. **Promote by rename.** Build to `out/citrus-gpu-<name>`, package to
+   `out/citrus-diagnostic/citrus-xnu-boot-<name>.img`, record its SHA256 here,
+   keep `<name>-manifest.json`, then strip the build tree's objects/`citrus.a`
+   (regenerate with `tools/build-citrus-gpu.py`). An unflashed candidate that
+   is replaced without ever booting should not keep an image at all.
+4. **Never delete or modify:** `kernel/`, `tools/`, `research/`, `devices/`,
+   `upstream/`, `userland/`, the two root images in §5, or cited logs.
+5. **`du` lies here.** The 16 GiB root images are APFS clones of one ~13.6 GiB
+   extent set; `du` counts shared blocks per file. Measure real reclamation with
+   `df -k` before/after, not `du`. Deleting one clone can free 0 bytes.
+6. **Temporary files go to `/tmp`.** If one must live in `out/`, name it after
+   the experiment and delete it when the experiment ends.
+7. **One durable USB reader only.** `pgrep -fl usb-log.py` first; start with
+   `nohup python3 tools/usb-log.py --wait 900 -o out/ios16/logs/<name>-live.txt
+   >/tmp/<name>-reader.out 2>&1 &` and record the PID.
 
-## 1. The UFS-fix trial (2026-10-26 08:22) did not restore the lock screen
+## 1. CURRENT STATE (updated 2026-10-30; newest first)
 
-The previous checkpoint correctly described the failure as intermittent bad/missing
-I/O, not one deadlock. `sweet_ufs.c` was changed (section 2) and booted once as
-`citrus-xnu-boot-ufsfix.img`. Boot args omitted every optional perturbation:
-`sweetusb=2 sweetlog=0 sweetsample=- sweetnull=- sweetwdt=0`, no heartbeat, no
-physical-timer tick.
+**2026-10-30, paused; pool-reclaim experiment is host-tested only.**
+`citrus-gpu-reclaim-experiment.patch` (opt-in `gpureclaim=1`, default off) is
+the answer to the "pressure-aware reclamation" note below. On a `pool_first`
+miss it walks the allocating client's `fKept` cache under
+`gGPULock`, drops the **oldest completed pool-backed** buffers (via the new
+`topaz_gpu_pool_owns()`), retries `topaz_gpu_pool_alloc()` after each drop, and
+stops at first success or when no eligible buffer is left. It never touches
+`fLeft` (possibly busy), active handles, other clients' caches, or low-memory
+allocations; the alloc happens with `gGPULock` held, same lock order as
+`dropKept`. Sparse log every 64 calls. Forward/reverse patch dry-runs and
+`python3 citrus-gpu-reclaim-test.py` PASS (arena boundaries, oldest-first,
+pool-only, stop-on-success, exhausted/empty, lock pairing). **Not compiled into
+a kernel, not booted, no image built** - review the fence-hold argument (freed
+buffers may be re-taken by the same allocation that triggered reclaim) and run
+an A/B against `smp7-seed` without high-volume tracing before believing it.
 
-What that boot did (`out/ios16/logs/ufsfix-live.txt`, 119,113 bytes, last output
-08:24:09):
+**2026-10-29, pool guard hardware A/B:** current phone boot is
+`out/citrus-8core/smp7-poolguard/citrus-xnu-boot-4k-smp7-poolguard.img`,
+SHA256 `92efea88019f1076dfa2e1565c861b85e1bd07d9aa48fa3729127d4385888e7e`,
+kernel `183bfaeb1f8c5befbc61401f774adb2ab5ba629c07032db7e57f696144aa4ae2`.
+`citrus-gpu-pool-guard-experiment.patch` adds opt-in `gpuguard=1`: best fit,
+protect one >=10 MiB block from <8 MiB requests when it would disappear. It can
+make a small allocation fail instead, does not compact allocated blocks, and
+cannot help total exhaustion. Forward/reverse patch checks, compile/link, shim
+and `python3 citrus-gpu-pool-guard-test.py` ASan/UBSan PASS (synthetic guard,
+coalescing, table-full and 20k randomized ops). On phone guard was active;
+user reports interface restarted at first Control Center, delays remain, and
+all blur-heavy animations appear in slow motion and stutter. Capture
+`out/ios16/logs/4k-smp7-poolguard-live.txt`, reader stopped. Explicit backboardd
+SIGSEGV at lines 4644–4647, after a pool miss with only 2.1 MB total free
+(lines 4600); later a 10 MiB request still missed with 15.8 MB free and 8 MiB
+largest (line 7039). Both 64 MiB arenas reserved. This A/B is not controlled
+and does not prove guard caused the crash, but it is **not an improvement** and
+must not be enabled by default. `smp7-seed` remains fallback; no userdata flash.
+Next investigate pressure-aware reclamation of already-completed per-client
+`fKept` GPU buffers before the expensive low-memory fallback, while preserving
+fence and lock invariants; a miss can be total exhaustion, not merely fragmentation.
 
-- UFS mounted userdata normally (`GPT ...`, `"userdata" on LUN 0`), and **no
-  `SWEET UFS:` error line appeared after that** — no timeout, no stale-response,
-  no short-transfer, no ring-restart message.
-- `exec SpringBoard`, `exec PosterBoard`, SpringBoard AKS/sandbox/surface ops,
-  backboardd created 1080x2340 buffer surfaces, `SWEET FB: display on`.
-- `SWEET INTF1` reported ~316 frames / 5 s with tearing enabled.
-- The last full-screen present was surface 3 (`nz 25862/26054`), then the
-  empty-swap fallback presented surface 2 (`nz 282`) — i.e. the Apple logo.
-- After that, SpringBoard created only small surfaces (272x184, 312x202,
-  230x186); **no further full-screen present**. The panel stayed on the Apple
-  logo for more than four minutes. The USB console then went silent, as it also
-  did on the one successful usb6 boot after userspace settled.
+**2026-10-29 20:33, full-root touch latency trace:** temporarily flashed
+`/tmp/citrus-touchprofile.img` SHA256
+`71c0c74ebacff1e6012d1ada446b4cf0abb1aeef468cbe3eced5a9ba923befe5`:
+same seed kernel/display settings with `touch_lat=1` substituted for default-0
+`sweetptrecord`. User tested, reported interface restarted on first Control
+Center attempt; recovery read-only pull `out/ios16/logs/fullroot-touchprofile-sweetlog.txt`.
+After the pull, flashed the prior non-tracing seed boot and rebooted. No userdata
+flash. Recorder's panic block contained `kmem_alloc` but has no associated boot
+ID, so it may be stale: do not attribute it to the interface restart.
 
-So this trial is a **failure** by the milestone test (no lock screen), but not a
-UFS failure. It got further than the old stalls and left no UFS complaint. Whether
-the fix improves the one-in-eight lock-screen rate is still unmeasured: only one
-boot of this image has been run, and it needs 3–4 repeats plus a process sampler.
+Trace correlates with severe allocation pressure, not a proven causal input
+latency: compositor frame 234 ran from 80.420 to 81.270 s (850 ms), frame 235
+from 81.277 to 81.830 s (554 ms); touch at 81.328 s occurred within frame 235,
+and the next swap was 503 ms later. They are temporal observations, not proof
+of which gesture produced the next frame. The 850 ms frame contains repeated
+`vm_page_find_contiguous(num=640)` failures and GL 0x505/0x506 errors; at 82 s
+the sampled 10 MiB pool request missed with 19.9 MB free but largest 5.8 MB,
+43 failed pool attempts. This is direct evidence of pool fragmentation and
+slow fallback coinciding with the long frames, not proof that every allocation
+line is the compositor's or that this explains every delay. Compare
+`fullroot-touchprofile-sweetlog.txt` lines 6036–6092, 6100–6108, 6193–6212.
+Next prioritize the previously planned pool large-allocation reservation / split
+policy (§2), simulate fragmentation, verify alignment and free/coalesce, then
+A/B without high-volume tracing. The tracer itself perturbs performance.
 
-The old observed outcomes remain useful context (all with `sweetwdt=0`):
+**2026-10-29 20:21, full restored root reprofiled:** phone then ran seed-observation
+boot `out/citrus-8core/smp7-seed/citrus-xnu-boot-4k-smp7-seed.img`
+SHA256 `a323b745630b269ecba9e838f8ee9d43e345fdd965b7518758bef3c7c46391b2`
+on the restored full root (`AGENTS-RESTORE.md`, image hash `414b3dc6...`).
+User rebooted normally; full root capture `out/ios16/logs/fullroot-live.txt`
+contains post-reboot activity and is owned by another session's USB reader: do
+not start a second one. User reports no observed tearing this test, scrolling
+fairly smooth, blur-heavy gestures consistent but slower with ~0.5 s initiation
+lag. GPU / flush counts cannot establish physical FPS. Post-reboot example at
+lines 32497–32503: 256 scans and flush clears, 0 failed waits or overlaps; 2
+seed changes in 128 cached-surface rechecks, 0 observed fence changes. A seed
+change means write-unlock occurred between observations, not proof of pixel
+writes during scanout or a cause of tearing; raw writes can evade this check.
 
-| build | config difference | observed outcome |
-|---|---|---|
-| usb6 | USB console | **reached and kept the iOS lock screen** (clock updating, 6 min) |
-| usb7/usb8 | USB console + 5 s heartbeat print | heartbeat to T=147..157 s, then silent, Apple logo |
-| usb9 | no heartbeat | silent ~70 s, Apple logo |
-| nousb1 | **USB gadget off** | heartbeat to T=136 s then stop, Apple logo |
-| slotsample | slot-1 IRQ recorder | heartbeat to T=156 s, `svc_runs` frozen at 31, no stall samples |
-| quiet | **no userspace tee, no UFS log** | Apple logo |
-| ptimer | 1 Hz physical-timer tick | **kernel alive to 271 s** but userspace died: `shared_region ... vm_shared_region_start_address() failed`, `libignition: failed to lookup preboot`, only 12 KB of log, 107k free pages |
-| **ufsfix** | **tag/residual/ring fixes, no other instrumentation** | **SpringBoard + PosterBoard ran, small surfaces created, no full-screen present; Apple logo only** |
+`citrus-texture-cache-experiment.patch` is an **uninstalled** isolated /tmp
+compositor experiment addressing the full-root capture's 256-image metadata
+limit and repeated failed texture attachments. It allocates stable 256-entry
+blocks up to 8192 entries and releases retained surfaces on context destruction;
+growth no longer invalidates existing pointers. Removal still moves the last
+entry into the removed slot as in the original, so deletion/reentrancy is not
+proven safe. Its real image_new / image_forget functions passed an ASan/UBSan
+host harness (stable addresses through growth, allocation failure, replacement,
+removal, cap, slot reuse, retain balance); rerun `python3
+citrus-texture-cache-test.py`. iOS arm64 dylib compiled and ad-hoc signature
+verified, SHA256 `dd81ed318202e17e525d14aa6e0d21f8e66bde5796c4301654cfdfa7f67d9ec0`.
+Not runtime-tested: context threading, removal/reentrancy, GL cleanup, memory
+growth, visuals and performance need review and hardware tests. No userland/root modifications authorized; never
+flash the full root or write its on-device filesystem without explicit decision.
 
-Hysteresis check: a stalled boot left for **9.5 minutes never recovers**.
+**2026-10-29, previous surface reuse diagnostic:** named fallback image
+`out/citrus-8core/smp7-reuse/citrus-xnu-boot-4k-smp7-reuse.img`, SHA256
+`c8960b9da5eb9e0ac56a08eee25c13f6327aecb4086d4bf81b47da9bb00f3a0d`;
+kernel `ea90240914d4947720ad928274912738a0d0d35fa5985a4ff6d6c0e15b2de5f8`.
+User says performance similar to cached-scan, slight tearing remains, touch felt
+slightly weird. Capture `out/ios16/logs/4k-smp7-reuse-live.txt`; reader stopped.
+`cachedscan` (`99b8e8...`), `trylock` (`d55b2d...`), `serial`, `overlap`,
+`scanout`, `gpu40` are fallbacks. Fastboot boot unsupported; no userdata flash.
 
-So:
-- it is **not** the `sweetwdt` panic (stalls happen with it off);
-- it is **not** USB (a boot with the gadget entirely off stalls);
-- it is **not** console spam (a build with the tee and UFS log off stalls);
-- it is **not** "just slow / pageout thrashing" (see the 9.5 min above);
-- it is **not** one reproducible deadlock — the failure point moves;
-- the first UFS fix did **not** by itself produce a visible lock screen.
+Incremental `citrus-scan-reuse-observation.patch` rechecks each cached scanned
+surface's `drawn` fence after latch, just before the next direct present. In 12
+windows of 256 direct attempts, 126–128 rechecks per window had **0 changes**.
+This is NOT proof of no writes while displayed: `drawn` tracks GPU submissions
+that name the surface, not CPU writes; it misses activity before the first
+sample and surfaces replaced by the timer, and the read is best-effort. Shim
+PASS, hardware booted; no timing or physical FPS claim. Next investigate CPU
+writes to the shared cached default surface and MDP latch/scan timing, and test
+whether separate protected scanout buffers can retain the throughput gain.
 
-## 2. What changed in `ufs_scsi()` and what to test next
+In the 4K CI working tree,
+`out/citrus-8core/ci-run-40531392449/tree/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp`,
+per-hitch logging is replaced with a 256-frame aggregate for 25–250 ms intervals
+(count, queue nonempty, MDP busy, maximum previous GPU wait). The independently
+applicable `citrus-frame-hitch-aggregate.patch` was verified forward and reverse
+against the gpu40-derived CI source. `/tmp/relink-smp7.py` linked kernel SHA256
+`8dc8ac7e44192df5adf02deb37d82ca1b1c7d3ffe4dad86c38b114f59fada85d`;
+its aggregate string is present and the old hitch string absent. A `/tmp` payload
+using the exact gpu40 ADT and cmdline passed Unicorn shim entry/boot-args testing;
+this did **not** execute XNU; the later scanout build above was booted. The
+250 ms cutoff filters long idle gaps, not all idle gaps; previous-present data
+are correlation, not proof of cause. The user reports smoother motion but no
+controlled FPS improvement is established.
 
-`bsd/dev/sweet_ufs.c` still uses **one** UTRL slot, one UCD and one bounce buffer,
-but now has the three missing safety checks:
+**Follow-up: scanout attribution, not physical FPS.** In `showDirect()` the
+existing `frameShown()` runs *before* `present()` and before the flush poll;
+`showPending()` counts before its pending frame is shown and can replace it.
+Thus neither the histogram nor `swaps` by itself proves unique frames reached
+the panel. The CI working tree and `citrus-frame-hitch-aggregate.patch` now add
+one aggregate per 256 direct attempts: GPU-pool direct scan programming, flush
+bit clear, zero observed fence, failed GPU wait, and repeated surface/fence pair.
+These are best-effort observations, not a pixel hash or panel-vsync measurement;
+the fence is sampled before the wait and can change concurrently. The modified
+translation unit compiles and the patch applies forward/reverse. A further
+histogram now times intervals *after* the direct-path flush bit becomes clear,
+instead of only at `showDirect()` entry. Flush completion is still not proof of
+actual panel pixels or unique content. Relinked kernel SHA256
+`5d8f03e7d38147f3697741358deb2e666b1ee23dac3d2afb86f7abe31358593d`;
+`/tmp/citrus-scanout-diagnostic.img` SHA256
+`c1397f9177bb8ed5f07071c41caefcd629fd20446e5cfe56642a2b4357405434` uses the
+`gpu40` ADT and command line, passes the Unicorn shim entry/boot-args test and
+preserves the template's other boot components. Hardware capture shows three
+256-attempt windows each with **256 direct scans and 256 flush clears, zero
+failed GPU waits**, and 3/0/1 repeated surface/fence pairs. Direct-only
+flush-clear intervals cluster at 25–58 ms, but they exclude other display
+updates and do not establish physical frame rate. Traces also contain non-pool
+`dp-surf ... 0` interleaved with pool surfaces, contrary to the earlier claim
+that every UI present was pool direct. `vsyncFired()` and `showDirect()` can
+both call `present()` outside `fLock`; capture actually shows their calls
+interleaving (e.g. log lines 3496–3510), but stale scanout has not been proven.
+The **booted** follow-up (`citrus-frame-hitch-aggregate.patch`) counts calls
+that begin while another `present()` is active: **113, 108, 135 overlaps** per
+three windows of 256 direct attempts; observed scan-ID regressions 6/4/5 out
+of 463/446/455 samples. These regressions are not proof of displayed order:
+field `0x50` semantics are not verified, and `flipFrom()` can take time after
+sampling. This confirms a concurrency hazard worth investigating, not its effect
+on the panel. Next: design a single ordered commit path that preserves vsync and
+surface holds, or instrument actual MMIO commit with a driver-owned sequence;
+measure frame pacing and check for regressions before changing default behavior.
+Host reset with a writable mounted filesystem is unsafe.
 
-1. **Response tag validation.** The sent task tag is remembered; the returned
-   UPIU byte 3 must match it, otherwise the response is discarded, logged as
-   `stale response`, the ring is restarted and the command fails with EIO. Tags
-   are allocated atomically (they are shared with the slot-1 interrupt recorder)
-   and tag 0 is skipped so an all-zero response cannot look valid.
-2. **Real timeout recovery.** `ufs_ring_restart()` stops UTRLRSR, clears the
-   whole doorbell with `UTRLCLR=~0`, waits up to 100 ms for it to drain, waits
-   20 ms for a response already on the link to land, clears the interrupt status,
-   re-programs UTRLBA/UTRLBAU, restarts the ring and verifies the registers.
-   The old code wrote `~1u` to `UTRLCLR` (which left slot 0 set) and returned.
-3. **Residual check.** The response UPIU bytes 8–11 (residual transfer count)
-   must be zero; a short read/write is logged as `short transfer` and fails with
-   EIO instead of looking like valid zero-filled data.
+**Booted serialization A/B:** `citrus-present-serialize-experiment.patch`
+adds opt-in `fbserial=1`, a separate mutex covering `present()` and associated
+hold updates on the timer and direct-present paths. It avoids simultaneous calls
+but **does not guarantee FIFO**: the timer can take an older pending record
+before acquiring the mutex. It can also block the vsync workloop while GPU
+waiting or latch polling, causing dropped pacing; hold-lifetime and visual tests
+are mandatory. Default off. Kernel `2509bd8872e323572e8596abd566a2f314087fa6bf25b4660807a54039445459`,
+`/tmp/citrus-serial-diagnostic.img` SHA256
+`efedf24be680a2313ff3b18679b524c9d198c3ee86a3b4e3a3dbbcaac9d6f0d8`; linked,
+shim PASS, non-kernel template components unchanged. On hardware the overlap
+counter was 0 in both 256-attempt windows (versus 108–135 before); sampled
+field-0x50 regressions were 1 in each, still not proof of display order. User
+reports fewer apparent skips but lower apparent FPS, with no visual faults.
+This is a diagnostic, not a validated performance fix. Next investigate a
+nonblocking ordered commit path and independent physical frame-rate measurement;
+retain `overlap` as fallback.
 
-The conservative cache path (`ufscache=0`) was audited: command/UTRDs and the
-bounce buffer are cleaned before DMA and invalidated after completion, and the
-read direction is covered by `flush_dcache64(pa, len, TRUE)`. No cache change was
-made because the trial did not fault the I/O path.
+**Booted try-lock A/B:** incremental `citrus-present-trylock-experiment.patch`
+on top of serialization adds `fbserial=2`: timer tries the presentation mutex
+under `fLock` without waiting; if busy, it leaves pending and retirement holds
+unchanged and rearms after notifying vsync. It acquires the mutex before taking
+a pending record, avoiding the serial mode's extracted-old-record race. This
+is still not FIFO and timer-side `present()` can itself block. Test for hold
+lifetime, contention, motion, visual corruption and actual panel rate; counter
+`timer present deferrals` reports busy ticks per 256 direct attempts. Kernel
+`3ecf00ab3fdeda4664d55672ae3223dff856d37023791fe7c7899a79f16c781a`,
+`/tmp/citrus-trylock-diagnostic.img` SHA256
+`d55b2d8e664c55cdc20db406e4351d08be80ac956bd85f6281c6667c8bfc1f70`;
+linked, patch forward/reverse dry-runs and shim PASS. Hardware test: four
+256-direct-attempt windows show 0 overlapping calls and 0 field-0x50 sampled
+regressions; busy timer deferrals 157/130/187/173, each including ticks even
+when no pending frame existed. User reports much better motion and touch, no
+visual problems, but still visibly low FPS. This is not evidence of 60 fps or
+proof of correct display ordering; long-duration hold lifetime, power transitions,
+and independent physical frame-rate tests remain needed.
 
-Next test, in order:
+**Booted cached-scan experiment:** `citrus-cached-scan-experiment.patch`
+applied after the try-lock patches adds `fbscanall=1` (requires `fbserial=2`
+and surface holds). For geometry-eligible cached non-pool surfaces it uses the
+presenter queue, cleans the CPU cache and scans the held original instead of
+copying 10 MiB to a flip buffer. Earlier direct scan without adequate producer
+cooperation showed half-drawn frames: **tearing/stale pixels remain a serious
+risk**, as do CPU/GPU cache coherency and long-held surface starvation. Only an
+A/B test showed a user-perceived substantial speedup, with **slight tearing**
+when scrolling very fast; do not claim correctness or promote to default. Heavy
+control center still slows down. The existing wait-failure handling remains
+unchanged and is not a safety guarantee. Counts include `cached direct scans`.
+Kernel SHA256
+`27157b2dd585fe1e9df1d2ac19896b5d28d55fa2f44e28f4eb1571f9840ca0f6`,
+`/tmp/citrus-cachedscan-diagnostic.img` SHA256
+`99b8e821fc8322be0b6295dec5275c19b06a4a3ff38d0f52ce266e9d37a12581`;
+compiled/linked, reverse patch dry-run, shim PASS and hardware booted. In many
+256-attempt windows, ~128 cached scans, 0 overlaps and 0 failed waits; example
+flush-clear interval buckets 0/119/106/12/13/1/3/2. These now include cached
+and pool scans, unlike the earlier direct-only histogram, and do not prove panel
+FPS. Next investigate whether tearing is caused by in-use reuse, incomplete GPU
+fencing, or scanout timing; test lifetime and coherency, not just visual speed.
+Keep trylock as fallback and do not alter userdata.
 
-1. **Run `citrus-xnu-boot-ufsfix.img` 3–4 more times, unchanged**, and count lock
-   screens. This is the only way to know whether the UFS repair changed the rate.
-   The current trial is one data point: it reached SpringBoard but not the lock
-   screen.
-2. If it still sticks at the Apple logo, **sample this exact image**:
-   `sweetsample=SpringBoard,backboardd,launchd,lsd,chronod,pkd` plus
-   `sweetlog=1` (and `sweetptimer=1` only if the sampler stops), then pull the
-   flight recorder and symbolicate SpringBoard/backboardd. The new boot's last
-   state (small surfaces only, no full-screen present) points at compositing or
-   a SpringBoard startup wait, not at a dead kernel.
-3. Do not redo the UFS work unless a repeat logs `stale response`, `short
-   transfer` or `timed out`; those paths are now instrumented.
+**Separate unbooted refill experiment:** `citrus-gpu-refill-experiment.patch`
+is opt-in (`glgpurefill=1`, default off), applied to a `/tmp` copy only. For a
+screen-sized, non-inverted mirrored BGRA target it attempts to blit the imported
+surface to the target texture on the GPU, holding the IOSurface read lock until
+`glFinish`, and falls back to the CPU upload if the FBO/blit fails. A `/tmp` iOS
+arm64 dylib linked and ad-hoc signature verified (SHA256
+`19c75490021cbc29f4aca48ac7daaf3c342232ad3c2ddc2c5b70cf61a8ae8cb3`).
+No GL correctness, cross-process synchronization, runtime or performance testing
+has been done; do not install on the phone without those checks. This experiment
+needs a root-image decision; no root was modified.
 
-## 3. What was built and proven today (do not redo)
 
-**Live console over USB — works, this is the big infrastructure win.**
-`bsd/dev/sweet_usb.c` is a full DWC3 gadget (ported from Topaz) plus a CDC-ACM
-function; the kernel streams its console ring to bulk IN, macOS shows
-`/dev/cu.usbmodem00011`, and `tools/usb-log.py` prints it (autodetects the port,
-no root, no network config, reports silence instead of hiding it). Citrus facts,
-all verified on hardware:
+**Historical gpu40 assessment:** 4 KiB / 7 cores with GPU composition; ~50
+swap requests/s was measured, but physical unique-frame rate and the cause of
+felt stutter remain open as clarified above.
+Previous image (fallback) `out/citrus-8core/smp7-gpu40/citrus-xnu-boot-4k-smp7-gpu40.img`, SHA256
+`669cf4cfb51dc95e5762ea8725718ef614e042cb513b7c1338a45dded804e4af`, kernel
+`0abf7719195e74b3fc0b39dec2ba7143c310a1468f47749156fb2201e16b2577` - it carries the per-hitch
+attribution line and no longer runs a 10 MiB pixel census whose result it threw away (capture
+`4k-smp7-gpu40-split.txt`). Fallback `smp7-gpu29` (`f82290e748d0...`, kernel `aac49e76...`,
+user-confirmed smoother with `gpuagain=16`) and `smp7-gpu20` (`3e0e03924a99...`) stay; `smp7-gpu37`
+(the GL-scale experiment) and `smp7-gpu39` are deleted. All of them carry the frame-interval
+histogram, the MDP latch probe, GPU fence timing and lock-free surface accounting.
+7/7 CPUs, Gold 2016 / Silver 1804, GPU 950 with `CP up`, UFS 200/150/300, `citrusgl=1`, no panic.
+**Ranked levers after 2026-10-29:** (1) whole-surface clears - measured, ~2 ms, not it; (2) render
+smaller - **both routes closed**: the MDP small mode needs an `IOSurfaceAccelerator` service we do
+not have, and the in-wrapper GL scale measured no gain (263-270 vs 205-267 presents/5 s); (3)
+present pacing - not a 30 Hz lock, already vsync-paced; (4) SMMU CB0 - parked with a verdict (§6).
+What remains is the GPU's own work per frame and the 2-deep presenter queue that turns a late GPU
+frame into a blocked `swap()` (§1A item 2b). **The 4K "compositor stall" was one 90 ms allocation
+per 10 MiB surface**; `gpupoolfirst=1` fixes it. The GPU-off clock build `smp7-clk` (`de95df37...`)
+and `smp7-ent8` (`a00de0c8...`, CPU-300/MHz reference) stay as fallbacks. The 16 KiB GPU line below
+is the older, more complete userspace: it is the reference for "what a clean boot looks like" and
+the fallback if a 4K experiment fails.
 
-- DWC3 wrapper `ssusb@4e00000`, core regs at **`0x04e00000`** (size 0xcd00),
-  **QSCRATCH at core + 0xf8800**.
-- **GCC is at `0x01400000`, size `0x1f0000`** (DT `/soc/qcom,gcc@1400000`). The
-  old Topaz value `0x00100000` is *not* GCC here; reading it wedges the bus and
-  silently killed four boots before their first log flush. This was the single
-  most expensive mistake of the day.
-- USB is **fully powered down** when XNU starts (measured: `usb30_prim` GDSCR
-  `0x00222001`, every USB CBCR has CLK_OFF). Working bring-up
-  (`sweet_usb_power_on()`): clear GDSCR bit0 and poll bit31 (comes back
-  `0xf8222000`); enable `ahb2phy-usb` 0x1d008 and deassert its BCR 0x1d000;
-  enable `usb30-master` 0x1a010, `sleep` 0x1a014, `mock-utmi` 0x1a018,
-  `cfg-noc-axi` 0x1a084, `ahb2phy-usb` 0x1d008, `usb3-clkref` 0x9f000; pulse
-  `usb30` BCR 0x1a000.
-- **QUSB2 PHY is `qusb@1613000`** (the "0x088e2000" in older notes is wrong — that
-  was SM7150). Register layout = `phy-qcom-qusb2.c` `msm8996_regs_layout`
-  (PLL_STATUS 0x38, TUNE1-4 0x80/84/88/8c, TEST2 0x9c, POWERDOWN 0xb4). The board
-  init sequence is in the device tree's `qcom,qusb-phy-init-seq` (value,offset
-  pairs) and is applied verbatim; reset via GCC `GCC_QUSB2PHY_PRIM_BCR` 0x1c000.
-  PLL locks (status bit 5).
-- **HS-only needs the pipe clock from UTMI**: QSCRATCH `GENERAL_CFG` (0x08) |=
-  `PIPE_UTMI_CLK_SEL|PIPE3_PHYSTATUS_SW`, clear `PIPE_UTMI_CLK_DIS` (dwc3-qcom's
-  `select-utmi-as-pipe-clk`). Without it the DWC3 command engine rejects
-  SETEPCONFIG ("ep0 cmd 0x1 timeout").
-- **EP0 max packet must be 64** (HS), not 512. VBUS override still required:
-  QSCRATCH `HS_PHY_CTRL` 0x10 |= `UTMI_OTG_VBUS_VALID|SW_SESSVLD_SEL`,
-  `SS_PHY_CTRL` 0x30 |= `LANE0_PWR_PRESENT`.
-- `ud.lock` must be allocated by hand — it used to come from `ud_if_create()`,
-  which the ACM switch removed. Symptom of forgetting: the console streams exactly
-  one chunk and stops.
-- The old CDC-ECM/UDP path enumerates fine but never delivered datagrams; it is
-  gone. Sockets/routes are more fragile than a serial line.
+16 KiB reference: `gpu-poolarena1` (4/4 CPUs, PLL0 950, identity SMMU, FD610,
+self-test PASS, 8 crashes in 3 minutes, `gpu-poolarena1-live.txt`) with root
+`ios16-root-onesubmit.img` (`352688c5...`). **16 KiB lessons that still
+matter:** one submission per frame is user-confirmed smoother; the
+`gpu_pool_alloc` arena split still fails the volume-slider 10 MiB hold (§2);
+`SweetHID.cpp` is missing from 0002's FILES (the 4K relink compiles it
+explicitly).
 
-**Diagnostics that now exist** (all in `bsd/dev/sweet_ufs.c` unless noted):
+## USB PMIC restart (2026-10-28)
 
-- flight recorder block + 4 MiB console ring at the end of userdata
-  (`tools/pull-sweetlog.sh NAME` pulls and decodes: heartbeat v2, stall samples
-  v3, console log).
-- **interrupt-side stall recorder on UTRL slot 1** with its own UCD and bounce
-  buffer (`ufs_diag_write_block()`), so samples are recorded **even while a thread
-  holds `sweet_ufs_lock`** — the case the old version could not see.
-- **independent 1 Hz tick on the ARM physical timer** (`sweetptimer=1`, PPI 18),
-  ISR in `osfmk/arm64/sleh.c`, re-armed in `sweet_ufs.c`; records the interrupted
-  PC, uptime, in-flight UFS op and its own tick count.
-- `sweet_ufs_op_string()` exposes the in-flight command (opcode, length, age) to
-  any healthy thread.
+`python3 usb-restart/reboot.py fastboot|recovery --device /dev/cu.usbmodem…`
+sends `citrus:reboot:*` to the CDC console; `sweet_usb.c` parses it and runs
+the PM6125 PON/IMEM restart reason plus `PSCI SYSTEM_RESET`. Verified on
+hardware through a full flash cycle (serial 2103d88d0621 in fastboot, and the
+user visually confirmed recovery). Commands work only while the USB poller
+runs; resetting with a writable filesystem mounted is unsafe. PMIC-aware image
+`out/citrus-8core/gold2-usbpon/…` `14ebd4fb…` (kernel `3fc70396…`). The
+`misc` first block is byte-identical to its pre-test backup; no restore needed.
+Details in `research/CITRUS-CROSS-PROJECT.md`.
 
-## 4. Traps that cost boots today — read before editing the kernel
+## USB diagnostic evidence (2026-10-28)
 
-- **Never call `PE_parse_boot_argn` from interrupt context.** It killed every boot
-  within seconds (panel7..usbprobe2) and looked like a new freeze. Resolve boot
-  args once in thread context (`sweet_irq_writes_resolve()` in `sweet_ufs_init`).
-- **`mach_absolute_time()` is 24 MHz ticks here, not nanoseconds.** A literal
-  `now + 5*1000000000ull` "5 s" period is really ~208 s. Always use
-  `nanoseconds_to_absolutetime()` / `absolutetime_to_nanoseconds()`.
-- **`sweetwdt=<s>` panics the kernel by design** (`sweet_wdt_thread` in
-  `sweet_sample.c` prints then panics). Keep `sweetwdt=0` unless you want a panic.
-- Frequent `printf` from the USB log thread is **suspect** (the two builds that
-  printed a 5 s heartbeat stalled while the one that did not reached the lock
-  screen; the build without heartbeat also stalled, so it is not proven). The
-  heartbeat is opt-in: `sweetusbbeat=1`.
-- **Interrupt-side UFS writes must never use slot 0** (the driver's). Use the
-  slot-1 helper. `sweetirqwr=1` deliberately re-enables the old unsafe path; leave
-  it 0.
-- Panel drawing from the timer interrupt (`sweetpanel=2`) has never actually been
-  seen on the panel; do not rely on it as a display channel.
-- A dead console stream is **not** proof the kernel is dead (re-open the tty; on
-  usb6 buffered output came later). Always ask the user what the screen shows.
-- Any new MMIO base must be checked against
-  `device-dumps/20261025-141423-923416/live-tree.json` (authoritative for
-  bengal/SM6115). Do not trust the older Topaz-derived notes in this file.
+Receive ping acknowledged on enumeration (`4k-gold2-usbrx-live.txt`); the
+receive-hook console path stays silent after boot, and the IMEM-only and
+`bootonce-bootloader` resets both just rebooted (no demonstrated target mode).
+The working reset is the PMIC one above. Details in
+`research/CITRUS-CROSS-PROJECT.md`; do not repeat those two tests.
 
-## 5. Boot args reference (current best set for userland work)
+## 1A. ALL-CORE / 4 KiB STATUS (2026-10-29)
+
+- **DONE: 4 KiB, 7 cores, lock screen, touch, home gesture.** Current boot
+  image `out/citrus-8core/smp7-ent8/citrus-xnu-boot-4k-smp7-ent8.img`, SHA256
+  `a00de0c834d471116bcd9a71532492dad5311daf2acb331cd224165937cc2985`, kernel
+  from `/tmp/relink-smp7.py`, shim PASS, capture
+  `out/ios16/logs/4k-smp7-ent8-live.txt`. `7/7 CPUs initialized, SGI1
+  verified`; 4 crashes in three minutes (all `driverkitd`, the 16 KiB
+  reference has 8); zero code-signing assertions; ~64 fps presenting.
+  **User-confirmed: lock screen with a live clock, touch, and the home
+  gesture.** Full account: `research/CITRUS-4K-BOOT.md`.
+- **DONE: every clock this port owns is at its designed rate, measured.**
+  Gold 300 -> **2016 MHz** (EPSS LUT state 8), Silver 1305 -> **1804 MHz**
+  (state 7), GPU 600 -> **950 MHz** (`PLL0 1900 OUT_AUX2/2`, `CP up core
+  950 MHz`, `selftest PASS`), DDR at the top OPP (**8.5-9.3 GB/s** measured
+  8 MiB copy), and now **UFS**: the bootloader left `ufs_axi` at 120 MHz
+  (GPLL0/5) and `ufs_unipro` at 100 MHz (AUX2/3); both are programmed to the
+  board's design maxima **200 and 150 MHz** with `ufs_ice` already at **300**
+  (divider-only RCG updates, readback confirmed, UFS root mounts read-write
+  afterwards). `tools/verify-clocks.py` over the captures is **12 pass / 0 fail
+  / 0 missing**. Image `de95df37...`; captures `4k-smp7-ufsrate-live.txt`
+  (first programmed boot), `4k-smp7-ufsdefdiag-live.txt` (default-on proof),
+  `4k-smp7-ufsfinal-live.txt` (resting build). `sweet_cpufreq.c` now decodes BOTH clusters,
+  `sweetcpufreq=1` = designed top (boost), `=2` = sustained (top-1), plus
+  `kern.sweet_cpu_state` to switch at runtime. **The tick counter is 19.2 MHz,
+  not 24** -- every earlier frequency claim in this file that used 24 is 1.25x
+  high. Full account and open items: `research/CITRUS-CLOCK-SPEED.md`.
+  **The remaining blocks are classified, and nothing is left to program:**
+  **UFS is AP-owned** and now at its design maxima (above); **SNOC/CNOC/BIMC
+  are RPM-owned** (`rpmcc *_MSMBUS_CLK`, `bengal-bus.dtsi`) so no AP code can
+  set them and the bandwidth probe is their evidence; **PCIE does not exist on
+  bengal**. `gcc_bimc_gpu_axi_clk`/`gcc_gpu_snoc_dvm_gfx_clk` are branches off
+  that same RPM-driven fabric. Detail: `research/CITRUS-CLOCK-SPEED.md` §6.
+- **DONE: the Adreno 610 composes on 4 KiB / 7 cores.** The "stall after 10-15
+  frames" was never a hang: every full-screen CoreAnimation surface is 10 MiB,
+  `RedwoodGPU.cpp` tried the low-memory allocation first, and for 10 MiB
+  physically-contiguous that call **takes 80-110 ms to fail** before the
+  reserved pool answers in 3 us — so 1-2 allocations per frame cost 100-300 ms,
+  i.e. **3-5 fps**. `gpupoolfirst=1` asks the pool first for >= 2 MiB and falls
+  back on a miss: frame cost fell from **112,994 us to 7,782 us** on the same
+  workload (302 calls/40 draws), allocations now 1-2 us, frames continue past
+  the old 15-frame point with fences climbing. `citrusgl=1` is now the resting
+  configuration (`smp7-gpu10` `01599318...`, capture `4k-smp7-gpu10-live.txt`).
+  **Where the rest of the frame goes (measured during a real swipe,
+  `4k-smp7-gpu11-samples-live.txt`, wrapper summary at 800 frames):** 13.48 ms
+  of work a frame - 5.37 ms `glFlush`, 5.49 ms waiting for the GPU, 1.25 ms
+  making textures from IOSurfaces, and 7.91 ms of it *outside* GL calls
+  (CoreAnimation's own CPU); 479 calls / 93 draws a frame. But only ~23 frames
+  arrive a second, i.e. the compositor is idle ~76% of the wall time waiting
+  for the next frame: the present/latency chain is costing ~2.7 vsyncs a frame,
+  not raw CPU. Kernel side is cheap: 1343 submissions in 5.4 s (10 a frame),
+  43 buffers each, 278 us flushing each. **ANSWERED (07:55, the same day, with
+  fence timing now in the kernel): the port is GPU-bound, not
+  present-bound.** Every submission's fence is stamped at the CP kick and again
+  when the fence is seen passed; ~1,400 submissions in 5 s take **8.0 ms of GPU
+  time each, 190 of 212 over 4 ms** (~277 submissions/s). The Adreno 610 is
+  saturated on ~93 draws + 10 clears over 10 MiB surfaces (~85 us a draw =
+  fill/bandwidth bound). Raising the rate now means **cutting GPU work**: (a)
+  UBWC/bandwidth compression on the composited surfaces (the kernel already
+  reports `HIGHEST_BANK_BIT 14`, `UBWC_SWIZZLE 7`, `MACROTILE_MODE 0`), (b) one
+  GPU blit a frame instead of per-layer mirror copies and redundant
+  whole-surface clears, (c) fewer submissions a frame (Mesa implicit flushes;
+  the wrapper's `glonesubmit` is already 1). Detail:
+  `research/CITRUS-4K-GPU.md` §2.
+  **What the three levers actually turned out to be (08:05, `glframes=1`):**
+  (a) **UBWC is already on**: Mesa 25.0.7's `get_best_layout()` returns UBWC for
+  every a6xx resource unless `FD_DBG(NOUBWC)` or the bind flags forbid it, so
+  there is nothing to enable there; the 10 MiB IOSurfaces themselves must stay
+  **linear** (`PIPE_BIND_SHARED` + display scanout), which is the traffic UBWC
+  could not have compressed anyway. (b) **the wrapper already draws in place**
+  (`1 in place, 0 copied` - no mirror blit to remove); the cost is
+  CoreAnimation **redrawing the whole screen every frame**: the damage box is
+  `0,0 1080x2340`, and 1746 of 1911 frames have no scissor at all. 136 draws
+  over 2.53 Mpix a frame *is* the 45 ms. (c) submissions are 200-250 a second
+  (~10 a frame) at 8-21 ms of queue latency; the multi-second figures in the log
+  (2.95 s, 1.39 s) are **observation delay** - the stamp is taken when someone
+  polls and finds the fence passed, not when the GPU finished - so only
+  busy-window numbers are trustworthy.
+  **"It degrades with use" is NOT a leak (measured 08:25, `4k-smp7-gpu14-live.txt`).**
+  The heartbeat now prints `WIRED=<KB> big=<n> in <MB>` (lock-free atomics
+  beside `sweet_surface_wired`; see §9 for why it cannot walk the table): over a
+  minute of real use `SURF live` 19 -> 400 (`made=507 freed=107`) but **WIRED
+  plateaus at ~128 MB and `big` stops at 16-18** surfaces, and presents stay
+  80-200 per 5 s throughout with no downward trend. What *does* grow is the
+  work per frame: 65 -> 83 draws (cumulative) as apps and layers accumulate, and
+  an idle lock screen costs only 4 draws a frame (so CA's damage tracking does
+  work; a scroll genuinely dirties the screen). The frame budget is therefore
+  GPU fill during interaction, not memory. **Sizing it:** ~136 draws at roughly
+  1/8 screen each is ~17 full-screen equivalents a frame; an Adreno 610 at
+  950 MHz sustains ~1.5-2 Gpix/s of blended fill against a 2.53 Mpix screen, so
+  60 fps allows ~10 full-screen equivalents. The port is **2-3x over budget, not
+  10x** - one solid 2x win makes 30-45 fps, two make 60. Ranked, with what is
+  measured vs assumed:
+  1. **~~The ~10 whole-surface clears a frame~~ - MEASURED, SMALL (09:15).**
+     `glclears=1` (wrapper) now prints `f N clears: <whole> whole, <boxed>
+     boxed, <skipped> skipped, <Mpix> Mpix` per frame. On a real scroll:
+     **4.6 whole + 2.5 boxed clears a frame, 4.3 Mpix in total** - about 1.7
+     screenfuls, i.e. ~17 MB of writes or **~2 ms of a 40 ms frame**, not the
+     12 ms the 10-clear count suggested. Dropping them cannot be the 2x. The
+     opt-in skip is still implemented (`gnoclear=1`: a deferred clear is
+     dropped when the following draw covers its box with blending off) - and it
+     **does not help**: with it on, presents were 150-238 per 5 s (30-48 fps)
+     against 205-267 without, i.e. no gain inside the noise, with visual-corruption
+     risk. Leave it off. Measured 09:40.
+  2. **Render smaller and let the MDP upscale - the scaler DOES work by plain MMIO, the
+     reported mode was the bug (11:45).** Two earlier conclusions in this item were wrong and
+     are corrected here. (i) The QSEED block is **QSEED4**, not QSEED3-lite: `HW_VERSION`
+     (SSPP+0xa00) reads **0x3000** = `QSEED4_SCALER_VERSION`, read back on hardware. (ii) It
+     does **not** need the register-DMA engine: `sde_hw_util.c` carries a plain-MMIO
+     `sde_hw_setup_scaler3()` beside the reg-DMA one, and its LUT writer returns early when
+     `lut_flag == 0` - and the driver's own default scale path sets `lut_flag = 0` with
+     **bilinear** filters. So the scaler is: `OP_MODE 0x04` = `enable | BIL<<16 | !DX<<14 |
+     alpha_en | alpha-BIL<<29`, `PHASE_STEP 0x10..0x1c` = `(src << 21) / dst`, `PRELOAD 0x20`
+     = QSEED4's h4/v2, `SRC_SIZE 0x40/0x44`, `DST_SIZE 0x48`, `PHASE_INIT 0x90..0x9c` = 0, and
+     - as the driver does - **`PE_OVERRIDE` stays set** (SSPP `0x38` bit 31) with the pixel
+     extension programmed by hand: `0x100/0x110/0x120` = right 2 fetch+repeat, `0x104/0x114/0x124`
+     = bottom 2, `0x108/0x118/0x128` = `(src_h+2)<<16 | (src_w+2)`.
+     **What actually produced the three broken pictures:** not the scaler. `directPresent()`
+     accepted *any* surface at least `fWidth x fHeight` and scanned the **centred crop**
+     (`ox = (s->width - fWidth)/2`), while CoreAnimation was still allocating **1080x2340**
+     surfaces because `kSweetFBGetDisplaySize` returned `fLogicalW/H`, which the small mode
+     had deliberately kept at the panel's size. A `fbdump=1` line (`ystride` 4352 = 1088 px on
+     a surface whose pipe SRC_SIZE said 720x1560) proved it: a full-size surface was being
+     cropped to 720x1560 and, once the scaler worked, blown back up - hence "mosaic", "top
+     half, three shadows" and "stretched diagonally". With the mode reported as the small size
+     (`GetDisplaySize` -> 720x1560) CA really does allocate 720-wide surfaces (`ystride` 2880,
+     verified) and the scaler is programmed with `step 0x155555` - **but the compositor then
+     stops swapping: 12 swaps in a minute, panel black.** So the remaining problem is the
+     *mode change*, not the scaler: userspace stops presenting once the size it asked for at
+     boot differs from the panel timing it also reads (the mode block 0x40 IDs are constants,
+     and nothing notifies it that its mode was accepted). That is the next thing to solve;
+     do not re-derive the scaler.
+     **WHY userspace stalls at a scaled mode - FOUND (12:30), and it is not our code.**
+     `IOSurfaceAccelerator` (in IOSurface.framework, inside `dyld_shared_cache_arm64.25`) does
+     `IOServiceMatching("AppleM2ScalerCSCDriver")` and, when nothing matches, prints
+     `IOServiceMatchingfailed for: %s` and `Unable to get scaler capabilities` before falling
+     back to a software path. That class really exists on this OS: the iPhone X 16.7.16
+     kernelcache (`ipsw kernel kexts`) lists **`com.apple.driver.AppleM2ScalerCSCDriver`
+     265.0.0**, a full ISPA scaler/CSC driver (`IosaInternalPipeMSR`, `M2ScalerCSCRequest`,
+     `IosaColorManagerMSR8`, ...). So iOS implements a scaled display mode by **upscaling the
+     frame with the hardware IOSurface accelerator**, and this port has no such service - which
+     is exactly the black panel and the 12 swaps a minute: WindowServer asks for the scaler,
+     gets nothing, and stops presenting. Our MDP QSEED4 scaler is the equivalent hardware but
+     it is invisible to userspace, which wants an IOKit service with IOSurfaceAccelerator's
+     user-client API. That is a multi-round driver project, not a register poke - do not retry
+     the mode change until it exists.
+     **The route that needs no Apple service (in progress, 12:35):** keep the mode at
+     1080x2340 and scale *inside the compositor's own GL* - `glscale=N/D` in the wrapper
+     (`eagl.c`, committed): the screen-sized surfaces are drawn into a texture N/D of their
+     size (`attachImage` re-specifies its storage), every `glViewport`/`glScissor` is mapped
+     into that smaller texture (`eagl_scale_rect`, emitted by `mkeagl.py` for slots 0xa80 and
+     0x7e0), and the existing mirror blit in `target_to_surface()` copies it up bilinearly.
+     Off by default; the same root serves both by adding `glscale=2/3` to the kernel cmdline.
+     **Hardware result (12:55 and 13:25, two boots): the scale works, the filter effects do not.**
+     With `glscale=2/3` (root `179f3dc3`, boot `smp7-gpu37`) content is correct and full screen and
+     presents reach **1581 against the control's 749** in the same session - the port really does
+     shade 720x1560 now. Two defects, both user-reported: the **app switcher and the lock-screen
+     clock are drawn wrong**, and it **feels slower** despite the extra presents. The first theory -
+     that the wrapper's own blur/group passes were scaled a second time - was wrong: those passes
+     call Mesa directly, not the intercepted slots, so they were never scaled, and the
+     `scale_suspend` guards added for it (root `ios16-root-glscale2.img`, `d93f163a...`) changed
+     nothing. The likely real cause is that the *filters* compute their sample geometry from
+     `image->width/height` (1080x2340) while the texture they read is now 720x1560, so every
+     radius/offset in the blur and group paths is 1.5x out - which is exactly the two effects that
+     look wrong. Fixing that means threading `texw/texh` through every filter, and the "feels
+     slower" verdict has to be settled by measurement first (frame time 12-15 ms against the
+     control's 9-10 ms, i.e. the 4.5 MB read + 10 MB write mirror blit may already eat the gain at
+     2/3). **Measured properly (13:55) and CLOSED - it is not a win.** During a real scroll at
+     `glscale=2/3`: **263-270 presents per 5 s against the unscaled 205-267**, frame cost 7.5-11 ms
+     against 9-10 ms - no gain outside the noise - while the filters stayed broken and the user
+     still felt 15-20 fps. The compositor was therefore never shading the frames that were missing:
+     it already presents at vsync, and the felt rate is set elsewhere (item 2b). `smp7-gpu37` is
+     deleted with this verdict; root `ios16-root-glscale2.img` stays as the phone's root because it
+     behaves identically with `glscale` off. **Control fact worth keeping:** an idle SpringBoard simply stops drawing (`swaps` flat, no
+     wrapper frames) - do not read that as a hang; ask for a swipe before calling a boot stalled.
+     Failed builds deleted; `smp7-gpu29` is back on the phone (presenting, capture
+     `4k-smp7-gpu29-restore4.txt`). Captures: `4k-smp7-gpu33-scaler.txt` (scaler programmed,
+     black), `4k-smp7-gpu34-pe.txt` (PE extension, cropped picture), `4k-smp7-gpu35-geom.txt`
+     (the `ystride 4352` proof), `4k-smp7-gpu36-mode720.txt` (real 720 mode, compositor stalls).
+  2b. **The felt 15-20 fps is the presenter waiting for the GPU - ATTRIBUTED (14:05).** The
+     presentation chain is neither the console nor a CPU copy: every UI frame takes
+     `dp-surf 1080 1 -> dp-drawn -> dp-scan -> dp-done` (direct scanout of the GPU-pool surface,
+     `copy-path` count 0), so the GUI is fully migrated off the console frame. What is slow is
+     inside `present()`: a new per-hitch line (`SWEET FB: hitch <us>: queue .., MDP busy ..,
+     previous present <us> (census <us>, GPU wait <us>) / latch <us>`) shows the presenter spending
+     **5-15 ms in `topaz_surface_drawn()`**, waiting for the Adreno to finish the frame, against
+     ~0-2 ms of its own work. When that wait exceeds a vsync the 2-deep presenter queue fills and
+     `swap()` blocks the compositor (up to its 200 ms deadline) - that is the visible stutter.
+     **Fixed on the way:** `present()` ran `sweet_surface_rgb_nz()` (a strided 10 MiB read) on
+     GPU-pool surfaces and then discarded the result - now skipped, census 1091-1923 us -> 0.
+     Build `smp7-gpu40` (`669cf4cf...`, kernel `0abf7719...`), capture `4k-smp7-gpu40-split.txt`.
+     That leaves the port GPU-bound on the app's own draws, which is why halving the fill
+     (`glscale`) did not help: the cost is the ~130 submissions a frame and the wait for them.
+  3. **Present pacing - ANSWERED (09:25): NOT a 30 Hz lock, and the phone is
+     already at ~50 fps.** `frameShown()` in `SweetFramebuffer.cpp` buckets the
+     interval between displayed frames in 8.33 ms steps and prints the histogram
+     every 256 frames (no per-frame console cost). During a real scroll:
+     **buckets 8.3-16.7 ms 102, 16.7-25 ms 138, 25-33 ms 7, 33-41 1, 41-50 0,
+     50-58 3, >58 4**, and `swaps` per 5 s reads **248, 205, 257, 255, 251, 256,
+     267 = ~50 fps**. Presentation is vsync-paced, not locked at 30, and the
+     frame budget is nearly met. The remaining defect is the **hitch tail**
+     (25-112 ms frames, a few per 256), which is what "frames skip / arrive out
+     of order" feels like. **The latch wait is not the cause**: a second probe
+     times the poll for the MDP to latch each frame - `latch max 16.5-17.3 ms`,
+     **73-79 of 256 frames over 8 ms, 0 expired** (the 25 ms budget is never
+     hit), so the presenter waits at most one vsync and the MDP always latches.
+     The frames that miss a vsync are GPU/CPU work, not presentation. Old: from
+     the per-frame timestamps, present intervals are vsync-quantised
+     (1/2/3 x 16.67 ms buckets) but not locked at 30 Hz, and their **median was
+     17.0 ms** - which is an artefact, see the console-cost trap in §9. Treat
+     as open. Frames arrive every 25-43 ms,
+     which is suspiciously close to 2 vsyncs. A kernel-side histogram of
+     inter-present intervals settles whether the compositor is throttled by the
+     swap chain rather than by the GPU; if so, triple buffering doubles the rate
+     for free.
+  4. **GPU memory path**: with SMMU bypass the GPU's accesses are Normal
+     non-cacheable (`MAIR0 = 0x44`); only enabling CB0 translation with
+     write-back attributes could make them cached/combined. That is the parked
+     §6 work, ~2x if it pans out, and coherency-risky.
+  5. Cheaper blur/shadow paths in the wrapper (visual change).
+- **Root cause of the whole crash loop: no AMFI, so nothing was signed.**
+  Without `mpo_vnode_check_signature`, `ubc_cs_blob_add()` never set
+  `CS_SIGNED`/`CS_PLATFORM_BINARY`, so every process looked unsigned,
+  unentitled and non-platform. Four `ARM64_BOARD_CONFIG_SWEET` fixes:
+  `ubc_subr.c` stamps `CS_SIGNED` (+`CS_PLATFORM_BINARY` on the rootfs) on a
+  blob that validated; `kern_exec.c` forces
+  `CS_SIGNED|CS_VALID|CS_PLATFORM_BINARY` into `imgp->ip_csflags` (exec's mask
+  has no platform bit at all); `kern_cs.c`/`kern_proc.c` drop the `CS_SIGNED`
+  gate on entitlements and fall back to `ubc_cs_blob_get()` and the signature's
+  raw XML/DER blobs; `kern_resource.c` lets platform binaries set low-space io
+  policy. Crash count per build on the same root: 1,145 -> 950 -> 845 -> 604 ->
+  **4**.
+- **Touch had two build-input bugs, not driver bugs.** (a) The CI tree held a
+  105-byte stub `bsd/dev/sweet_touch_fw.h` (`len = 0`), so the FT8719 ROM got
+  `downloading 0 bytes`; the real 264 KB header with `len = 64336` was next to
+  the source but absent from the build. Recompiling `sweet_touch.o` fixed it.
+  (b) `SweetHIDTouch::touch()` tested the edge band against the 2436 logical
+  height (`y > 2399 - 48`) while the panel reports 2340, so a bottom swipe
+  could never set `kIOHIDDigitizerEventFromEdgeTip` and UIKit never armed the
+  home gesture. Now `2339 - 48`, and `SweetHID.cpp` must be recompiled into
+  `SweetHID.cpo` (the prebuilt member is the old code).
+- **Host-driven resets work; the button is no longer needed.** `sweet_usb.c`
+  now parses `citrus:reboot:fastboot|recovery` on the already-armed bulk OUT
+  endpoint and runs the PM6125 PON/IMEM reason then `PSCI SYSTEM_RESET`
+  (`sweetusbcmd` gates it, default on). Verified on hardware, including a full
+  build-flash-boot cycle with no physical interaction.
+- **Silver 0 remains unavailable.** An 8-node ADT makes `PSCI CPU_ON(0x0)`
+  return -4 (ALREADY_ON): secure world owns it. Seven cores (4 Gold + Silver
+  1-3) is the true maximum; `SweetCPU.cpp:253` panics on the non-zero rc.
+- **`sweettrustall=1` should now be droppable** (processes carry
+  `CS_PLATFORM_BINARY` themselves); the no-trustall test predates the fix and
+  has not been repeated. Do not try to suppress the launchd "boot task is not a
+  platform binary" panic itself: `panic_kernel()` is `__abortlike`, so returning
+  traps (BRK #1) and returning success from `reboot_kernel()` panics
+  `initproc exited` — both proven on hardware.
+Work is consolidated in this checkout under the isolated namespace
+`out/citrus-8core/` (delete that directory to roll back its artifacts; the
+added tools and research note are additive). No root image was modified.
+
+- **Build inputs (do not re-derive):** CI run 40531392449 (`7e84cd1c`,
+  macos-14/Xcode 15.4, `TOPAZ_4K=1`, no AMP) produced the 4K kernel
+  `1492c683…` plus the 133 MB archive, `*.exp`/`*.alias.exp`/`*.linkarguments`
+  that `/tmp/relink-smp7.py` reuses for a local relink
+  (`tools/relink-citrus-4k-firmware.py` is the older one-shot variant; local ld
+  27 emits no `__LINKINFO`/`__CTF` and merges `__LASTDATA_CONST` into `__LAST`,
+  so always shim-test before booting). The recorder needs a writable `userdata`
+  (`ufsrw=1`); with `sweetlog=0 ufsrw=0` neither the ring nor the heartbeat
+  runs. One-Gold and rollback experiments from 2026-10-28 are in
+  `research/CITRUS-4K-BOOT.md`.
+
+## 2. NEXT DECISION
+
+1. Composition is on the GPU and fast enough to use (§1A). Next, in order: the
+   10 MiB IOSurface refill is still a CPU copy (13-183 ms per full-screen
+   change), then the ~5 ms/frame cache maintenance on 4 KiB pages. Both are
+   `research/CITRUS-4K-GPU.md` §2.
+2. The pool's cold-latency defect is fixed by `gpupoolfirst=1`; what remains is
+   the volume-slider 10 MiB *failure* with 12.9 MB free in 4 MB blocks — solve
+   it in `gpu_pool_alloc` (refuse small splits below 8 MiB, or reserve the
+   10 MiB class), not by raising `gpupoolmb`.
+
+## 2A. 4K PLAN (updated 2026-10-29 04:05)
+
+1. **The phone is healthy on `smp7-clk` `de95df37...`** (§1); no restore
+   needed. Use `python3 usb-restart/reboot.py fastboot` then `fastboot flash
+   boot ...` for the next experiment.
+2. **Then, in order:** (a) make the 10 MiB IOSurface refill a GPU blit instead
+   of a CPU copy, and cut the per-submission cache-maintenance cost
+   (`research/CITRUS-4K-GPU.md` §2); (b) boot once without `sweettrustall=1`;
+   (c) fold touch probe mode 10 into `sweet_touch_init()`; (d) backlight PWM.
+3. **Iterate with the host channel, not the button:**
+   `python3 usb-restart/reboot.py fastboot` while the USB console is up, then
+   `fastboot flash boot ... && fastboot reboot`. Boot to userspace is 40-90 s;
+   the touch probe starts 5 s in and needs ~40 s for the 64 KiB firmware.
+4. **Silver 0 is not available to the HLOS — proven, not assumed.** Seven
+   nodes, `cpus=7`. Do not publish an 8-node ADT.
+5. **Do not rebuild what is already fixed:** the identity/entitlement/platform
+   stamps, the low-space io policy, the 2340-pixel edge test, the real
+   `sweet_touch_fw.h`, the immediate DWC3 bring-up. Each was proven on
+   hardware and is described in `research/CITRUS-4K-BOOT.md`.
+
+## 3. MEASURED BASIS (16 KiB B0, 2026-10-27)
+
+3,980 frames: median 10.96 ms/frame, p95 30.34 (29% over 16.7). Texture refills
+are per asset, not per frame — deduping them was not justified. All 13 large
+allocations came from the pool after 18.9-108.7 ms (median 47.6) of failed
+low-memory search, 36 sub-attempts; `gpupoolfirst=1` now removes that search
+(§1A). `glFlush` 5.3-7.5 ms/frame, cache maintenance 657 us/submission.
+
+## 4. NAMED IMAGES / QUARANTINE
+
+16 KiB fallbacks in `out/citrus-diagnostic/`: `gpu-poolarena1` `c0056a8f...`
+(current 16 KiB boot), `pool2` `aeec7fc4...` (byte-identical), `perf3`
+`af7dd145...`, `keys-test` `68e079af...`, `ca6` `b699cac2...`, `pll0-950`
+`4e3e54fe...`, `cpu1` `0f709d85...`, `mhz600` `15e99eea...`, `touch-cpu4`
+`74598845...`, `touchprobe23` `4bf2cd3b...`, `smp4` `e464cb60...`; manifest
+next to each build dir.
+
+**Quarantined — do not flash without a new diagnosis:** `gpu-perf2`, `gpu-perf4`,
+`gpu-perf4b`, `gpu-allocprobe`, `gpu-latpool`, `gpu-pool128`, `gpu-smmu1`,
+`gpu-smmu39`, `gpu-smmudiag`, `gpu-clockprobe1`, `gpu-direct1`, `gpu-probe1`,
+`gpu-backlight1`, `smp5-cpu4`, `citrus-xnu-boot-unmask.img`.
+
+## 5. ROOTS
+
+- **Root on the phone:** restored `out/ios16/ios16-root-full.img` (install SHA256
+  `414b3dc6e84f80e053b23de2af8298e79800aec2b0cfddfa995ce4249b8c343d`;
+  live contents may have drifted). See `AGENTS-RESTORE.md` for full restore and
+  known wallpaper issue. The former `out/ios16/ios16-root-glscale2.img`
+  (`d93f163a...`) remains a fallback, not the current phone root. Do not modify
+  or flash either root without an explicit root-image decision.
+- **Known-good root:** `out/ios16/ios16-root-onesubmit.img`, SHA256
+  `352688c583725d7b2090ee7a2b1e8ef68f925c3a96eca5dae4b4afc0431641e6` — the
+  compositor root plus the one-submission `libcitrus-gl.dylib`. Rebuild it from
+  the compositor root (next bullet) with `tools/build-citrus-eagl.py` +
+  `tools/package-citrus-gpu-userland.py` +
+  `tools/install-citrus-compositor.py --image <copy> --source-sha256
+  0ee5bd34… --apply`, then `tools/flash-citrus-gpu-userdata.sh`.
+- Known-good base: `out/ios16/ios16-root-keychain.img` (16 GiB HFSX),
+  SHA256 `0ee5bd34809984e05d88104f4bd5a1e6a78166b6b61c1b1f338ba478f3bb1732`.
+- Fallback root with compositor, **never modify**:
+  `out/ios16/ios16-root-gpu-compositor.img`, install hash
+  `e796c1f202ff02f546700395fac3de8b329ece882acecaf23db49adde9eb76fa`.
+  It still has the two-submission wrapper, so pair it with a kernel whose
+  cmdline has no `glonesubmit=0` only if you want the old behaviour.
+- Rebuild the offline root with `tools/build-ios-root-macos.py` (IPSW
+  provenance in `out/ios16/download.json`); a triangle root is a copy of the
+  keychain image plus `tools/install-citrus-gpu-userland.py --image <copy>
+  --test-runner iomfb` (always pass `--image`).
+- Repairs already done — do not redo: catalog extents reconstruction, one-node
+  extents-overflow fix for fileID 8, keychain ownership `/private/var/Keychains`
+  → 64:64, Wi-Fi identity in `/chosen/mac-address-wifi0`.
+- Flashing root: fastboot rejects ≥2 GiB. Use recovery + ADB:
+  `tools/stream-image-adb.sh IMAGE /dev/block/by-name/userdata` (16 × 1 GiB
+  segments), then verify the on-device SHA. Cancel ADB Sideload in OrangeFox if
+  `adb shell` is closed. Never run `tools/hfs-owners.c` on a real root; use
+  `tools/hfs-chown-inplace.py`.
+
+## 6. SMMU STATUS (parked, not abandoned)
+
+IDR1 `0x20000005`: 4 KiB pages, NUMPAGENDXB 2, five context banks; IDR2
+`0x5511` = 36-bit IAS/OAS. Vendor rule `cb_base = base + size/2` gives
+CB0=0x8000, GR1=0x1000, confirmed on hardware; `citrus_smmu_layout()` now
+validates it (`tools/test-citrus-smmu-layout.py`). CB0 writes land exactly
+(SCTLR `0x67`, TTBR0 `0x8efe4000`, TCR `0x00800020`); SCTLR bit 12 and sCR0
+bits 4/5 are not writable; only CB0 is trustworthy. **2026-10-29 10:05 - translation is blocked by a fault at enable time, and the
+stage-1 tables are NOT the reason.** A software walk of the CP's firmware
+address proves the chain is right and the PTEs are in RAM:
 
 ```
-debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress rd=ufsroot0
+WALK sqe va=0xf0000000 ttbr0=0x93a64000 l1[3]=0x93a65003 l2[384]=0x93a66003
+     l3[0]@0x93a66000=0x8f0cc643   (PA 0x8f0cc000, flags 0x643)  next=0xf0017000
+```
+
+(`sqe` 32 KB at 0xf0000000, `ring` at 0xf0009000, `mem` at 0xf0012000; the ring
+l3 entry 0x8f0d4643. `table_chunk_used` is fine - `PAGE_SIZE` here is 16 KB, so
+4 slots per chunk, and the initialiser of 4 was already correct.)
+
+What actually happens: **CB0 FSR already reads non-zero at the instant SCTLR.M
+is set**, before the CP is ever kicked (`SMMU enabled after mapping: SCTLR
+00000067 FSR 00000400`). The bootloader leaves the GPU/CP live, so the first
+translated access comes from a client that is already running, not from our
+submission. Sequence of attempts, each with its own boot:
+
+1. Enable at the end of `smmu_setup()` -> CP faults at `0xf0000000`, ring stuck.
+2. Enable only after the CP buffers are mapped (`smmu_enable_now()` style) ->
+   **FSR non-zero at enable**, so the fault is not an unmapped-IB ordering bug.
+3. `SMR0` widened from mask 1 (SID 0/1 only) to `0x7F` (all 7-bit SIDs) plus an
+   attempt to clear `sCR0.USFCFG` -> the fault signature changes (`FAR` becomes
+   a 48-bit value), i.e. **stream matching was definitely wrong before**. Note
+   `sCR0` bit 10 does not read back cleared.
+4. Clean *every* descriptor page (all l2/l3 tables, not just the 8-byte
+   entries) before enabling -> unchanged, so it is not descriptor coherency.
+
+**Two traps found, do not trust the old fault report:**
+- `smmu_atos()` is useless as written: it polls `CB+0x8F0` for bit 0 with an
+  expected value of 0 and prints `PASS` with `par=0` on every address, mapped or
+  not. Either fix the register offsets (ATS1PR result is in `CB_PAR`, 0x50) or
+  delete it.
+- Our `CB_FSR`/`CB_FAR` reads (0x58 / 0x50) can return values that cannot be
+  GPU VAs at all (`FAR 0x601310167482`, repeatable but nonsense, 48-bit), so
+  the printed FSR/FAR may be from the wrong offsets. Treat "the CP never leaves
+  the ring" as the trustworthy symptom and the register dump as suspect.
+
+Reverted to the identity build (`smp7-gpu20` back on the phone, `Adreno 610
+ready`, `CP up core 950`); `smp7-gpu26`/`smp7-gpu27` deleted, captures
+`4k-smp7-gpu24-walk.txt`, `4k-smp7-gpu26-smr.txt`, `4k-smp7-gpu27-clean.txt`.
+The tree now carries those gated edits (SMR0 mask `0x7F` unconditionally, and
+enable-after-map plus a full descriptor clean under `!gpu_identity`); **the
+resting image predates them**, so a future `gpu_identity=0` build starts from
+the state described here, while identity boots are unaffected (SCTLR.M stays 0,
+which bypasses translation regardless of stream matching).
+
+**CORRECTION (10:30):** the "fault at enable time" above is an artefact - the
+same `FSR 0x400 / FAR 0x6013_10167482` pair reads back on an **identity** boot
+with translation disabled (gpu29), where no fault is possible. The register
+offsets (FSR 0x58, FAR 0x60/0x64, FSYNR0 0x68) match Linux's arm-smmu, so the
+MMU-500 in this SoC simply does not expose usable fault status there; nothing
+about the CP's failure can be learned from it.
+
+**VERDICT (10:25): evaluated, parked.** Every avenue that does not require new
+machinery is exhausted - the tables, the TLB, the descriptor coherency, the
+enable point and the stream mask are all verified or ruled out, and the fault
+report itself is untrustworthy on this part. What remains needs either 2 MiB
+*block* descriptors (to identity-map the RAM window the ZAP/CP microcode is
+already executing from, which is the leading hypothesis: `zap_load()` runs
+before `smmu_setup()`, so under bypass the GPU is executing microcode at
+IOVA = PA, and translation turns that into an immediate walk fault) or a real
+GPU reset path we do not have. That is a multi-round project, not the fast path
+to 60 fps, so the lever is parked with the evidence above.
+
+**Next for this lever (if resumed):** find CB0's real FSR/FAR/Fsynr1 offsets from the
+MMU-500 spec (Fsynr1 carries the SID of the faulting stream, which names the
+client), kill/stop the pre-existing GPU client before enabling translation (a
+GPU soft reset, not just a CP halt), and only then map and start. Do not rebuild
+the descriptor path - it is verified correct.
+
+## 7. BUILD / FLASH / TEST
+
+```sh
+# Kernel + boot image (23.7 MB). The ADT node count must match cpus=.
+python3 tools/rebuild-kernel.py
+python3 upstream/ios-topaz/tools/mkpayload.py \
+    out/citrus-kernel/kernel.development.citrus \
+    out/citrus-kernel/citrus-ufsroot-disp-ram1792-cpu4.adt \
+    out/citrus-kernel/payload-<name>.bin --cmdline "<args, cpus=4>"
+python3 tools/build-diagnostic.py \
+    --template device-dumps/20261025-141423-923416/backups/boot.img \
+    --payload out/citrus-kernel/payload-<name>.bin
+mv out/citrus-diagnostic/citrus-xnu-boot.img \
+   out/citrus-diagnostic/citrus-xnu-boot-<name>.img
+
+# Clock goal gate: one row per designed-rate claim, 0 = all satisfied.
+# Pass several captures; CPU/GPU evidence and the sweep/DDR probe come from
+# different boots. MISSING means the image predates that check, FAIL is real.
+python3 tools/verify-clocks.py out/ios16/logs/*.txt
+
+# Flash (user resets with Power+Volume Down; nothing is automatic)
+fastboot flash boot out/citrus-diagnostic/citrus-xnu-boot-<name>.img
+fastboot reboot
+python3 tools/usb-log.py -o out/ios16/logs/<name>-live.txt
+fastboot reboot recovery && tools/pull-sweetlog.sh <name>   # recorder pull
+
+# GPU candidate (matches pool2)
+python3 tools/build-citrus-gpu.py --output-dir out/citrus-gpu-<name> \
+    --firmware-dir devices/citrus-gpu-fw
+python3 tools/package-citrus-gpu.py --build-dir out/citrus-gpu-<name> \
+    --name <name> --execute --gl 1 --gpu-mhz 950 --cpu-max --keys \
+    --extra-arg gpupoolmb=128
+
+# Userland (only with an explicit root decision)
+python3 tools/build-citrus-eagl.py
+python3 tools/package-citrus-gpu-userland.py
+cp out/ios16/ios16-root-gpu-compositor.img out/ios16/ios16-root-<name>.img
+python3 tools/install-citrus-compositor.py --image out/ios16/ios16-root-<name>.img \
+    --source-sha256 e796c1f202ff02f546700395fac3de8b329ece882acecaf23db49adde9eb76fa --apply
+tools/flash-citrus-gpu-userdata.sh <image> <device> <sha256>
+```
+
+Patches: `0002-sweet-console-display-stall-instrumentation.patch` (208094 B) is
+a `diff -u` against `/tmp/origbt/xnu` (from
+`out/upstream-artifacts/xnu-buildtree.zip`). `0003-citrus-adreno-kernel.patch`
+(197001 B, sha `8fcd6a1a326b433097efd32aa94f6328e7702de9d9e1868f6955695f1370e49d`, nine files) is reproduced exactly by
+`python3 tools/make-citrus-gpu-patch.py`. Regenerate and dry-run verify after
+every kernel edit.
+
+## 8. BOOT ARGS
+
+```
+debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress rd=ufsroot0
 ufsrw=1 rootrw=1 wdt=-1 wdt_test=no_user_checkin
 unentitled_ios_sim_launch=1 launchd_unsecure_cache=1
 sweetkeys=0 sweetbattery=0 sweetcpufreq=0 sweetchg=0 sweethw=0 sweettouch=0
 sweetscan=mobileactivation
-sweetnull=backboardd,SpringBoard,mobileactivation   # or '-' to reduce console load
+sweetnull=-                       # or backboardd,SpringBoard,mobileactivation
 sweetfb_stayon=1 sweetfb_native=1
-sweetwdt=0
-sweetpanel=1            # 1 = bookkeeping only, 2 = also draw (unreliable)
-sweetirqwr=0            # never use slot 0 from an interrupt
-sweetusb=2              # 1 = probe only, 2 = power up + enumerate + live console
-sweetusbbeat=0          # 1 = 5 s SWEET LIVE printf (may perturb timing)
-sweetptimer=1           # 1 = independent 1 Hz physical-timer tick
-sweetlog=0              # 1 = also write the console ring to UFS (slower)
-sweetsample=-           # disable the 90 s process sampler
-```
-Boot-time knobs used for speed: `sweetlog=0`, `sweetsample=-`, USB polling is
-10 ms once configured, console chunks 1 KiB.
-
-## 6. Build / flash / test loop
-
-```
-# kernel (rebuilds exception.o rtclock.o video_console.o serial_console.o
-# sweet_sample.o sweet_ufs.o sweet_usb.o SweetFramebuffer.cpo)
-python3 tools/rebuild-kernel.py
-
-# payload + boot image (23.7 MB), then flash
-python3 upstream/ios-topaz/tools/mkpayload.py \
-    out/citrus-kernel/kernel.development.citrus \
-    out/citrus-kernel/citrus-ufsroot-disp-ram1792.adt \
-    out/citrus-kernel/payload-<name>.bin --cmdline "<args>"
-python3 tools/build-diagnostic.py \
-    --template device-dumps/20261025-141423-923416/backups/boot.img \
-    --payload out/citrus-kernel/payload-<name>.bin
-mv out/citrus-diagnostic/citrus-xnu-boot.img out/citrus-diagnostic/citrus-xnu-boot-<name>.img
-
-# the user resets the phone with Power + Volume Down (nothing is automatic)
-fastboot flash boot out/citrus-diagnostic/citrus-xnu-boot-<name>.img
-fastboot reboot
-python3 tools/usb-log.py -o out/ios16/logs/<name>-live.txt   # live console
-
-# only when the boot must be inspected after a reset:
-fastboot reboot recovery && tools/pull-sweetlog.sh <name>
-```
-`kernel/patches/0002-*.patch` must be regenerated after kernel edits: it is a
-`diff -u` of the changed files against `/tmp/origbt/xnu/...` extracted from
-`out/upstream-artifacts/xnu-buildtree.zip`. The current file list is: sweet_ufs.c,
-sweet_sample.c, sweet_usb.c, osfmk/kern/exception.c, osfmk/arm/rtclock.c,
-osfmk/arm64/sleh.c, osfmk/console/video_console.c, osfmk/console/serial_console.c,
-pexpert/arm/pe_fiq.c, iokit/Kernel/arm/SweetFramebuffer.cpp.
-
-## 7. Phone state at STOP (2026-10-26 08:30)
-
-Phone is showing the **Apple logo** from
-`out/citrus-diagnostic/citrus-xnu-boot-ufsfix.img`; it is not in recovery and
-does not answer adb. This is the failed UFS-fix trial described in section 1.
-The boot partition holds that image. To test anything else the user must reset
-with Power + Volume Down, then the next image can be flashed normally.
-
-The USB live-console listener is stopped. Its captured log is
-`out/ios16/logs/ufsfix-live.txt` (119,113 bytes; last output 08:24:09). No
-flight-recorder block was pulled from this boot because `sweetlog=0` and
-`sweetsample=-`.
-
-Reference images worth keeping: `citrus-xnu-boot-usb6.img` (the one that reached
-the lock screen), `citrus-xnu-boot-ufsfix.img` (this trial; UFS safety fixes in,
-no lock screen), `citrus-xnu-boot-ptimer.img` (latest old diagnostics), and the
-`usb5..usb10` series for the USB port's evolution.
-
-## 8. Next work, in order
-
-1. **Run the existing `citrus-xnu-boot-ufsfix.img` 3–4 more times, unchanged.**
-   The one trial reached SpringBoard/PosterBoard and logged no UFS error, so the
-   UFS repair did not cause the Apple-logo hang there. The rate of successful lock
-   screens is still unknown; count it before changing the driver again.
-2. **Sample the Apple-logo hang with userspace instrumentation.** Use
-   `sweetsample=SpringBoard,backboardd,launchd,lsd,chronod,pkd` and `sweetlog=1`,
-   then `tools/pull-sweetlog.sh ufsfix-sampled` and symbolicate. Evidence from the
-   current trial: SpringBoard ran and created small surfaces, but there was no
-   full-screen present after the Apple-logo fallback; the last full-screen content
-   was the boot logo. This points at SpringBoard/compositing startup, not a dead
-   kernel. Add `sweetptimer=1` only if samples stop arriving.
-3. If a repeat logs `stale response`, `short transfer` or `timed out`, then the
-   UFS fix did hit the real fault: capture that log and iterate on ring recovery
-   / slot reuse instead of sampling userspace first.
-4. Then continue the original list: **touch (FT8719 over SPI, QUP SE2
-   `0x04a88000`, IRQ 93, reset GPIO 103)** to unlock the lock screen and reach the
-   home/setup screen; mobileactivationd SIGTRAP; sandbox container-path patches
-   0149/0936 (still not applied); GPU (Adreno 610); Wi-Fi.
-5. Boot speed: after reliability, measure boot-to-lock-screen and consider
-   trimming daemons/`sweetscan`, and enabling more than one CPU (SMP is unported —
-   there is no PSCI CPU start path in the kernel, only the shim's single CPU_ON
-   handoff; a second CPU would also give the robust watchdog the port keeps
-   needing).
-
-## 9. Evidence produced today (all under out/ios16/logs/)
-
-- `usb-live.txt` — the good boot's live console (usb6, lock screen, 531 execs).
-- `usb7-live.txt`, `usb8-live.txt`, `usb9-live.txt`, `usb10-live.txt` — stalled
-  boots' live consoles (5 s `SWEET LIVE` heartbeat with `ufsio`, `free`, `op`).
-- `nousb1-sweetlog.txt` + `nousb1-heartbeat.txt` — USB-off control (stall at 136 s).
-- `slotsample-{sweetlog,heartbeat,stalls}.txt` — slot-1 recorder; no samples
-  because the timer interrupt stopped (`svc_runs` froze at 31).
-- `ptimer-{sweetlog,heartbeat}.txt` — the alive-to-271 s boot with the
-  `shared_region` / `ignition` failures.
-- `ufsfix-live.txt` — the 08:22 UFS-fix trial: SpringBoard/PosterBoard reached,
-  no UFS errors, no full-screen present after the Apple-logo fallback.
-- `nousb1-*`, `ptimer-*`, `usbprobe4-*`, `usb1-*` heartbeats document every
-  `boot_id` of the day.
-
-### Superseded checkpoint (2026-10-26 00:03 Asia/Jakarta)
-
-Stopped at 89% used / 11% remaining five-hour, 28% used / 72% weekly. Phone was
-in OrangeFox recovery; boot partition held
-`out/citrus-diagnostic/citrus-xnu-boot-native-long.img` (payload
-`payload-ufsroot-native-long.bin`). Root had the verified keychain ownership
-fix. Final native-long boot showed only the Apple logo; log had only sample 0
-(136923 bytes, flush #58). Symbolication of sample 0 is in
-`out/ios16/logs/native-long-symbolicated.txt` (106 records, 238 shared-cache
-addresses). SpringBoard t0 in that sample was in
-`-[XBApplicationSnapshotManifestImpl _access_validateWithContainerIdentity:]`
--> `NSFileManager removeItemAtPath` -> `removefile`, i.e. it had long left the
-old `LSContextInit`/container-XPC wait; containermanagerd was servicing
-requests. RAM was hard-whitelisted at 1 GiB in `shim/xnu-loader.c` and
-`tools/mk-citrus-adt.py` at that time.
-
-**Next work, in order:**
-1. Read final symbolication, especially SpringBoard t0, chronod, timed, DND and
-   containermanagerd; compare with earlier samples. Avoid diagnosing permanent
-   waits from one sample. Native-long SpringBoard t0 differs from earlier boots;
-   chronod is also in a different stack, so startup does progress.
-2. Check whether the missing later samples/flushes reflect memory/I/O stalls.
-   Current RAM is hard-whitelisted in shim/xnu-loader.c and tools/mk-citrus-adt.py.
-   A potential 1.75 GiB interval 0x80000000..0xefffffff stays below the first
-   /proc/iomem reservation at 0xf3c00000. Do not naively expose 3 GiB.
-3. Once stable, finish home/setup rendering. Native geometry has proven non-empty
-   full-screen Apple-logo buffers; original 1125x2436 conversion targets were
-   empty. Debug fallback remains; it can select stale content by RGB density.
-   Existing "panel nz" probe reads the boot framebuffer fPixels, not necessarily
-   the MDP's current flipped buffer, and counts alpha too; don't treat it as a
-   real screenshot or proof of visible colour. Actual scanout capture would be
-   useful if further rendering diagnosis is needed.
-4. Sandbox container-path patches 0149/0936 remain candidates for extension
-   support, **not applied**. containermanagerd has now been observed receiving and
-   servicing requests (getxattr/lstat), so Mach delivery is not generally broken.
-
-### What this continuation actually fixed / verified
-
-1. **Wi-Fi identity lookup stalled lsd:** latest old cm2 sample was waiting in
-   MobileGestalt while generating built-in app install identities, not the earlier
-   container query. Disassembly showed fallback waiting for **IONetworkController**
-   because Wi-Fi is unported. Added `/chosen/mac-address-wifi0` = six bytes
-   **02:43:49:54:52:53** (synthetic locally administered identity) in
-   `tools/mk-citrus-adt.py`. This is identity only; no Wi-Fi hardware enabled.
-   Subsequent samples prove **lsd finishes seeding** and enters its server runloop.
-2. **mobileactivationd migration crash fixed:** enabled existing
-   `sweetscan=mobileactivation` and found `Failed to query keychain`, UCRT query
-   **-25291**, SQLite cannot open `/Library/Keychains/keychain-2.db`.
-   `/Library/Keychains` links to `/private/var/Keychains`; it was root:wheel 0755,
-   while securityd runs **_securityd uid/gid 64:64**. Changed just that directory's
-   ownership to 64:64. Native migration then succeeds: **zero mobileactivationd
-   crashes**, daemon main sampled in CFRunLoop. No activation data-ark seed or
-   binary activation patch was applied. Runtime confirms should_hactivate=true.
-   Static code explicitly accepts missing UCRT certificate (-25300), unlike -25291.
-3. **Display geometry:** after the keychain fix, original logical **1125x2436**
-   swaps still referenced all-zero surfaces 3/5 and user saw Apple logo -> black.
-   `sweetfb_stayon=1` correctly ignored display-off requests, so this was not
-   simply an accepted framebuffer power-off. With **sweetfb_native=1**, dimensions
-   are **1080x2340**, surfaces 2/3 actually contain the Apple logo, and normal
-   directPresent works without selecting the debug fallback for those frames.
-   User saw Apple logo throughout that native test. **Home/setup UI not proven.**
-4. **Do not overinterpret samples:** keychain boot's SpringBoard t0 waited in
-   `CHSWidgetDescriptorProvider -> CHSChronoServicesConnection descriptors:` ->
-   BoardServices sync XPC. Native boot's chronod t0 waits on PlugInKit, pkd waits
-   for LS store; SpringBoard t0 has advanced to `FMSharedFileContainer
-   groupContainerURLWithIdentifier:` -> container XPC. **containermanagerd is
-   actively handling requests**, in getxattr/MCMContainerCacheEntry verify and
-   lstat/orphan cleanup. So Mach service delivery works; these samples do NOT
-   establish the permanent container-XPC deadlock claimed in the older handoff.
-   Later native log prints SBCoverSheet appearance / configuration-update messages.
-   Long run is intended to distinguish slow startup from a stable blocker.
-
-### Images / transfer / physical state
-
-- Original offline `out/ios16/ios16-root.img` remains unchanged:
-  SHA256 `e4161c8fdbf2e09e6398bcea72bb8b2ee296ee2ffd7016510da32c7efef0bee3`.
-  Mounted **read-only** at `/Volumes/iOSRoot`, `/dev/disk4`, owners on, for ipsw.
-  OS dmg remains closed. Do not re-stream this old original by mistake.
-- Preserved complete phone-generated root **out/ios16/ios16-phone-2314.img**:
-  SHA256 `330714ff092ee0c93c43f99d2584ef12678d170d2b437c78bac2e0ec8c8d8c7b`.
-  Its `.json` records remotely hashed 256 x 64 MiB chunks; all verified. Kept
-  unchanged. Pulled efficiently by cloning original and fetching 44 changed chunks.
-- Working / flashed root **out/ios16/ios16-root-keychain.img**:
-  SHA256 `0ee5bd34809984e05d88104f4bd5a1e6a78166b6b61c1b1f338ba478f3bb1732`.
-  Native HFS replayed pending journal in a mounted working clone, then detached.
-  Clean attributes 0x80002100; journal start=end=5220352. 329344 catalog items =
-  190308 files + 139036 folders. Applied keychain ownership with --only-overrides.
-  Exactly one catalog record changed; byte audit offsets **51645407**, **51645411**,
-  both 0 -> 64. Rollback `out/ios16/backup/keychain-owner-2314.rollback`.
-- **All 16 segments streamed and FULL on-device SHA matched** the keychain image
-  before test boot. Proof: `userdata-stream-keychain.log`, `userdata-verify-keychain.log`.
-  Subsequent writable XNU boots naturally change the device root, so don't expect
-  it still matches the pre-boot image. Preserve generated state when editing again.
-- Current boot is native-long as above. Prior working test boots retained:
-  `citrus-xnu-boot-{mac,macscan,keychain,keychain-native}.img`.
-- No recovery, bootloader, modem, persist, or partition-map writes. Only boot and
-  userdata. Android data already gone by earlier authorization. Never claim iOS
-  works just because XNU or the Apple logo works.
-
-### Evidence and new tools
-
-- Logs in `out/ios16/logs/`:
-  `cm2-symbolicated{-clean}.txt` (old baseline), `resume-prior-sweetlog.{bin,txt}`,
-  `mac-sweetlog.{bin,txt}` / `mac-symbolicated.txt`,
-  `macscan-sweetlog.{bin,txt}` / `macscan-symbolicated.txt` (5 samples; migration
-  failure strings), `keychain-sweetlog.{bin,txt}` / `keychain-symbolicated.txt`,
-  `keychain-native-sweetlog.{bin,txt}` / `keychain-native-symbolicated.txt`.
-- `tools/symbolicate-samples.py INPUT OUTPUT` uses ipsw against mounted dyld
-  cache, honors each process's slide, recovers concatenated/truncated records,
-  skips stack addresses / main-binary addresses. Look up executable offsets with
-  LLVM separately. `ipsw dyld a2s ... ADDR -s SLIDE` needs no cache file.
-- `ipsw dyld disass ... -q` avoids symbol cache generation; markup needs writable
-  `--cache out/ios16/logs/ios16.a2s` (~730 MiB, already created). LLVM `--macho`
-  ignores requested address bounds; plain `llvm-objdump -d --start-address=...`
-  `--stop-address=...` correctly bounds disassembly. Saved MG and mobileactivation
-  disassemblies alongside logs. These are ordinary ipsw/LLVM observations, not REA
-  Evidence; REA MCP isn't registered, no configuration changes were made.
-- `tools/hfs-read-adb.py --image IMAGE list /path` or `extract /path --output FILE`
-  reads raw HFS without mount permissions. Also `--adb-cache NEW_DIR` for direct
-  recovery reads (fresh cache per invocation). Read-only; small ordinary files
-  only; hardlinks/symlinks/overflow data forks unsupported. Local extraction
-  verified byte-identical to mounted com.apple.migration.plist.
-- `tools/pull-image-adb.py --clone-base OLD.img --output NEW.img` is verified on
-  this phone. Read-only device snapshot: hash all 256 x 64 MiB chunks, APFS clone,
-  fetch differences, then recheck every final chunk. Needs recovery + unmounted
-  userdata and unused output paths. Keeps failed .partial + manifest. Avoid naive
-  full extra copies: host has only ~17 GiB free after snapshot.
-- `tools/hfs-chown-inplace.py --only-overrides` preserves everything except TSV
-  targets. Use it on **unmounted** working clones, retain rollback. Do NOT run
-  global default ownership on generated phone state (would reset container owners).
-  `out/ios16/keychain-owners.tsv` targets one directory; `root-owners.tsv` also has
-  the new 64:64 override for future complete ownership rebuilds.
-- Hardened `tools/stream-image-adb.sh`: pipefail; remote dd `&& sync`, so read/write
-  failures cannot be hidden. Mocked source and receiver failures both stop; actual
-  16-segment transfer and independent complete device hash passed. Still re-stream
-  all 16 segments after image changes, never >2 GiB userdata fastboot writes.
-- `adb wait-for-device` hangs when state is recovery. Check `adb devices` or use
-  a recovery-specific wait. If sideload, user must cancel it on phone UI.
-- Prepared `out/ios16/activation-seed.plist` matching 20H392 / 16.7.16 as fallback;
-  **not applied**, no longer needed for the fixed migration error.
-
-### Remaining work / constraints
-
-- First finish long native run, identify any **stable repeated** wait and actual
-  screen content. Native geometry fixes the proven empty conversion target issue;
-  framebuffer debug probes/fallback remain and should be removed only once actual
-  home/setup rendering is verified. No new kernel changes this continuation.
-- Sandbox container path support (upstream 0149 + 0936) is still **unimplemented**.
-  It may help extension/PlugInKit support, but do not blindly attribute every slow
-  XPC request to it. Current sandbox op logs are GLOBAL first-use only, so silence
-  for a daemon doesn't mean it receives no operations.
-- RAM is now **1.75 GiB** (`--ram-mib 1792` in `tools/mk-citrus-adt.py`, loader
-  whitelists 0x40000000 or 0x70000000), physically verified: 111632 free pages at
-  boot. It did not change the stall. cpus=1 unchanged. Do NOT expose naive 3 GiB;
-  /proc/iomem reserves 0xf3c00000..0xffbfffff and ranges near 0x13b4..0x13ff.
-- Touch FT8719 SPI, GPU Adreno 610, Wi-Fi remain unported. Root/macOS permission
-  or protected-container flags can block mounted reads; raw read tool avoids it.
-- Final usage: **89% used / 11% remaining five-hour; 28% used / 72%
-  remaining weekly**. Regularly call get_usage_limits. At about **10% REMAINING**
-  in either window, stop work and fully update this file. No background automation.
-- User asks if we can see phone: **no live phone screen access**; only user reports
-  and logs. Can inspect an attached photo, but do not claim logs are a screenshot.
-
-## Historical handoff below — superseded by the current checkpoint above
-
-#### Earlier symbolication / container waits (2026-10-25 22:45)
-
-`brew install ipsw` works. Mount the image read-only and symbolicate the kernel
-sampler's addresses with:
-
-```
-ipsw dyld a2s /Volumes/iOSRoot/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64 <addr> -s <slide>
+sweetwdt=0                        # nonzero panics by design
+sweetpanel=1                      # 2 = draw from ISR (unreliable)
+sweetirqwr=0                      # never use slot 0 from an interrupt
+sweetusb=2                        # 0 off, 1 probe, 2 full console
+sweetptimer=0                     # physical PPI18 never verified
+sweetusbspin=0                    # keep the busy probe off
+sweetlog=1                        # console ring + heartbeat thread
+sweetvrecord=0                    # selects fallback stall probe; DOES NOT disable slot-1 writes
+sweetsample=-                     # disable process sampler
+sweetufstrace=0                   # 0 means trace from t=0, not "off"!
 ```
 
-`slide` is on the `SMP name[pid] slide 0x... mh 0x...` header line; `ipsw` applies
-it itself. This turns the sampler into a usable profiler (no `ipsw dyld a2s`
-symbol cache write is needed; the read-only volume is fine).
+`sweetufstrace=0` starts the trace immediately; omit the argument to disable.
+No idle flag is a reliable fix.
 
-**SpringBoard is not crashed in the display builds. It is blocked in
-LaunchServices, waiting for a reply that never comes:**
+## 9. STANDING TRAPS
 
-- SpringBoard t0: `___ulock_wait` <- `_LSContextInitCommon` <-
-  `__LSContextInitWithOptions` <- `LaunchServices::Database::Context::_get` <-
-  `-[LSApplicationRecord initWithBundleIdentifier:allowPlaceholder:error:]` <-
-  `CCSModuleRepository _queue_filterModuleMetadataByAssociatedBundleAvailability:`
-  <- `_BSCollectionFilter` (Control Center filtering modules by app presence).
-- SpringBoard t1: `___NSXPCCONNECTION_IS_WAITING_FOR_A_SYNCHRONOUS_REPLY__` <-
-  `xpc_connection_send_message_with_reply_sync` <- `_LSContextInitCommon`.
-- lsd main thread: `-[_LSInstallProgressService performJournalRecovery]` ->
-  `dispatch_sync_f_slow` -> waits for its own queue; the worker running that
-  recovery block (lsd t1) is inside
-  `-[MIInstalledInfoGatherer _groupContainersDictionary]` ->
-  `+[MIContainer groupContainerURLsForBundleIdentifier:persona:error:]` ->
-  `container_query_iterate_results_sync` -> `container_xpc_send_sync_message` ->
-  sync XPC reply wait.
-- containermanagerd is the peer and is **idle** (main thread in `CFRunLoopRun`,
-  three workers in ulock wait; no `SWEET Sandbox` ops after startup). The query
-  therefore never returns: this sync XPC is the current hard wall.
+- Never call `PE_parse_boot_argn` in interrupt context; resolve in thread
+  context (`sweet_irq_writes_resolve()` / init paths).
+- **`sweet_stall_service()` runs in the timer interrupt, so nothing on that path
+  may take a lock.** `IOLockLock` there panics
+  `Attempt to take mutex ... with preemption disabled (Glock_mtx.c:194)` before
+  userspace starts. The liveness line may only read atomics (that is why
+  `redwood_gpu_state()`/`sweet_surface_counts()` are lock-free); a diagnostic
+  that needs to walk a table must keep running counters instead.
+- `ml_io_map` has an **8 MiB budget for the whole kernel**
+  (`IO_MAP_SIZE`, `osfmk/arm/io_map.c`, `KMA_NOFAIL`, permanent maps). A full
+  map panics in `kmem_alloc` with `KERN_NO_SPACE` — this killed `clockprobe1`.
+  Map small windows, reuse mappings, or use an `IOMemoryDescriptor`.
+- **The time base is 19.2 MHz, not 24 MHz.** `mach_absolute_time()`, `cntvct_el0` and
+  `cntpct_el0` tick at the board's XO; every frequency derived with a 24 MHz
+  constant is 1.25x high (this is how the CPU clock table was misread on
+  2026-10-29, see `research/CITRUS-CLOCK-SPEED.md` §2).
+- `sweetwdt=<s>` panics by design; keep `sweetwdt=0`.
+- Interrupt-side UFS slot 0 writes are unsafe (`sweetirqwr=1` re-enables the old
+  path on purpose). The UFS driver is single-slot and polled.
+- A dead USB console is not proof of a dead kernel. Reopen the tty, ask what the
+  screen shows; the `sweetlog` recorder is authoritative.
+- `tools/usb-log.py` can latch a stale `/dev/cu.usbmodem*` node and record
+  **0 bytes** while the gadget re-enumerates (seen 22:10, 22:32, 22:57). Check
+  `ls -l` the capture after ~60 s; if empty, kill the reader, confirm the node
+  mtime changed, then restart it.
+- New MMIO bases must be checked against
+  `device-dumps/20261025-141423-923416/live-tree.json` (bengal/SM6115). Old
+  Topaz addresses (GCC 0x00100000, QUSB2 0x088e2000) are wrong.
+- Panel is 1080x2340; iOS logical 1125x2436 targets can be empty.
+  `sweetfb_native=1` is the working mode; `sweetpanel=2` has never drawn.
+- **Never index surface pixels by `width*height`.** `allocSize` is the length
+  (the 312x202 LA08 surface is 2 bpp). Use `sweet_surface_word_limit()`; a stray
+  scan faults inside `present()`, which also swallows the panic output.
+- **Code-signing flags come from our own stamps, not from AMFI.** There is no
+  MAC policy here, so `ubc_subr.c` (blob) and `kern_exec.c` (process) set
+  `CS_SIGNED`/`CS_PLATFORM_BINARY` themselves. If a future tree loses those
+  edits, the symptoms come back in a fixed order: identity mismatch on boot
+  tasks, then the `+[SpringBoardUI load]` assertion, then
+  `(platformBinary)` in `SBStaticInitializer`.
+- **Generated sources may be stubs in the build tree.** `sweet_touch_fw.h` was
+  105 bytes there and 264 KB next to the source, silently producing a
+  zero-length firmware download. After touching generated data, grep the build
+  tree's copy, not just the source tree's.
+- **`SweetHID.cpo` must be recompiled when `SweetHID.cpp` changes.** The
+  archive member is prebuilt; the edge test that enables the home gesture only
+  changed once it was rebuilt locally.
+- ADT nodes and `cpus=` must agree; `cpus=N` alone does nothing (`selected`
+  comes from the ADT). Seven homogeneous-SMP cores (4 Gold + Silver 1-3) now
+  initialize on 4K. Silver 0/MPIDR 0x0 answers `PSCI CPU_ON` with -4
+  (ALREADY_ON, secure world); publishing it in the ADT panics in
+  `SweetCPU.cpp:253`. Keep 7 nodes. Do not reintroduce the old "four Gold
+  maximum" assumption.
+- Keep the physical timer off and one reader only.
+- **A console line costs ~17 ms at 115200 baud, so per-frame logging throttles
+  the frame rate it is measuring.** `glframes=1`/`glclears=1` print one or two
+  ~200-byte lines a frame; the median inter-frame interval then lands exactly on
+  17 ms and the numbers are the console's, not the GPU's. Never quote frame
+  timing from a `glframes`/`glclears` boot; measure with `SURF ... swaps` per
+  5 s (or `touch_lat=1`, which is designed for it).
+- **The phone mounts its root read-write, so the on-device volume drifts away
+  from any host image.** On 2026-10-29 the journal region of userdata was `0x5a`
+  filled and did not match `ios16-root-onesubmit.img`; a block-level diff patch
+  would have corrupted the volume. Reflash the whole 16 GiB image
+  (`tools/stream-image-adb.sh`, ~37 s per GiB through recovery) instead of
+  patching deltas.
+- **`INTF1` frames on the heartbeat are the display timer, not presents.** A
+  boot can print `~320 frames in 5 s` while the UI draws 3 fps; trust the
+  wrapper's `redwood-gl: frame N` lines and `SURF ... swaps` instead.
+- **Do not mount a 16 GiB root read-write and then hash it on this Mac.** On
+  2026-10-27 that combination (rw attach + whole-image digest, 16 GiB RAM, ~25k
+  free pages) made every app hang. Mount **read-only** (`hdiutil attach
+  -readonly -noverify -nobrowse -owners off -mountpoint /tmp/mntroot`) only to
+  check one file, and hash with `F_NOCACHE` (`/tmp/sha-nocache.py`, prints
+  "<sha> <bytes>") rather than `shasum` so the page cache is not filled. Pass
+  the result as `CITRUS_IMAGE_SHA=… tools/flash-citrus-gpu-userdata.sh …` to
+  skip the script's own 16 GiB re-hash; the on-device readback still verifies.
+- **`build-citrus-gpu.py` applies `kernel/patches/0003` to a fresh copy of
+  `out/upstream-artifacts/buildtree/xnu`; edits under `out/citrus-gpu/xnu` are
+  ignored unless `tools/make-citrus-gpu-patch.py` is run first.** Regenerate the
+  patch, then build, and verify the new string/symbol is in the linked kernel
+  (`strings ... | grep`) before packaging. A build made before regeneration
+  silently runs the old code (this happened once on 2026-10-27: the first
+  submitprobe image had no phase line).
 
-**Display milestone:** with the debug `present()` fallback (when the swap record
-references an empty 1125x2436 surface, present the 1080x2340 surface that has
-content) the panel shows the iOS **Apple boot logo** - iOS userspace content is
-being composited and displayed. The home screen/Setup still does not draw because
-SpringBoard is blocked as above. The fallback is a debug hack in
-SweetFramebuffer.cpp (`SWEET FB: fallback frame surface ...`).
+## 10. PROVEN INFRASTRUCTURE
 
-Candidate fixes for the container-XPC wall: add the upstream sandbox
-container-path hook (0149 plus the 0936 `sweet_sandbox_container_path()` from
-CFFIXED_USER_HOME; our Sandbox policy currently returns ENOENT for op 4 and
-containermanagerd only logged ops 16/15/7), or investigate why launchd routes
-that particular Mach service to a containermanagerd that never sees the message.
+- **USB console:** DWC3 `ssusb@4e00000`, core regs `0x04e00000` (size 0xcd00),
+  QSCRATCH at core+`0xf8800`; CDC-ACM gives `/dev/cu.usbmodem*`.
+- **GCC** `0x01400000` size `0x1f0000` (bengal).
+- **UFS:** single UTRL slot/UCD/bounce, polled; GPT `userdata` = `ufsroot0`,
+  drive with `rd=ufsroot0`.
+- **Display:** AppleCLCD/MDP direct scanout, 1080x2340 stride 4320 at
+  `0x5c000000`.
+- **Recorder:** console ring + heartbeat + 16 stall slots + panic block at the
+  end of userdata; `tools/pull-sweetlog.sh NAME` decodes (panic at `-18`,
+  observer at `-17`).
+- **Touch (FT8719) works end to end:** crossed data pair (IC MISO GPIO6, MOSI
+  GPIO7), ROM firmware downloaded every boot, `0xAE`/`0xCC` carry addr/len in
+  the command package, reports read data-phase-only (`0x3F` + 63 bytes).
+- **GPU:** Adreno 610 via Mesa freedreno/RedwoodGPU, 950 MHz, identity SMMU,
+  FD610; compositor uses the mirror-blit path (direct draw rejected).
 
+## 11. EVIDENCE
 
-#### The big find: the attributes-file extent bug (fixed)
+- `out/ios16/logs/` — live captures, `*-heartbeat.txt`, `*-stalls.txt`,
+  `*-sweetlog.txt`, `*-manifest.json`, `*-reader.json`.
+- Boots cited above: `gpu-pool2-b0-live.txt`, `gpu-pool2-restore-live.txt`,
+  `gpu-smmudiag-live.txt`, `gpu-performance{1,2,3}-live.txt`,
+  `gpu-perf3-reuse-rollback-live.txt`, `gpu-clockprobe1-live.txt`,
+  `gpu-triangle4-live.txt`, `touchprobe23-live.txt`, `touch-cpu4-live.txt`,
+  `smp2..smp4`, `pll0-950-live.txt`, `gpu-keys-test-live.txt`.
+- Per-image evidence lives next to the manifest:
+  `out/citrus-gpu-<name>/<name>-manifest.json`.
+- `tools/verify-clocks.py <capture>...` is the clock goal's pass/fail gate: one
+  row per claim (7/7 CPUs, Silver 7/1804, Gold 8/2016, both normal steps, GPU
+  950 + CP 950 + selftest, DDR >= 8 GB/s, the three UFS RCG decodes). As of
+  2026-10-29 05:25, over `4k-smp7-clk-live.txt` + `4k-smp7-ufsdefdiag-live.txt`,
+  the gate is **12 pass / 0 fail / 0 missing**.
+- **In the repository (since 2026-10-30):** `research/evidence/cited-captures-2026-10-29.tar.xz`
+  holds the 101 captures cited by this file and `research/*`, with its member
+  index and archive SHA256 in `research/evidence/README.md`. Extract into
+  `out/ios16/logs/`. `research/artifacts/` holds every image/root manifest and
+  the IPSW + CI-artifact provenance, so hashes survive even though the 16 GiB
+  images and build tree do not. Uncited captures were deleted; `RESUME.md`
+  lists the rest of the local-only artifacts and how to regenerate them.
 
-The persistent `hfs_swap_BTNode: invalid forward link (0x69742d74 >= 0x00000c00)`
-/ `hfs: node=2950 fileID=8` / `hfs_mark_inconsistent` messages were NOT caused by
-streaming. `FileID 8` is the **extended-attributes B-tree**, and it uses
-**8192-byte nodes**: 3072 nodes = 6144 4 KiB blocks. The volume-header fork holds
-8 extents (4608 blocks); the rest come from the extents-overflow record for
-fileID 8, startBlock 4608. That record's 6th extent pointed at block **2909015**,
-which is file data of another file (Finnish licence text), instead of the true
-**2910039**. With the correct extent the tree is fully coherent: 2926 leaves,
-283640 records, index traversal == leaf chain, 121 free nodes (2951..3071).
-The true start was found by scanning the image for the 8 KiB node with
-`fLink=2945 bLink=2943` (node 2943 in the 5th overflow extent has fLink 2944).
-Fix: 4 bytes in extents-overflow leaf node 1 (block 2052), record fileID 8,
-extent index 5: 2909015 -> 2910039. Backup of the old node:
-out/ios16/backup/extents-node1-prefix-attrsfix.blk.
+## 12. NEXT WORK, IN ORDER
 
-Validate with a read-only device: `hdiutil attach -readonly -nomount <img>` then
-`fsck_hfs -f -n /dev/disk4` (a plain file path fails with "Can't get device block
-size"). It now traverses the whole attributes B-tree and reports only count-level
-nits (extended attributes 283640 vs 283639, orphaned blocks, dir/free counts).
+1. 4K GPU composition works now (§1A); next is the 10 MiB surface refill (CPU
+   copy) and the ~5 ms/frame cache maintenance on 4 KiB pages.
+2. Clocks: done and measured for every clock the port owns (§1A) — CPU, GPU,
+   DDR, UFS. SNOC/CNOC/BIMC are RPM-owned and cannot be programmed from the
+   AP; only the GPU bus/rail vote and a sustained/thermal policy remain parked
+   with GLINK-RPM (`research/CITRUS-CLOCK-SPEED.md` §6).
+3. Re-test 4K boot without `sweettrustall=1`.
+4. Fold touch probe mode 10 into `sweet_touch_init()` (`sweettouch=1`).
+5. Backlight: `bl_ctrl_pwm` on `pm6125_pwm` is never programmed; inherited
+   bootloader duty makes the bottom edge hot.
+6. Pool: the volume-slider 10 MiB failure (§2).
+7. Touch polish: debounce the phantom "(absent)" ups, drop per-frame printf.
+8. Longer term: activation/sandbox, Wi-Fi, RPM/LDO power.
 
-On the phone this eliminated the corruption messages completely (zero in a
-2-minute boot) and lsd, backboardd, installcoordinationd, analyticsd and tccd
-stopped crashing. Only mobileactivationd (sig 5, `brk #1` at main+0x1bf3bc,
-~8x/min) and, in no-display builds, SpringBoard still crash.
+## 13. MAINTENANCE LOG
 
-#### Kernel log channel works — the "sweetlog=1 hang" was a filter
+- **2026-10-30 11:20 - project paused and packaged for a long gap.** Wrote
+  `RESUME.md` (restart index plus the list of local-only artifacts: 16 GiB
+  roots, IPSW, CI build tree, stock partition dumps) and archived the 101
+  captures cited here into `research/evidence/cited-captures-2026-10-29.tar.xz`
+  (6.4 MB; index + SHA256 in its README). Copied every image/root manifest and
+  the IPSW + CI-artifact provenance into `research/artifacts/`. Added
+  `citrus-gpu-reclaim-experiment.patch` and its host harness (see §1). Ran all
+  three host harnesses once more: reclaim, texture cache and pool guard PASS.
+  No kernel or boot image was built, flashed or changed; the phone was not
+  touched. Uncited logs and regenerable build trees stay local-only.
 
-`sweetlog=1` was ALSO parsed by `_cnputs` in osfmk/console/serial_console.c as a
-word filter for the on-screen console, so the screen only drew lines containing
-"1" and looked frozen at "SWEET EARLY 20". The log thread was writing normally all
-along. Kernel change: the screen filter boot-arg is now **`sweetlogmask`** (local
-buildtree; serial_console.o is now a rebuild target in tools/rebuild-kernel.py).
-Boot with `sweetlog=1 ufslogsecs=2`, let it run, then pull from recovery:
+- **2026-10-29 14:10 - lever 2 closed with numbers; the felt frame rate is the GPU wait in
+  `present()`, and the console/scanout hypothesis is ruled out.** A real scroll at `glscale=2/3`
+  gave **263-270 presents/5 s against 205-267 unscaled** - no gain - so the GL scale is closed as a
+  lever (it also kept the filter defects) and `smp7-gpu37` was deleted. Two diagnostics landed
+  instead: per-hitch attribution in `frameShown()` (latency, queue depth, MDP busy, the previous
+  present split into census and GPU wait, latch time) and the removal of a strided 10 MiB pixel
+  census that ran on every present and whose result was discarded for GPU-pool surfaces. Readings:
+  frames reach the panel by **direct scanout of the GPU surface** (`dp-scan`, zero `copy-path`
+  frames), and each hitch is `GPU wait 5-15 ms` in `topaz_surface_drawn()` - the Adreno is still
+  drawing - against ~0-2 ms of our own work in `present()`. Because the queue is 2 deep, that wait
+  becomes a blocked `swap()` in backboardd, which is what the user feels. Image `smp7-gpu40`
+  (`669cf4cf...`, kernel `0abf7719...`), capture `4k-smp7-gpu40-split.txt`; `smp7-gpu39` deleted.
+  Remaining route to 60 fps: fewer submissions/draws per frame or a shorter GPU tail - not more
+  present-path work.
 
-```
-bytes=$(adb shell blockdev --getsize64 /dev/block/by-name/userdata | tr -d '\r')
-skip=$((bytes/4096-1025))
-adb exec-out "dd if=/dev/block/by-name/userdata bs=4096 skip=$skip count=1025 2>/dev/null" > log.bin
-python3 upstream/ios-topaz/tools/sweet-log.py log.bin log.txt
-```
+- **2026-10-29 13:35 - `glscale` lever parked: the scale is right, the filters are not.** Second boot
+  with the guarded wrapper (root `d93f163a`, `glscale=2/3`) still broke the app switcher and the
+  lock-screen clock, so the guard was aimed at the wrong thing: the wrapper's `vblur_level()` /
+  `group_flatten()` call Mesa directly, not the intercepted `glViewport` slot, so they were never
+  double-scaled. The remaining explanation is that the filter geometry (`image->width/height`) is
+  still the full 1080x2340 while the texture is 720x1560, i.e. every blur radius and group offset is
+  1.5x out. Threading `texw/texh` through the filter paths plus a measurement of the mirror blit's
+  cost is a multi-round piece of work with an uncertain payoff (the user already found 2/3 *slower*
+  than unscaled), so the lever is parked with its artifacts kept: boot `smp7-gpu37`
+  (`a3cb0a91...`) and root `ios16-root-glscale2.img`. `smp7-gpu38` (the control boot) and
+  `ios16-root-glscale.img` were deleted. Phone restored to `smp7-gpu29` + the glscale2 root with
+  scaling off: `7/7 CPUs`, `Adreno 610 ready`, presenting, capture `4k-smp7-gpu29-restore5.txt`.
 
-The log area is the last 4 MiB + 4 KiB of userdata (outside the 16 GiB image), so
-re-streaming the image does not erase it; each sweetlog boot overwrites it.
+- **2026-10-29 13:05 - lever 2 first hardware result: `glscale=2/3` renders and presents, and the
+  group/blur passes had to be exempt.** With `glscale=2/3` the wrapper draws the screen's surfaces into
+  720x1560 textures and blits them up: content correct and full screen, **1581 presents against 749**
+  for the same session with scaling off. Broken: the app switcher and the lock-screen clock, because
+  `vblur_level()` and `group_flatten()` set their own viewports and the new `glscale` hook scaled them
+  again - fixed with a `scale_suspend` counter that `eagl_scale_rect()` honours (root
+  `ios16-root-glscale2.img`, `d93f163a...`). The user also reported it *feels* slower, so the next step
+  is a measurement (frame time 12-15 ms against 9-10 ms unscaled, i.e. the 4.5 MB read + 10 MB write
+  blit may be eating the gain at 2/3; 3/4 and 1/2 are a cmdline away). Also learned: an idle
+  SpringBoard stops drawing entirely, so a flat `swaps` on an untouched phone is not a hang - always
+  ask for a swipe before calling a boot stalled. New root installed, boot `smp7-gpu37` unchanged.
 
-#### Display: pipeline proven; the swapped surfaces are empty
+- **2026-10-29 12:40 - lever 2: the scaled-mode blocker has a name (AppleM2ScalerCSCDriver), and the
+  wrapper now scales in GL instead.** The stall at 720x1560 is `IOSurfaceAccelerator`: it
+  `IOServiceMatching`s `AppleM2ScalerCSCDriver` (a real kext, `com.apple.driver.AppleM2ScalerCSCDriver`
+  265.0.0, in the iPhone X 16.7.16 kernelcache - `ipsw kernel kexts`), logs
+  `IOServiceMatchingfailed for: %s`, `Unable to get scaler capabilities`, and then WindowServer stops
+  presenting. iOS upscales a scaled mode on that hardware accelerator; the port has no such service.
+  Meanwhile the same 2.2x is available without userspace cooperation: `glscale=N/D` makes the wrapper
+  draw the screen-sized surfaces into a texture N/D of their size and blit it up - `attachImage()`
+  re-specifies the texture's storage, `eagl_scale_rect()` (emitted by `mkeagl.py` into slots `0xa80`
+  glViewport and `0x7e0` glScissor) maps the boxes, `target_to_surface()` blits bilinearly. New root
+  `ios16-root-glscale.img` (`179f3dc3...`), new boot image `smp7-gpu37` (`a3cb0a91...`, kernel
+  `8e137ae6...`, + `glscale=2/3`). Also downloaded the iPhone X 16.7.16 IPSW (5.7 GiB, `/tmp`) for
+  the kernelcache; `/tmp` was pruned from 21 GB to 4.6 GB on the way (probe images, old build trees,
+  the extracted dyld cache).
 
-- Build the ADT with display:
-  `python3 tools/mk-citrus-adt.py out/citrus-kernel/citrus-ufsroot-disp.adt --ufs --display`
-- AppleCLCD starts and owns the panel: `SWEET FB: DSI0 ctrl 0x1f7`,
-  `MDP VIG0 src 0x5c000000 stride 4320 (boot), direct scanout ready`,
-  `AppleCLCD 1080x2340 stride 4320 at 0x5c000000, default surface 1, presented as 1125x2436`.
-- backboardd opens it and swaps, and the panel really updates, so the kernel
-  display path works. The frame the swap record references (1125x2436 surfaces 3
-  and 5) samples as all zero, but 1080x2340 surfaces 2 and 4 contain the Apple
-  boot logo (rgb-nz ~1%). The debug fallback in present() shows that logo on the
-  panel, proving iOS-composited content can be displayed. The UI does not draw
-  because SpringBoard is blocked (see the symbolication section at the top).
-- backboardd keeps looking for IOAcceleratorES / AppleM2ScalerCSCDriver; this
-  kernel build has no GPU (the published archive predates the Adreno patches).
-- Kernel changes in SweetFramebuffer.cpp: empty swaps no longer clear the panel;
-  `SWEET FB: present ...`, surface/panel RGB probes and the fallback present are
-  debug instrumentation and can be removed once SpringBoard draws.
+- **2026-10-29 11:45 - lever 2: the MDP scaler was never the problem; the reported mode was.**
+  The QSEED block reads `HW_VERSION 0x3000` on hardware, i.e. **QSEED4**, and `sde_hw_util.c`
+  has a **plain-MMIO** `sde_hw_setup_scaler3()` that needs no register-DMA and no LUT (the
+  driver's own default path uses `lut_flag = 0`, bilinear). Implemented in
+  `SweetFramebuffer.cpp::programScaler()`: op mode `0xa0034401`, phase step
+  `(src<<21)/dst` = `0x155555` for 720x1560 -> 1080x2340, preload h4/v2, sizes, init phase 0,
+  plus the driver's pixel-extension registers (`0x100..0x128`) with `PE_OVERRIDE` left set.
+  The three broken pictures came from somewhere else: `directPresent()` scans the **centred
+  720x1560 crop** of whatever surface it is handed, and CoreAnimation was still allocating
+  **1080x2340** surfaces because `GetDisplaySize` returned the *panel* size. A `fbdump`
+  readback (`ystride 4352` = 1088 px against a 720x1560 SRC_SIZE) proved the crop. Reporting
+  the mode as the small size works (`ystride 2880`, step `0x155555`, scaler registers read
+  back exactly as written) but then the compositor stops presenting - **12 swaps a minute,
+  black panel** - so the open problem is the mode change, not the scaler. Four boots
+  (`gpu33`..`gpu36`), all deleted; `smp7-gpu29` restored and presenting
+  (`4k-smp7-gpu29-restore4.txt`). Captures `4k-smp7-gpu33-scaler.txt`,
+  `4k-smp7-gpu34-pe.txt`, `4k-smp7-gpu35-geom.txt`, `4k-smp7-gpu36-mode720.txt`.
 
-#### launchd logging rules (learned the hard way)
+- **2026-10-29 11:05 - lever 2 started: small-mode plumbing lands, MDP scaling does not work yet.** `fbw=`/`fbh=` shrink the framebuffer (and every compositor surface) while the logical size stays 1080x2340 points; `scanFrom()` writes `SSPP_SRC_SIZE`/`SSPP_OUT_SIZE`. A 720x1560 build boots fully (`rendering 720x1560`, `Adreno 610 ready`, presenting) but the panel shows a mosaic - top half only, three shadow copies - so the pipe fetches with no working scaler. `fbdump=1` read the pipe's registers back: SRC_SIZE/OUT_SIZE at 0x00/0x0c, SRC0_ADDR 0x14, YSTRIDE0 0x24, SRC_OP_MODE 0x38 = **PE_OVERRIDE set**, QSEED3-lite at SSPP+0xa00. Clearing PE_OVERRIDE does not help (same mosaic), which points at the QSEED3LITE path being reg-DMA + LUT (`reg_dmav1_setup_vig_qseed3` in msm's `sde_hw_sspp.c`) - a multi-round bring-up, not a register poke. Recommended next: keep the small mode and do the upscale as one **GPU blit** into a 1080x2340 scanout surface, reusing the wrapper's existing copy path, since the GPU is what is fill-bound. Two boots (`gpu31`, `gpu32`), both deleted; `smp7-gpu29` restored and presenting. Captures `4k-smp7-gpu30-vigdump.txt`, `4k-smp7-gpu31-fb720.txt`, `4k-smp7-gpu32-fb720pe.txt`.
 
-- **Never point a launchd job's StandardOutPath/StandardErrorPath at
-  /dev/console.** Such a job does not launch at all (this is also documented in
-  bsd/dev/mem.c). This cost two boot cycles: backboardd never started and
-  SpringBoard relaunch-looped every ~30 s because its window server was missing.
-- The intended channel is the kernel's `sweetnull` tee (bsd/dev/mem.c): it copies
-  what the named processes write to /dev/null to the console as `|name| text`.
-  Default `sweetnull=backboardd,SpringBoard`; add names (15-char p_comm forms,
-  e.g. `containermanager`) or `sweetnull=-` to disable.
-- `OS_ACTIVITY_DT_MODE=YES` / `CFLOG_FORCE_STDERR=1` in a job's
-  EnvironmentVariables is harmless but did **not** mirror os_log to stderr on this
-  build (only plain stderr appeared). Do not rely on it for os_log.
+- **2026-10-29 10:30 - cache maintenance halved; ~50 fps confirmed on a real scroll; SMMU stream-match trap.** `GPU_PUSH_AGAIN_MS` (4 ms) meant the compositor re-cleaned every surface on nearly every submission: **1876 us a submission for 4381 KB**, ten times a frame. `gpuagain=16` (one frame) cuts it to **915 us** on the same set with no visual corruption over a real scroll, and the user reports it feels smoother. Measured during that scroll: presents **199/453/703/956/1145 per 5 s = 50-51 fps**, frame buckets `0 79 152 15 5 2 1 2`, latch `max 16.8-27 ms, 0 expired`. So the port is a solid ~50 fps and the residual is GPU fill plus a hitch tail, not CPU. Default is 16 ms in code now. **Trap found:** applying the wildcard `SMR0` mask on *every* boot (a round-4 experiment) stops the CP on identity boots (`ring stuck rptr 0 wptr 9`, `CP_HW_FAULT 00`, no `Adreno 610 ready`); it is now gated to `!gpu_identity`. Also: `CB0 FSR` reads `0x400` with `FAR 0x601310167482` **even in bypass mode**, which proves that register pair cannot be trusted at all - round 4's "fault at enable time" was this artefact, not a real fault. Image `smp7-gpu29` (`f82290e748d0...`, kernel `aac49e76...`); `smp7-gpu28` deleted.
 
-#### Phone state at STOP
+- **2026-10-29 10:25 - lever 4 parked with a verdict; the remaining 60 fps gap is the hitch tail.** The stage-1 tables are verified correct by a software walk, so the blocker is the fault raised the instant `SCTLR.M` is set, from a client the GPU left running (`zap_load()` executes microcode under bypass *before* `smmu_setup()`), and `CB_FAR` returns impossible values so the faulting SID cannot be named with the registers we can trust. Fixing it needs either level-2 block descriptors to identity-map the RAM the microcode runs from, or a GPU reset path - both multi-round work, so the lever is parked. Also noted: `sweet_atos()` is broken (always `PASS`), and `SweetFramebuffer.cpp` has **no scaler support at all** (no QSEED/SCALER register writes anywhere), so lever 2 means a from-scratch QSEED3 bring-up on the display pipe, not a configuration change.
 
-- Phone in OrangeFox recovery (`adb devices` -> recovery, root shell). Sometimes
-  adbd comes up in ADB Sideload mode; the user cancels "ADB Sideload" in the UI.
-- userdata = full 16-segment stream of out/ios16/ios16-root.img (always verify:
-  `adb shell "dd if=/dev/block/by-name/userdata bs=1048576 count=16384 2>/dev/null | sha256sum"`).
-- boot = out/citrus-diagnostic/citrus-xnu-boot-cm2.img (kernel with the
-  serial-console filter fix, the empty-swap guard, surface/panel probes, the
-  debug fallback present, and the sampler set to SpringBoard,lsd,containermanager),
-  cmdline sweetlog=1 ufslogsecs=2, display ADT. Disp6/7/8 and native variants are
-  kept next to it.
-- Local image hashes seen this session (out/ios16/ios16-root.img):
-  * 857b5858... old, corrupt attributes extent
-  * 4018d05a... attributes extent fixed
-  * c6b8d4ef... attributes fix + backboardd/SpringBoard logging (SpringBoard loop)
-  * ab794fa5... attributes fix + backboardd stdio logging (SpringBoard loop)
-  * e4161c8f... attributes fix + backboardd env-only logging (current image;
-    checkpoint clone out/ios16/ios16-root.checkpoint-2250.img)
+- **2026-10-29 10:05 - SMMU lever 4: tables verified correct; the fault is at enable time from a client the bootloader left running.** A software walk reproduces CB0's exact walk (`l1[3] -> l2[384] -> l3[0] = 0x8f0cc643`, PA 0x8f0cc000), so the stage-1 tables are right, cleaned and flushed; yet `CB0 FSR` is already non-zero the instant `SCTLR.M` goes to 1, before our CP kick, and the CP never leaves the ring. Widening `SMR0` from mask 1 to mask `0x7F` changes the fault signature (stream matching was wrong: the GPU's SID is not 0), and cleaning every descriptor page changes nothing. Two diagnostics are untrustworthy: `smmu_atos()` always prints PASS with `par=0` (wrong poll register), and our CB_FSR/CB_FAR offsets return 48-bit nonsense, so use `Fsynr1` for the faulting SID and a GPU soft reset before enabling. Reverted to `smp7-gpu20`; captures `4k-smp7-gpu24-walk.txt`, `4k-smp7-gpu26-smr.txt`, `4k-smp7-gpu27-clean.txt`.
 
-#### Exact next steps
+- **2026-10-29 09:45 — SMMU translation: the walker works, the first GPU-VA fetch does not.** Built a `gpumair` boot arg (MAIR0 attr0; 0x44 = Normal non-cacheable, 0xFF = write-back) and booted `gpu_identity=0 gpumair=0x44`. The SMMU programs cleanly (`TTBR0 0x93d30000 SCTLR 0x67 TCR 0x00800020 MAIR0 44`) and the GPU then faults once, `CB0 FSR 0x402 FAR 0xf0000000`, and never reaches `Adreno 610 ready`; presents stay at 5. `0xf0000000` is `VA_KERNEL`, the base of our own GPU-VA allocator, so this is a **translation fault on our IOVA, i.e. stage-1 walking works** and the bug is the mapping/TLB visibility of the first submission, not the hardware. Reverted to the identity build; the image `smp7-gpu21` is deleted and `smp7-gpu20` is back on the phone. Capture `4k-smp7-gpu21-smmu.txt`.
 
-1. **Break the container-XPC wall** (see the symbolication section): SpringBoard ->
-   LaunchServices -> lsd -> `+[MIContainer groupContainerURLsForBundleIdentifier:]`
-   -> sync XPC to containermanagerd never returns. Ideas, in order:
-   a. Sample `launchd` and the XPC transport: check whether the Mach service the
-      query targets is registered (containermanagerd is running and idle).
-   b. Add upstream sandbox container-path support (0149 + 0936
-      `sweet_sandbox_container_path()` reading CFFIXED_USER_HOME); our Sandbox
-      policy still returns ENOENT for op 4.
-   c. Try booting with the LS install-progress journal impossible to replay or
-      with `sweetsample` on more daemons to see who else blocks on the same XPC.
-2. Once SpringBoard draws, remove the debug probes/fallback in SweetFramebuffer.cpp
-   and check the home/Setup screen (milestone 2).
-3. mobileactivationd SIGTRAP: crash pc is a `brk #1` at main+0x1bf3bc; the code
-   around it is an os_crash/assert sequence ("main", line numbers 363/321/310).
-   Disassemble `/usr/libexec/mobileactivationd` at VA 0x1001bf3bc (llvm-objdump)
-   for the exact site; it may matter for activation/SpringBoard state.
-4. Then RAM (1 GiB hard-coded in shim/xnu-loader.c and validated there) and
-   cpus=1 (one Gold), which SpringBoard will need.
-5. Touch (FT8719, SPI not I2C), GPU (Adreno 610) and Wi-Fi are still unported.
+- **2026-10-29 09:40 — the latch wait is clean; skipping clears gains nothing; resting build back at ~50 fps.** A probe around the MDP latch poll in `showDirect()` reports `latch max 16.5-17.3 ms, 73-79 of 256 frames over 8 ms, 0 expired`: presentation always completes within one vsync, so the presenter is not serialising the compositor. The clear-skip path (`gnoclear=1`) was then tried on hardware: presents **150-238 per 5 s** versus **205-267** without it - no improvement inside the run-to-run noise, so it stays off (and it carries a visual-corruption risk). Resting image `smp7-gpu20` (`3e0e03924a99...`, kernel `4eeeac6b`, `frameShown()` + latch probe in), captures `4k-smp7-gpu20-latch.txt`, `4k-smp7-gpu17-intervals.txt`. The 60 fps target now needs **~17% less work a frame**; the clears (2 ms) and the latch are both excluded as causes.
 
+- **2026-10-29 09:25 — the phone is at ~50 fps; the gap to 60 is a hitch tail, not throughput.** `AppleCLCD::frameShown()` (in the display path, printed every 256 frames) shows the interval distribution during a real scroll: **102 intervals of 8.3-16.7 ms and 138 of 16.7-25 ms**, i.e. most frames meet vsync, with 7 at 25-33 ms and 8 outliers up to 112 ms. `swaps` per 5 s is **205-267 (41-53 fps)**. So presentation is vsync-paced, neither a 30 Hz lock nor the 16-40 fps the earlier `swaps` windows implied, and the "2-3x over budget" estimate was inflated by console-throttled measurements. What remains is the **hitch tail** - a handful of 25-112 ms frames per 256 - which is exactly the "frames skip / out of order" the user reports. Image `smp7-gpu17` (`f7be732af926...`), capture `4k-smp7-gpu17-intervals.txt`.
 
-### What was wrong and how it was fixed
+- **2026-10-29 09:15 — clears measured: ~2 ms, not the lever; and per-frame logging costs 17 ms a line.** A new wrapper census (`glclears=1`) shows 4.6 whole + 2.5 boxed clears a frame totalling **4.3 Mpix** (~1.7 screens, ~2 ms), so clears cannot explain the frame time - the draws can. The bigger discovery is a measurement trap: a 200-byte console line takes **~17 ms at 115200 baud**, which is exactly the median inter-frame interval seen with `glframes=1`/`glclears=1`, so every frame-timing number taken with per-frame logging enabled is throttled by the console, not by the GPU. Root reflashed because the on-device volume no longer matched `ios16-root-onesubmit.img` (journal region rewritten, `0x5a` fill; the phone mounts root read-write, so a stale image cannot be block-patched - always stream the whole image). Image `smp7-gpu16` (`5d6086e309e4...`), root `ios16-root-clears.img` (`c779e0bf...`), capture `4k-smp7-gpu16-clears.txt`.
 
-The 16 GiB root image could not be attached ("no mountable file systems").
-fsck_hfs reported `Invalid catalog PEOF`. Cause: the catalog file's extents
-overflow records (extents overflow B-tree, fileID 4) had been rewritten in
-little-endian with a wrong continuation key and two bogus extents that actually
-belong to another file (they contain Mach-O/strings data). The catalog B-tree
-itself was intact.
-
-Reconstruction (read-only forensics, no guessing): the catalog's true layout was
-recovered by scanning the whole image for catalog leaf/B-tree nodes, walking the
-leaf fLink/bLink chain from the last leaf (node 1 at block 5124), and clustering
-`physical_block - node_number` into constant-delta runs. Result — 18 extents,
-25600 blocks total, matching the volume header exactly:
-5123+2816, 8066+4096, 12418+512, 13186+1024, 14466+1024, 15746+1024,
-17026+1280, 18562+1280 (the 8 in the volume header), then
-20098+1536, 21890+1280, 23426+1280, 24962+1024, 26242+1280, 27778+4864,
-2087439+512, 2087967+256, 2907535+256, 2949132+256.
-Validation anchors: node 0 header, node 1 last leaf (fLink 0), node 11055 root
-index at height 4, node 25009 first leaf with bLink 0 (block 2088144).
-
-Only ONE 4 KiB node needed repair: extents-overflow leaf node 1 at block 2052.
-It now holds three big-endian records (catalog 13056 with 8 extents; catalog
-25088 with 2; attributes 4608 with 6) = 76 bytes each, header leafRecords 3.
-Nothing else was written: the volume header, catalog B-tree header and catalog
-nodes were already correct. Backups in out/ios16/backup/ (extents-node0.blk,
-extents-node1.blk, catalog-header.blk, volume-header.bin,
-alt-volume-header.bin) plus an APFS clone out/ios16/ios16-root.prefsck.img.
-
-### Image now verified
-
-- Mounts read-only and with `-owners on`.
-- 326500 catalog items == 189295 files + 137205 folders (volume header), 25600
-  catalog nodes, 25299 leaves; full `find` walk, zero I/O errors.
-- The hidden NUL-named `HFS+ Private Data` folder exists (hard-link inodes), so
-  counts reconcile exactly (4864 inode files + 42529 hard-link entries).
-- Ownership is correct everywhere: root 0:0 (launchd/dyld 0755), /private/var/mobile
-  501:501, /private/var/root 0:0 0750, diagnostics+uuidtext 272:272,
-  containers/Bundle 33:33, keybags 0:0 0700, bring-up prefs 501:501 0600.
-- Known remaining defects (all cosmetic, non-blocking):
-  * (SUPERSEDED by "Late image fixes": the dangling hard links and the private
-    folder valence were repaired and the sound file was restored from the dmg.)
-  * fsck_hfs still reports two count-level errors: "Incorrect number of thread
-    records" (orphan thread for the deleted CNID 48938) and "Incorrect number of
-    file hard links".
-  * fsck_hfs -y CRASHES (SIGTRAP) on this macOS 27 build during its repair
-    phase, so these cannot be auto-repaired. `diskutil verifyVolume` works for
-    diagnosis; plain `fsck_hfs` needs `-x` to avoid the same trap.
-- This image HAS since been booted on the phone: launchd and many daemons run
-  from it (see STOPPED HERE). It is no longer an untested artifact.
-
-### New tools and rules
-
-- `tools/hfs-chown-inplace.py` — SAFE offline ownership repair for a large HFSX
-  volume. It parses the volume header + extents overflow itself, walks every
-  catalog leaf, and rewrites ONLY the 8 bytes of ownerID/groupID inside existing
-  records (rollback checkpoint via --rollback; --dry-run supported). It never
-  searches/inserts/extends a B-tree, so volumes with a full catalog are safe.
-  Rules: default 0:0; /private/var/mobile subtree 501:501; TSV overrides last.
-  It is idempotent and asserts item count == fileCount+folderCount.
-- `tools/hfs-owners.c` (libdmg-hfsplus based) is UNSAFE on this image: its
-  updateCatalog search uses a ':'->'/' key hack while the volume is HFSX
-  (keyCompareType 0xBC), and its write path corrupted the extents overflow
-  records. Do not run it again on a real root image.
-- tools/_hfslib.py is a copy of hfs-chown-inplace.py used for ad-hoc analysis
-  scripts (import HFS/read_records).
-
-### Downloads / disk
-
-- The 087-86698-044.dmg OS image was re-downloaded successfully via
-  upstream/ios-topaz/tools/remotezip.py: 4,730,814,044 bytes, zip CRC-32 ok
-  (log out/ios16/os-redownload.log). Keep it closed unless a rebuild or file
-  restore is needed.
-- Source mounts are all detached. Keep in mind the OS dmg must stay closed
-  unless deliberately rebuilding.
-
-### Flashing route (important — fastboot cannot write >2 GiB here)
-
-`fastboot flash userdata` on this bootloader accepts at most < 2 GiB:
-1 MiB, 1 GiB and 1.9 GiB images flash fine; a 2 GiB image fails immediately with
-"fastboot: error: Failed reading from userdata". `-S 512M` does not help, and the
-sparse chunk `offset` field is 32-bit, so a 16 GiB volume cannot be streamed that
-way at all. max-download-size is 804268032 (768 MiB) but the client sparsifies.
-Consequence: the only way to place the 16 GiB root image on userdata is a raw
-on-device write.
-
-Chosen route (user approved): boot the already-installed OrangeFox recovery and
-`dd` from an `adb shell` (root) into the userdata block device in 1 GiB segments.
-
-- `fastboot reboot recovery` works on this device (it sets the BCB); `fastboot
-  boot` does NOT (unknown command).
-- In OrangeFox, adbd may come up in **sideload** mode (`adb shell` fails with
-  "error: closed"). The user must cancel ADB Sideload in the recovery UI; then
-  `adb devices` shows `recovery` and `adb shell` is uid=0, context u:r:su:s0.
-- userdata is `/dev/block/sda11`, 50,582,138,880 bytes (47.1 GiB). Recovery was
-  NOT modified (no recovery write); only boot and userdata are written.
-- Root image: 17179869184 bytes. Its sha256 changes every time the image is
-  modified; the copy currently on the phone is
-  857b58582e90c15d1c836f0f05e0417dd1b5ffaba4872eaaae0d3f65ef77a1da
-  (stream log out/ios16/userdata-stream2.log, verify out/ios16/userdata-verify2.log).
-  Stream script: tools/stream-image-adb.sh.
-- The first 1.9 GiB of userdata was already overwritten by the fastboot size
-  probes, so Android's /data (F2FS + Magisk) is gone and Android will not boot.
-  That is expected: user does not care about Android data.
-- Fallback prepared but not needed yet: out/android-boot/boot-nodata.img is the
-  original Android boot image with the userdata line in fstab.qcom commented out
-  (`/data` never mounted). Could be flashed to get a root adbd without /data.
-
-### Late image fixes (after the first verification pass)
-
-- The volume header attribute word had to change from 0x80006000 to 0x80002100
-  (journaled + kHFSVolumeUnmountedBit). The extra 0x4000 bit made DiskArbitration
-  run fsck_hfs on every writable attach, and fsck_hfs crashes (SIGTRAP) on this
-  macOS 27, so the image could not be mounted read-write at all. With the clean
-  word, `hdiutil attach` mounts it read-write and the kernel manages catalog
-  growth. Header backup: out/ios16/backup/volume-header.bin (pre-change).
-- Restored the missing sound file from the re-downloaded OS dmg: both
-  /System/Library/Audio/UISounds/connect_power.caf and
-  /Library/Audio/Tunings/Generic/Haptics/AudioResources/ConnectedToPower.caf are
-  now normal files, 163400 bytes, mode 0644, sha256
-  0798b94bfb09376c25e516bcad05ad7f9bfe9aae6f9407db9ff131820bca7722 (the dangling
-  hard-link records were removed first, with macOS doing the catalog work).
-- Fixed the hidden private folder's valence 4865 -> 4864 in place, and set the
-  volume header file/folder counts to the actual catalog contents
-  (189296 files / 137206 folders; macOS created '.HFS+ Private Directory Data\r'
-  while repairing the hard links). Ownership re-verified afterwards with
-  tools/hfs-chown-inplace.py (idempotent, 0 items changed).
-- Hard-link accounting is now fully consistent by direct analysis: 4864 inode
-  files, 42527 hlnk entries, 42527 declared links, no absent inodes, no
-  mismatches, no orphan inodes.
-- Remaining fsck_hfs (read-only) output: only "Incorrect number of thread
-  records" (one orphan thread for now-deleted CNID 48938) and "Incorrect number
-  of file hard links". Both are count-level; fsck still crashes at the end of
-  its run, so they cannot be auto-repaired. Do not chase them unless the kernel
-  complains.
-
-## User instructions and priorities
-
-- Device: POCO M3 citrus, M2010J19CG, Indonesia, 4/64 GB, unlocked bootloader,
-  rooted Android 13 Arrow/AOSP, OrangeFox installed. User does not care about
-  Android data. Preserve bootloaders, modem, persist, recovery and partition map.
-- Milestones: (1) XNU running, (2) display + iOS home/setup screen, (3) touch,
-  (4) GPU and Wi-Fi.
-- User authorized diagnostic boot flashing and restoration, then said to keep
-  working until finished and that Android need not be rebooted between tests.
-  Keep the original images available. Never claim iOS works from a kernel boot.
-- Latest delegation preference: **only GPT-6 Luna** for subagents. Handle
-  demanding work in the main agent. Earlier permission for GPT-6.1 Sol is revoked.
-- **Regularly call get_usage_limits. At about 10% REMAINING in either window,
-  stop work and update this file fully for another agent.** usedPercent is
-  consumed usage, so remaining = 100 - usedPercent. Last check: 76% used / 24%
-  remaining five-hour; 12% used / 88% remaining weekly. Check at build checkpoints.
-  Do not create a background automation that consumes usage after stopping.
-
-## Achieved on physical phone
-
-1. Rooted ADB works, hardware identified and live DTB collected.
-2. boot/recovery/dtbo backed up; local and device SHA-256 matched independently.
-3. fastboot boot tested: transfer succeeds, boot command fails `unknown command`.
-   Thus test images are flashed to **boot only**. Original restored afterward.
-4. Custom ARM64 diagnostic runs and draws on ABL framebuffer.
-5. PSCI CPU_ON handoff to Gold MPIDR affinity 0x100 works. Gold reports EL1,
-   MIDR 0x51af8002, MPIDR 0x80000100, MMFR0 0x01011122, TGran16=1.
-   Silver entry CPU: MIDR 0x51af8014, MPIDR 0x80000000, MMFR0 0x11122, no 16K.
-6. XNU boots through scheduler/logging initialization and root selection
-   (first panic was the expected missing md0).
-7. **iOS userland runs from the HFS root volume on UFS**: HFS mounts as
-   `iOSRoot`, XNU execs /sbin/launchd, launchd runs its boot tasks and enters
-   ondemand mode, and many daemons spawn (xpcproxy, tccd, locationd, backboardd,
-   installcoordinationd, mobileactivationd, logd, analyticsd, ...).
-8. **The iOS lock screen renders and stays live** (2026-10-26 06:26, one boot in
-   ~8 — the boot is intermittent; see sections 1–2).
-9. **The kernel console streams live over USB** (CDC-ACM, `tools/usb-log.py`).
-10. Still missing: touch (FT8719 SPI), GPU (Adreno 610), Wi-Fi, and deterministic
-    boots. See section 8 for the plan.
-
-## Current physical state
-
-Superseded — see **section 7 "Phone state at STOP"** at the top of this file.
-Standing rules that still apply: reset with Power + Volume Down (nothing is
-automatic); only boot and userdata are ever written; no recovery/bootloader/modem/
-persist/partition-map writes have ever been made.
-
-## Important local artifacts
-
-- `device-dumps/20261025-141423-923416/`: identity, CPU, /proc/iomem, input,
-  device logs, live.dtb (543616 bytes), decoded live-tree.json.
-- `.../backups/{boot,recovery,dtbo}.img`, manifest.json.
-  boot 134217728 bytes SHA256
-  `77c77db8a23ab9cfc92a4e6001a41a1762b78ec9d11a4f34cf535bf747dbe6c1`.
-  Recovery SHA256 `99068895dccab41b422879ebda54ad9c2d7ccf60eac0e4498f503e2f9fddb03a`.
-- `devices/citrus.observed.json`: hardware and transcribed diagnostic evidence.
-- `out/citrus-kernel/kernel.development.citrus`: locally rebuilt XNU (~19 MiB).
-- `out/citrus-kernel/{citrus.adt,payload.bin,boot-image-manifest.json}`.
-- `out/citrus-diagnostic/citrus-xnu-boot.img`: physical test 1, ~23 MiB.
-- `out/citrus-diagnostic/citrus-diagnostic-boot.img`: diagnostic-only version.
-- Everything under out/, upstream/, device-dumps/ is ignored by root .gitignore.
-  The repository is public: https://github.com/ezariago/ios-citrus (branch
-  master). Commit only milestone-level changes, not every experiment.
-
-## Hardware confirmed
-
-- CPU Kryo260/A53/A73-class; boot starts Silver and must hand off to Gold.
-- GICD 0x0f200000, GICR 0x0f300000, region 0x100000, stride 0x20000.
-- CNTFRQ 19200000; virtual timer INTID19 (DT PPI3), physical timer18.
-- Display 1080x2340 60 Hz, FT8719 Truly v2 video panel.
-  ABL scanout framebuffer **0x5c000000**, stride **4320/0x10e0**, source format
-  **0x237ff**. Splash reservation 0x5c000000+0xf00000.
-- MDP regs 0x05e00000; VIG0 source 0x05e05000, DMA source0x05e25000.
-  SRC_SIZE +0, SRC_XY+8, OUT_SIZE+c, OUT_XY+10, ADDR+14, STRIDE+24,
-  FORMAT+30, UNPACK+34, OPMODE+38, MULTIRECT+170.
-- Touch FocalTech **FT8719**, SPI mode1, 6 MHz, QUP SE2 0x04a88000,
-  CS0, TLMM reset GPIO103, IRQ93, 10 contacts, coords 1080x2340.
-  Topaz FT5452 I2C driver is NOT usable as-is.
-- GPU Adreno610v1, DT chipid0x06010000, regs0x05900000.
-- UFS 0x04804000. Original boot/recovery v2, image pages4096, embedded DTB.
-- Live RAM banks: 0x40000000+0x3dd00000, 0xc0000000+0x80000000,
-  0x80000000+0x40000000. Some user screen transcriptions have shifted digits;
-  use binary DTB and /proc/iomem. First XNU uses 1 GiB at0x80000000 with no
-  /proc/iomem reservation in that span. Topaz highmem starts nonexistent RAM.
-
-## Source/build approach (works on this Mac)
-
-- Host Apple Silicon, macOS27.0.1, Xcode27.1. Old Xcode15.4 not installed.
-- Homebrew LLVM/lld23.1.4 installed during task; /opt/homebrew/opt/llvm/bin.
-- `upstream/ios-topaz`: branch topaz at e4772911e116ab4ab6c4ac1f38e6106fefe8b483.
-  Read its AGENTS.md/NOTES.md if editing that checkout. No changes made there.
-- Downloaded matching published artifacts from MakrSas/ios-topaz:
-  kernel id12263212928, buildtree12262938798, run39419628786,
-  commit2665612a9eabb76b294cbc1b014132c6b89d09db.
-  Provenance/hashes: out/upstream-artifacts/artifact-manifest.json.
-- Artifact `.link/` contains complete ~137 MB object archive, exported/alias
-  symbols, linker flags; buildtree provides source + config/generated headers.
-  Recompile only changed files, reuse existing IIG objects, avoiding new-IIG ABI.
-- Logging library recompiled from Apple libdispatch tag1415.140.2,
-  commitcdb61e93e803d0093635f356753a9a30c09836db into
-  out/upstream-artifacts/firehose_buffer.o. Compile command JSON saved there.
-- `tools/rebuild-kernel.py`: make -n gets correct original per-file compile flags,
-  adds source include paths, -fno-lto, targets cortex-a53/arm64, min OS14;
-  replaces sweet_early.o/start.o/arm_vm_init.o/SweetBattery.cpo in copied archive,
-  relinks with logging object and cc_kext runtime.
-- Raw kernel relink MUST OMIT `-rename_segment,__LASTDATA_CONST,__LAST` from
-  archived .linkarguments. That extra option is for static kernel collections;
-  with current linker it causes illegal text relocations for last constructor.
-- Retained patch: kernel/patches/0001-citrus-diagnostic-console-and-driver-gates.patch.
-  Applied to out/upstream-artifacts/buildtree/xnu, not upstream checkout.
-  Changes old Sweet 0x9c000000 framebuffer refs to0x5c000000, height2400->2340,
-  stage marker2368->2308; SweetBattery::start returns false before any hardware.
-- `tools/mk-citrus-adt.py`: imports upstream ADT builder, one Gold core,
-  no UFS/disp0/WLAN nodes initially. Lacks Apple /product seed (not needed yet).
-- Kernel scan found zero LSE/RCpc instructions. TOPAZ_4K remains unset.
-
-Build commands (artifacts already prepared locally):
-```
-python3 tools/rebuild-kernel.py
-python3 tools/mk-citrus-adt.py out/citrus-kernel/citrus.adt
-python3 upstream/ios-topaz/tools/mkpayload.py out/citrus-kernel/kernel.development.citrus out/citrus-kernel/citrus.adt out/citrus-kernel/payload.bin --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress rd=md0 wdt=-1 wdt_test=no_user_checkin sweetbattery=0 sweetcpufreq=0 sweetchg=0 sweethw=0 sweettouch=0'
-python3 tools/build-diagnostic.py --template device-dumps/20261025-141423-923416/backups/boot.img --payload out/citrus-kernel/payload.bin
-out/test-env/bin/python tools/test-diagnostic.py --loader
-```
-
-Shim is own source under shim/: start.S, diagnostic.c, xnu-loader.c, link.ld,
-font.h. Gold has separate stack, exceptions have emergency stack/recursion guard.
-Loader validates SWEETXNU segments/ADT/ranges, copies into 1GiB bank, initializes
-Gold GIC Group1/timers, passes 736-byte XNU boot_args. Synthetic Unicorn test
-stubs CPU registers + unsupported GIC sysregs, checks real segment copies/entry.
-Build/packager preserves original boot DTB, ramdisk, addresses. Header checked
-byte-for-byte against AOSP mkbootimg. Wrapper is CITRUSPL+u64 length after _end.
-
-## Next work
-
-Superseded — see **section 8 "Next work, in order"** at the top of this file.
-(The old text here described hunting a single "~150 s freeze", which turned out to
-be the wrong model; the failure is intermittent I/O, see section 1.)
-
-## Immediate handoff checklist
-
-1. Read **sections 0–8 at the top** first; they replace every older checkpoint.
-   The most important sentence in the file: the first `ufs_scsi()` fix is already
-   built and booted, but the lock screen still did not appear; the next step is
-   repeated boots plus a userspace sampler, not another blind UFS rewrite.
-2. Never fastboot a >2 GiB image at userdata; use tools/stream-image-adb.sh from
-   OrangeFox recovery.
-3. After ANY change to the local image, re-stream all 16 segments and verify the
-   on-device sha256 (partial segments caused misleading HFS corruption).
-4. Keep unentitled_ios_sim_launch=1, launchd_unsecure_cache=1 and
-   ufsrw=1 rootrw=1 in the cmdline for userland tests.
-5. The kernel source of truth for local changes is
-   out/upstream-artifacts/buildtree/xnu, and **every edit is captured in
-   `kernel/patches/0001-*.patch` + `kernel/patches/0002-*.patch`** (0002 is a
-   diff against the pristine `out/upstream-artifacts/xnu-buildtree.zip`).
-   Rebuild with `python3 tools/rebuild-kernel.py` (it rebuilds exception.o,
-   rtclock.o, video_console.o, serial_console.o, sweet_sample.o, sweet_ufs.o and
-   SweetFramebuffer.cpo).
+- **2026-10-27 and earlier (`2026-10-28 20:45` back):** moved verbatim to `research/CITRUS-MAINTENANCE-ARCHIVE.md` to keep this file under its size budget. The findings that still matter are in §1A, §6 and §9.

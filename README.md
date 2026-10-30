@@ -3,14 +3,18 @@
 Target: POCO M3 `citrus`, M2010J19CG, Indonesian region, 4 GB / 64 GB.
 Unlocked bootloader, rooted Android 13 AOSP, OrangeFox recovery (version unknown).
 
-## Current milestone: iOS home screen with working touch
+## Current milestone: 4 KiB / 7-core XNU with a GPU-composited iOS UI
 
-Status as of **2026-10-27 (Asia/Jakarta)**: XNU boots **iOS 16.7.16
-(20H392, iPhone10,3 userland)** from a 16 GiB HFSX root on UFS. The phone has
-been unlocked and the SpringBoard home screen reached by touching the panel.
-The current baseline uses **four Gold cores**, **1792 MiB of verified RAM**,
-software rendering, and the bootloader-initialized 1080×2340 display.
-**GPU acceleration is the next porting milestone.**
+Status as of **2026-10-30 (Asia/Jakarta), project paused**: XNU boots **iOS
+16.7.16 (20H392, iPhone10,3 userland)** from a 16 GiB HFSX root on UFS with
+**4 KiB pages and seven CPUs** (4 Gold + Silver 1–3; Silver 0 is owned by the
+secure world). The Adreno 610 **composes SpringBoard through Mesa freedreno +
+RedwoodGPU**, touch (FT8719) unlocks the phone and drives the home gesture, and
+every AP-owned clock (CPU, GPU, DDR, UFS) runs at its designed rate. Presentation
+is vsync-paced at roughly **50 fps** in a real scroll. What remains is GPU fill
+and a hitch tail, pool fragmentation under blur-heavy use, and the unported
+subsystems below. **The project is paused — read [RESUME.md](RESUME.md) first:
+it lists what is not stored in this repository.**
 
 This is an experimental hardware port. Reaching the home screen establishes
 boot, presentation, and input; the remaining hardware and iOS integration work
@@ -19,14 +23,24 @@ are goals, with completion criteria rather than promised dates.
 
 | Subsystem | Demonstrated on Citrus | Remaining work |
 |---|---|---|
-| Boot and CPU | XNU entry, scheduler, four Gold cores selected | Repeatable boots and longer stability runs; Silver cores need a separate 4K-page port |
-| Storage | UFS root mount and iOS boot from HFSX | Broader I/O stress and recovery validation |
-| Display | Native 1080×2340 framebuffer presentation and SpringBoard | Full display/panel ownership, brightness, blanking, suspend/resume |
-| Touch | FT8719 firmware download, reports, HID delivery, unlock and home screen | Release debounce, early initialization, normal driver integration |
-| GPU | Adreno 610 identified; upstream backport investigated offline | Hardware bring-up, Mesa/EAGL, accelerated CoreAnimation |
-| USB | CDC-ACM serial console and reconnecting host capture | Other USB functions and lifecycle testing |
+| Boot and CPU | XNU entry, scheduler, 4 KiB pages, seven cores (4 Gold + Silver 1–3) | Longer stability runs; Silver 0 is unavailable to the HLOS |
+| Storage | UFS root mount and iOS boot from HFSX, UFS clocks at design rate | Broader I/O stress and recovery validation |
+| Display | Native 1080×2340, GPU direct scanout, ~50 fps vsync-paced | Frame pacing/hitch tail, panel lifecycle, brightness, blanking, suspend/resume |
+| Touch | FT8719 firmware download, reports, HID delivery, unlock and home gesture | Release debounce, early initialization, normal driver integration |
+| GPU | Adreno 610 composing the UI (RedwoodGPU + freedreno), 950 MHz, direct scanout | Cut GPU work per frame; pool fragmentation; GPU VA/SMMU translation parked |
+| USB | CDC-ACM serial console, host capture, host-driven fastboot/recovery reset | Other USB functions and lifecycle testing |
 | Wireless and cellular | No working iOS connectivity established | Wi-Fi, Bluetooth, modem, telephony, and data integration |
 | Power and peripherals | Enough inherited hardware state to boot | Battery/charging reporting, power policy, audio, sensors, cameras |
+
+The earlier 136–161 s failures included a confirmed framebuffer diagnostic
+scan overread in `present()`, now bounded by the surface allocation size.
+The later apparent smp4 stop at 408 s was a failed host logger: the kernel
+continued running, and smp4 reached roughly 36 minutes before an intentional
+reboot. The four-core touch run recorded 17 minutes without a panic before a
+USB disappearance whose cause was not established. Multi-hour stability is
+still an open milestone; a silent console alone does not establish a kernel
+failure. See [the active handoff](AGENTS.md) for evidence, image hashes, and
+current device state.
 
 The earlier 136–161 s failures included a confirmed framebuffer diagnostic
 scan overread in `present()`, now bounded by the surface allocation size.
@@ -45,9 +59,10 @@ current device state.
 - [x] Boot a Citrus-adjusted XNU kernel through the Android boot-image path.
 - [x] Mount the UFS-backed iOS root and reach the lock screen and SpringBoard.
 - [x] Present at the native 1080×2340 panel geometry.
-- [x] Boot with four Gold CPU nodes and matching `cpus=4`; the captured console
-  confirms `requested=4 selected=4`. The current 16K-page kernel cannot use
-  the four Silver cores.
+- [x] Boot with seven homogeneous CPU nodes and matching `cpus=7` on 4 KiB
+  pages (4 Gold + Silver 1–3); the captured console confirms `7/7 CPUs
+  initialized, SGI1 verified`. Silver 0 cannot be started (secure world owns
+  it), so seven is the true maximum.
 - [x] Bring up the FT8719 from ROM, download its PRAM firmware, read contact
   reports, and deliver HID digitizer events consumed by iOS.
 - [x] Unlock and reach the home screen using the physical touchscreen.
@@ -56,37 +71,64 @@ current device state.
   with the normal driver path. Verify dragging, edge gestures, multiple
   contacts, app launch, and touch after a reboot.
 
-### 2. Adreno 610 GPU acceleration — NEXT
+### 2. Adreno 610 GPU acceleration — achieved, performance open
 
 **Goal:** render iOS UI through the GPU, with repeatable command submission
 and correct presentation. Publishing a GPU service or compiling the driver
 alone does not complete this milestone.
 
-The local Topaz backport investigation found that the IOSurface prerequisites
-and GPU patch series apply cleanly to a scratch tree and the new driver
-sources compile. Citrus hardware execution and final linking remain untested.
+**Hardware milestone (2026-10-27):** the isolated boots power CX/GX,
+authenticate Citrus's own zap firmware, initialize the SMMU/SQE command
+processor, and pass **16 GPU command-buffer writes and completion fences at
+300 MHz**. `gpu-svc1` then publishes **RedwoodGPU** with the baseline software
+UI still usable. On the triangle test root, **Mesa freedreno rendered a red
+triangle over blue into a shared IOSurface and both GL and CPU readback were
+correct** (`renderer: FD610`,
+`PASS: triangle, GL center=255,0,0 corner=0,0,255 error=0`). The launchd job had
+to borrow the one-shot `IOMFB_FDR_Loader` slot; iOS launchd would not start a
+new cached daemon.
+
+**2026-10-29, CoreAnimation on the GPU:** with 4 KiB pages and seven cores,
+`citrusgl=1` makes the compositor draw through Mesa freedreno/RedwoodGPU and
+scan out the GPU surface directly. The lock screen, unlock, home screen and
+app/Control Center animations are GPU-composited; the user confirmed the lock
+screen with a live clock, touch and the home gesture. Measured at ~50 fps
+presenting, GPU-bound; the open work is cutting GPU work per frame, the hitch
+tail, and the pool fragmentation that makes blur-heavy animations slow.
+
+The compositor backport (Mesa freedreno, Redwood DRM bridge, EAGL/loader
+libraries, IOSurface path) also builds for arm64 iOS, and an offline check
+matches all 457 dispatch names in the recovered EAGL table against the local
+20H392 OpenGLES cache. The 4 KiB / seven-core port and the path from the
+"stall after 10-15 frames" to usable composition are in
+[the implementation checkpoint](research/CITRUS-GPU-IMPLEMENTATION.md) and
+[`research/CITRUS-4K-GPU.md`](research/CITRUS-4K-GPU.md).
 The candidate stack is **RedwoodGPU → Mesa freedreno → EAGL → CoreAnimation**;
 Metal support is outside this initial milestone.
 
-- [ ] Verify Citrus GPU/GPUCC/SMMU resources and reserved firmware memory
+- [x] Verify Citrus GPU/GPUCC/SMMU resources and reserved firmware memory
   against the captured device tree. Obtain and record provenance for the
   device's `a610_zap` and SQE firmware; preserve firmware reservations.
-- [ ] Integrate the kernel objects and IOSurface prerequisites while retaining
-  Citrus's 16K-page configuration and existing display bounds fixes. Produce
-  a reproducible linked kernel with an opt-in GPU path.
-- [ ] Establish TrustZone/PAS access and required clock/power sequencing, then
+- [x] Integrate the kernel objects and IOSurface prerequisites while retaining
+  Citrus's 16K-page configuration and existing display bounds fixes. A
+  reproducible linked kernel with an opt-in GPU path boots (`gpu-svc1`); the
+  isolated `--baseline-service` profile keeps the unverified compositor
+  backport out.
+- [x] Establish TrustZone/PAS access and required clock/power sequencing, then
   authenticate firmware and initialize the GPU SMMU and command processor.
-- [ ] Submit a minimal command buffer that writes a known result and completes
+- [x] Submit a minimal command buffer that writes a known result and completes
   a fence. Exercise repeated submissions, bounded timeouts, and error handling
   before attaching the compositor.
-- [ ] Build Mesa freedreno and the Redwood DRM bridge for the iOS target;
-  reconstruct the missing EAGL dispatch generator/build pieces. Validate a
-  standalone rendered triangle through IOSurface and readback.
-- [ ] Connect EAGL to CoreAnimation/backboardd on the exact iOS build. Verify
-  GPU-rendered lock screen, unlock, home screen, transitions, and app content.
-- [ ] Measure frame times, CPU load, memory use, and sustained behavior. Keep
-  GPU allocations within verified RAM and preserve a software-rendered
-  fallback boot profile.
+- [x] Build Mesa freedreno and the Redwood DRM bridge for the iOS target;
+  reconstruct the missing EAGL dispatch generator/build pieces. A standalone
+  triangle passes through IOSurface and readback on hardware (2026-10-27).
+- [x] Connect EAGL to CoreAnimation/backboardd on the exact iOS build. The
+  GPU-rendered lock screen, unlock, home screen, transitions and app content
+  are demonstrated (2026-10-29); heavy blur/Control Center remains slow.
+- [ ] Measure frame times, CPU load, memory use, and sustained behavior, and
+  cut GPU work per frame (the port is GPU-fill-bound, ~2-3x over a 60 fps
+  budget). Keep GPU allocations within verified RAM and preserve a
+  software-rendered fallback boot profile.
 
 **Completion:** hardware-rendered UI survives repeated unlock/app/gesture
 cycles without corruption, GPU hangs, or new kernel faults, with logs and a

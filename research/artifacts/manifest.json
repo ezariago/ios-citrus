@@ -1,0 +1,53 @@
+{
+  "hardware_tested": false,
+  "firmware": {
+    "a610_zap.mdt": {
+      "bytes": 6860,
+      "sha256": "6577effdc2a6ed5980a0de608bb1b5801f2abe28b64124aa50244e7782bd7c9c",
+      "source": "/Users/ezariago/.codex/worktrees/citrus-eight-cores/ios-citrus-copy/devices/citrus-gpu-fw/a610_zap.mdt"
+    },
+    "a610_zap.b02": {
+      "bytes": 2096,
+      "sha256": "84c657996f3ec60a90d0c7223faad9b0700074fe00dc55596e0d3ba69b914d33",
+      "source": "/Users/ezariago/.codex/worktrees/citrus-eight-cores/ios-citrus-copy/devices/citrus-gpu-fw/a610_zap.b02"
+    },
+    "a630_sqe.fw": {
+      "bytes": 32304,
+      "sha256": "a0e1b583f620fabe32729ce367959d1960638663244d7d0cfc21b9a5215a018b",
+      "source": "/Users/ezariago/.codex/worktrees/citrus-eight-cores/ios-citrus-copy/devices/citrus-gpu-fw/a630_sqe.fw"
+    }
+  },
+  "patch_sha256": "bc32c9aa2ce61c4b978fa1043a81635f7da302c558d1ac9df909c49b374b936b",
+  "baseline_patch_sha256": "c68975e8d24cd2b4039cba66f07b592d3121f1e45db0e4dd71bb8404388c623d",
+  "page_size": 16384,
+  "gpu_default": "off",
+  "raw_physical_pool": "disabled",
+  "baseline_probe": false,
+  "baseline_hardware": false,
+  "baseline_service": false,
+  "baseline_compositor": false,
+  "vsync_timestamps": "baseline",
+  "firmware_provenance": {
+    "captured_utc": "2026-10-26T21:57:06.063481+00:00",
+    "adb_serial": null,
+    "independently_verified": true,
+    "method": "adb exec-out cat, separate on-device sha256sum",
+    "files": {
+      "a610_zap.mdt": {
+        "remote": "/vendor/firmware/a610_zap.mdt",
+        "sha256": "6577effdc2a6ed5980a0de608bb1b5801f2abe28b64124aa50244e7782bd7c9c",
+        "bytes": 6860
+      },
+      "a610_zap.b02": {
+        "remote": "/vendor/firmware/a610_zap.b02",
+        "sha256": "84c657996f3ec60a90d0c7223faad9b0700074fe00dc55596e0d3ba69b914d33",
+        "bytes": 2096
+      },
+      "a630_sqe.fw": {
+        "remote": "/vendor/firmware/a630_sqe.fw",
+        "sha256": "a0e1b583f620fabe32729ce367959d1960638663244d7d0cfc21b9a5215a018b",
+        "bytes": 32304
+      }
+    }
+  }
+}

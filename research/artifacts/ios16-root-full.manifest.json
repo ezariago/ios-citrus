@@ -1,0 +1,43 @@
+{
+  "name": "ios16-root-full",
+  "kind": "full iOS 16.7.16 userland root (HFSX, 4 KiB nodes)",
+  "image": "out/ios16/ios16-root-full.img",
+  "sha256": "414b3dc6e84f80e053b23de2af8298e79800aec2b0cfddfa995ce4249b8c343d",
+  "bytes": 17179869184,
+  "volume": {"name": "iOSRoot", "block": 4096, "case_sensitive": true, "journaled": true},
+  "sources": {
+    "ipsw": "iPhone10,3 d22ap 16.7.16 (20H392), BuildManifest identity 1",
+    "OS": "087-86698-044.dmg",
+    "Cryptex1,SystemOS": "087-86593-047.dmg",
+    "Cryptex1,AppOS": "087-86715-047.dmg"
+  },
+  "contents": {
+    "applications": 175,
+    "staged_system_apps": 0,
+    "app_placeholders": 0,
+    "moved_from_staged": 32,
+    "cryptex_links": {"OS": 8, "App": 11, "dyld_cache": 44},
+    "compositor": ["usr/libexec/backboardd (wrapper)", "usr/libexec/real/backboardd",
+                   "citrus/lib/libOSMesa.8.dylib", "citrus/lib/libcitrus-gl.dylib",
+                   "citrus/lib/libcitrus-loader.dylib"]
+  },
+  "ownership": "root:wheel default; /private/var/mobile 501:501; /private/var/Keychains 64:64; applied before hard links were created",
+  "flashed": {
+    "device_serial": "2103d88d0621",
+    "target": "/dev/block/by-name/userdata",
+    "segments": 16,
+    "on_device_sha256": "414b3dc6e84f80e053b23de2af8298e79800aec2b0cfddfa995ce4249b8c343d",
+    "boot_capture": "out/ios16/logs/fullroot-live.txt"
+  },
+  "verified": [
+    "fsck_hfs -fn clean (multi-linked files check passes)",
+    "on-device SHA-256 identical to host image",
+    "175 bundles in /Applications, staged_system_apps empty, placeholders empty",
+    "codesign --verify valid on wrapper, real backboardd and libcitrus-gl.dylib",
+    "user confirmed full stock app set on the home screen"
+  ],
+  "known_gaps": [
+    "wallpaper missing: PosterBoard crashes (SIGTRAP then SIGABRT) and no poster store is seeded; cosmetic, separate from the app restore",
+    "redwood-gl texture cache exhaustion line under heavy use ('more textures with IOSurfaces than there is room for')"
+  ]
+}

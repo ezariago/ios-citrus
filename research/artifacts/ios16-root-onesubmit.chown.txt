@@ -1,0 +1,4 @@
+catalog: 26112 nodes, 25546 leaves, 329355 items (volume header: 190316 files + 139039 folders = 329355)
+mobile cnid 143392
+items needing change: 0 of 329355
+rewrote 0 catalog nodes

@@ -1,0 +1,39 @@
+{
+  "date": "2026-10-27 Asia/Jakarta",
+  "image": "out/citrus-diagnostic/citrus-xnu-boot-gpu-hw2.img",
+  "image_sha256": "26b55f5a7262f9d8e15212879067188d1adda991eed2278ad1317e2becad7eae",
+  "kernel_sha256": "c5c2cd2f278faf65745fe5aced98e00f67d921922c3530dd04f4d07db2681153",
+  "firmware": {
+    "a610_zap.mdt": {
+      "remote": "/vendor/firmware/a610_zap.mdt",
+      "sha256": "6577effdc2a6ed5980a0de608bb1b5801f2abe28b64124aa50244e7782bd7c9c",
+      "bytes": 6860
+    },
+    "a610_zap.b02": {
+      "remote": "/vendor/firmware/a610_zap.b02",
+      "sha256": "84c657996f3ec60a90d0c7223faad9b0700074fe00dc55596e0d3ba69b914d33",
+      "bytes": 2096
+    },
+    "a630_sqe.fw": {
+      "remote": "/vendor/firmware/a630_sqe.fw",
+      "sha256": "a0e1b583f620fabe32729ce367959d1960638663244d7d0cfc21b9a5215a018b",
+      "bytes": 32304
+    }
+  },
+  "result": {
+    "four_cpus_initialized": true,
+    "cx_gx_power_on": true,
+    "zap_authentication": "0/0",
+    "smmu_mode": "identity",
+    "cp_started": true,
+    "core_mhz": 300,
+    "known_word_writes_and_fences": 16,
+    "gpu_service_published": false,
+    "gpu_rendered_ui": false,
+    "user_ui": "Swipe-to-unlock works",
+    "log": "out/ios16/logs/gpu-hw2-live.txt",
+    "log_prefix_bytes": 240013,
+    "log_prefix_sha256": "8b5ee45721e1eda9a36bc80b7c35cf975f595cb3498a4de495023085932b72b0",
+    "kernel_panics_seen": 0
+  }
+}

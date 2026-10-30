@@ -1,0 +1,13 @@
+{
+  "identifier": "iPhone10,3",
+  "version": "16.7.16",
+  "buildid": "20H392",
+  "sha1sum": "5606c298c1d908f8a48f617f0ceaf71f2a9f0193",
+  "md5sum": "edd545f3e99a9751e989da9c681cbe30",
+  "sha256sum": "ece1194f7e233e9109c5790a8d23a4564a10a254e15ec5b09978a343265568fb",
+  "filesize": 6171035648,
+  "url": "https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw",
+  "releasedate": "2026-05-11T17:47:42Z",
+  "uploaddate": "2026-05-01T20:37:41Z",
+  "signed": true
+}

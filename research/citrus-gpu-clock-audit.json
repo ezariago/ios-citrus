@@ -1,0 +1,270 @@
+{
+  "capture": "device-dumps/20261025-141423-923416/live-tree.json",
+  "capture_sha256": "05f688eda4a677c16865d1734f0a7b426a8d5baa7f3596317ff13539ab176dd7",
+  "stock_kernel_commit": "02ca1a919564a9b176a79cce09c40977f833e9ac",
+  "stock_source_sha256": {
+    "drivers/clk/qcom/gpucc-bengal.c": "fba7cbba5c6831e14795f8faf8e37c4d2ea1637dc3ef870f4a81ae5b3ec97164",
+    "drivers/clk/qcom/clk-alpha-pll.c": "2a199001bbc2aabc88ab4c8faa6ba379cda8e2b4c73570147068ebe60f4c7f8d",
+    "drivers/clk/clk.c": "1eb02ef480e3c9f669fb0d05104a083c46c338a9a276a6453a7b5f38c3a29ced",
+    "drivers/clk/qcom/vdd-level-bengal.h": "3165552a0c2e9abd8438bc31ecae1559fbe12533738a7d91bcaa93608b99f30f",
+    "drivers/clk/qcom/clk-regmap.c": "48154e45d3ab7db09b780d3b48f7c5be3b8cecefc49dc5c41e1e111d03770f75",
+    "drivers/regulator/rpm-smd-regulator.c": "429b6410e75ed8e15d7083aadd8e2163254ecadac53c9e15c2f8b956c0a54710",
+    "drivers/rpmsg/rpm-smd.c": "99f2cc412b05e8c98a31fae3f6dcc0bfc4f3e1007387a55e191ec65891213dc9",
+    "drivers/rpmsg/qcom_smd.c": "b952fee80bee044f7ba2b2fa3b16e7268811005127c04baf1893f92bf2cfb2ee",
+    "drivers/rpmsg/qcom_glink_rpm.c": "fdc048e1a49c9161546e1d113d9a7d44576d3cd5d74b193bb2427eb97e582bcf",
+    "drivers/rpmsg/qcom_glink_native.c": "4cf343c7e68c9820ec708933afac02048a85b9585341be3d64bc4c2d41d33b26",
+    "drivers/gpu/msm/adreno.c": "a233d9d15a2a69d2dd273d6c920d373aee8959b419a4c5ea6e3b80b9832fb517",
+    "drivers/soc/qcom/smem.c": "17a6ca619a337499356f1d2d73981ba980e868d8c6ac40822ae7577781481f44",
+    "drivers/soc/qcom/msm_bus/msm_bus_rpm_smd.c": "40de04efa0ac92f8d89801199f530805aec1179f5b7871775f6ac7e181d9671a"
+  },
+  "current_driver_mhz": 300,
+  "common_stock_mhz_across_dt_bins": [
+    320,
+    465,
+    600
+  ],
+  "actual_fuse_bin_known": true,
+  "observed_speed_bin": 200,
+  "observed_gaming_bin": 0,
+  "fused_bin_max_stock_mhz": 950,
+  "speed_bins": [
+    {
+      "speed_bin": 0,
+      "levels": [
+        {
+          "mhz": 980,
+          "bus_index": 11
+        },
+        {
+          "mhz": 900,
+          "bus_index": 11
+        },
+        {
+          "mhz": 820,
+          "bus_index": 10
+        },
+        {
+          "mhz": 745,
+          "bus_index": 9
+        },
+        {
+          "mhz": 600,
+          "bus_index": 8
+        },
+        {
+          "mhz": 465,
+          "bus_index": 7
+        },
+        {
+          "mhz": 320,
+          "bus_index": 4
+        }
+      ]
+    },
+    {
+      "speed_bin": 206,
+      "levels": [
+        {
+          "mhz": 980,
+          "bus_index": 11
+        },
+        {
+          "mhz": 900,
+          "bus_index": 11
+        },
+        {
+          "mhz": 820,
+          "bus_index": 10
+        },
+        {
+          "mhz": 745,
+          "bus_index": 9
+        },
+        {
+          "mhz": 600,
+          "bus_index": 8
+        },
+        {
+          "mhz": 465,
+          "bus_index": 7
+        },
+        {
+          "mhz": 320,
+          "bus_index": 4
+        }
+      ]
+    },
+    {
+      "speed_bin": 200,
+      "levels": [
+        {
+          "mhz": 950,
+          "bus_index": 11
+        },
+        {
+          "mhz": 900,
+          "bus_index": 11
+        },
+        {
+          "mhz": 820,
+          "bus_index": 10
+        },
+        {
+          "mhz": 745,
+          "bus_index": 9
+        },
+        {
+          "mhz": 600,
+          "bus_index": 8
+        },
+        {
+          "mhz": 465,
+          "bus_index": 7
+        },
+        {
+          "mhz": 320,
+          "bus_index": 4
+        }
+      ]
+    },
+    {
+      "speed_bin": 157,
+      "levels": [
+        {
+          "mhz": 745,
+          "bus_index": 11
+        },
+        {
+          "mhz": 600,
+          "bus_index": 8
+        },
+        {
+          "mhz": 465,
+          "bus_index": 7
+        },
+        {
+          "mhz": 320,
+          "bus_index": 4
+        }
+      ]
+    },
+    {
+      "speed_bin": 127,
+      "levels": [
+        {
+          "mhz": 600,
+          "bus_index": 11
+        },
+        {
+          "mhz": 465,
+          "bus_index": 7
+        },
+        {
+          "mhz": 320,
+          "bus_index": 4
+        }
+      ]
+    }
+  ],
+  "opps": [
+    {
+      "mhz": 320,
+      "encoded_regulator_level": 64
+    },
+    {
+      "mhz": 465,
+      "encoded_regulator_level": 128
+    },
+    {
+      "mhz": 600,
+      "encoded_regulator_level": 192
+    },
+    {
+      "mhz": 745,
+      "encoded_regulator_level": 256
+    },
+    {
+      "mhz": 820,
+      "encoded_regulator_level": 320
+    },
+    {
+      "mhz": 900,
+      "encoded_regulator_level": 384
+    },
+    {
+      "mhz": 950,
+      "encoded_regulator_level": 416
+    },
+    {
+      "mhz": 980,
+      "encoded_regulator_level": 416
+    }
+  ],
+  "clock_supplies": {
+    "vdd_cx-supply": {
+      "node": "/soc/qcom,rpm-smd/rpm-regulator-smpa3/regulator-s3-level",
+      "regulator": "pm6125_s3_level",
+      "resource_type": "rwcx",
+      "resource_id": 0,
+      "uses_voltage_level": true
+    },
+    "vdd_mx-supply": {
+      "node": "/soc/qcom,rpm-smd/rpm-regulator-smpa5/regulator-s5-level",
+      "regulator": "pm6125_s5_level",
+      "resource_type": "rwmx",
+      "resource_id": 0,
+      "uses_voltage_level": true
+    }
+  },
+  "voltage_transport": "RPM-SMD frontend, rpm_requests RPMsg over GLINK-RPM; not traditional SMEM-SMD or inherited RPMh",
+  "rpm_message_ram": {
+    "compatible": [
+      "qcom,rpm-msg-ram"
+    ],
+    "reg": [
+      "0x45f0000",
+      "0x7000"
+    ],
+    "phandle": [
+      "0x6b"
+    ]
+  },
+  "rpm_glink": {
+    "compatible": [
+      "qcom,glink-rpm"
+    ],
+    "interrupts": [
+      "0x0",
+      "0xc2",
+      "0x1"
+    ],
+    "qcom,rpm-msg-ram": [
+      "0x6b"
+    ],
+    "mboxes": [
+      "0x6c",
+      "0x0"
+    ]
+  },
+  "apcs_mailbox": {
+    "compatible": [
+      "qcom,bengal-apcs-hmss-global"
+    ],
+    "reg": [
+      "0xf111000",
+      "0x1000"
+    ],
+    "#mbox-cells": [
+      "0x1"
+    ],
+    "phandle": [
+      "0x6c"
+    ]
+  },
+  "rpm_wire_format": "stock driver defaults to v0 when the DT RPM node has no reg property",
+  "stock_levels_are_not_microvolts": true,
+  "clock_parent": "Bengal default alpha PLLs; PLL1 AUX /2 for 320/465, PLL0 AUX2 /2 for 600+",
+  "higher_clock_implemented": false,
+  "higher_clock_applied": false,
+  "probe_boot_only": true
+}

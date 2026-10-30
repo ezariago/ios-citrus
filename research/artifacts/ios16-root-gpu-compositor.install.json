@@ -1,0 +1,41 @@
+{
+  "image": "out/ios16/ios16-root-gpu-compositor.img",
+  "mode": "compositor-test",
+  "source_sha256": "0ee5bd34809984e05d88104f4bd5a1e6a78166b6b61c1b1f338ba478f3bb1732",
+  "files": [
+    {
+      "source": "citrus/lib/libOSMesa.8.dylib",
+      "destination": "/citrus/lib/libOSMesa.8.dylib",
+      "sha256": "e0c7ba1d00bc9a67bec31aebe5c2fcfaf989fd4f0182fa1de4385d5fa7667894",
+      "size": 14841216
+    },
+    {
+      "source": "citrus/lib/libcitrus-gl.dylib",
+      "destination": "/citrus/lib/libcitrus-gl.dylib",
+      "sha256": "dcd0b3fa3cc4051ca9a6b63e23ddcdf2088c02da6cb1e5ab00b7c87292024c31",
+      "size": 326784
+    },
+    {
+      "source": "citrus/lib/libcitrus-loader.dylib",
+      "destination": "/citrus/lib/libcitrus-loader.dylib",
+      "sha256": "2fb666f1f9cf9a7b82169e27f544b6aec82f737a8195802aef9c0cb9e391c54f",
+      "size": 51136
+    },
+    {
+      "source": "citrus/bin/citrus-bbd-wrapper",
+      "destination": "/usr/libexec/backboardd",
+      "sha256": "c87ed2e0de533d6a3da49d9b702cceb25619131d27ecc09c06622c6232f9d2df",
+      "size": 50416
+    },
+    {
+      "destination": "/usr/libexec/real/backboardd",
+      "source": "original /usr/libexec/backboardd",
+      "preserved": true
+    }
+  ],
+  "preserved_sha256": "7aa6f8bf5ea2c3634fb8c8916a4e9c3c84508de78eccf57ca65c1ae4f676267c",
+  "ownership_verified": true,
+  "codesign_verified": true,
+  "image_sha256": "e796c1f202ff02f546700395fac3de8b329ece882acecaf23db49adde9eb76fa",
+  "image_size": 17179869184
+}

@@ -85,6 +85,20 @@ image; that is expected (`AGENTS.md` §9).
    anything; use `python3 usb-restart/reboot.py fastboot` for host-driven
    resets. Do not mount the 16 GiB root read-write on the Mac (§9).
 
+## Archive and cleanup check (2026-10-30 12:49 Asia/Jakarta)
+
+The source, research, experiment patches/tests, cited-capture archive, and handoff
+were already committed and pushed to `origin/master` (`a1db046` at the start of
+this check). I removed only generated build outputs/images explicitly listed as
+quarantined in `AGENTS.md` §4. The protected roots, cited logs, named fallbacks,
+`device-dumps/`, `upstream/`, and source/research files were left untouched.
+
+**Deleting this checkout is not equivalent to an independent full backup.**
+Ignored, local-only data (`out/`, `device-dumps/`, `upstream/`) are not in Git.
+The phone retains the installed root/boot state, but a fresh clone will need
+prerequisites recreated as listed above. Do not delete the local-only data unless
+you accept reacquiring/rebuilding them or have copied them elsewhere.
+
 ## Where the work stopped (2026-10-29/30)
 
 - GPU composition works but the **remaining gap is GPU work per frame and a
